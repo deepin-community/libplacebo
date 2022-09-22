@@ -1,0 +1,34 @@
+# Optional components
+option('vulkan', type: 'feature', value: 'auto',
+       description: 'Vulkan-based renderer')
+
+option('vulkan-link', type: 'boolean', value: true,
+       description: 'Link directly againt vkGetInstanceProcAddr from libvulkan.so')
+
+option('vulkan-registry', type: 'string', value: '',
+       description: 'Path to vulkan XML registry (for code generation)')
+
+option('opengl', type: 'feature', value: 'auto',
+       description: 'OpenGL-based renderer')
+
+option('glslang', type: 'feature', value: 'auto',
+       description: 'glslang SPIR-V compiler')
+
+option('shaderc', type: 'feature', value: 'auto',
+       description: 'libshaderc SPIR-V compiler')
+
+option('lcms', type: 'feature', value: 'auto',
+       description: 'LittleCMS 2 support')
+
+# Miscellaneous
+option('demos', type: 'boolean', value: true,
+       description: 'Enable building (and installing) the demo programs')
+
+option('tests', type: 'boolean', value: false,
+       description: 'Enable building the test cases')
+
+option('bench', type: 'boolean', value: false,
+       description: 'Enable building benchmarks (`meson test benchmark`)')
+
+option('fuzz', type: 'boolean', value: false,
+       description: 'Enable building fuzzer binaries (`CC=afl-cc`)')

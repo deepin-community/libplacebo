@@ -1,0 +1,200 @@
+stages:
+    - compile
+    - test
+    - test
+    - sanitize
+
+linux:
+    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    stage: compile
+    tags:
+        - docker
+        - amd64
+    script:
+        - meson build --buildtype release
+                      --werror
+                      -Dtests=true
+                      -Dshaderc=enabled
+                      -Dglslang=enabled
+        - ninja -C build
+
+static:
+    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    stage: compile
+    tags:
+        - docker
+        - amd64
+    script:
+        - meson build --buildtype release
+                      --default-library static
+                      --werror
+                      -Dshaderc=enabled
+                      -Dglslang=enabled
+        - ninja -C build
+
+win32:
+    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    stage: compile
+    tags:
+        - docker
+        - amd64
+    script:
+        - meson build --buildtype release
+                      --werror
+                      -Dtests=true
+                      --libdir lib
+                      --cross-file /opt/crossfiles/i686-w64-mingw32.meson
+        - ninja -C build
+        - cd build && meson test -t 5 -v --num-processes=1
+
+win64:
+    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    stage: compile
+    tags:
+        - docker
+        - amd64
+    script:
+        - meson build --buildtype release
+                      --werror
+                      -Dtests=true
+                      --libdir lib
+                      --cross-file /opt/crossfiles/x86_64-w64-mingw32.meson
+        - ninja -C build
+        - cd build && meson test -t 5 -v --num-processes=1
+
+aarch64:
+    image: registry.videolan.org/libplacebo-ubuntu-eoan-aarch64:20200525090115
+    stage: compile
+    tags:
+        - docker
+        - aarch64
+    script:
+        - meson build --buildtype release --werror -Dtests=true
+        - ninja -C build
+        - cd build && meson test -t 5 -v --num-processes=1
+
+macos:
+    stage: compile
+    tags:
+        - amd64
+        - catalina
+    script:
+        - meson build --buildtype release
+                      -Ddefault_library=both
+                      -Dtests=true
+                      --werror
+        - ninja -C build
+        - cd build && meson test -t 5 -v --num-processes=1
+
+scan:
+    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    stage: compile
+    tags:
+        - docker
+        - amd64
+    script:
+        - env CC=clang meson build --buildtype debugoptimized
+                                   --werror
+                                   -Dtests=true
+                                   -Ddemos=true
+                                   -Dbench=true
+                                   -Dshaderc=enabled
+                                   -Dglslang=enabled
+        - ninja -C build scan-build
+
+llvmpipe:
+    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    stage: test
+    tags:
+        - docker
+        - amd64
+    script:
+        - meson build --buildtype release
+                      --werror
+                      -Dtests=true
+                      -Ddemos=false
+                      -Dc_args='-DCI_ALLOW_SW'
+                      -Dshaderc=enabled
+                      -Dglslang=enabled
+        - ninja -C build
+        - cd build && meson test -t 5 -v --num-processes=1
+
+gpu:
+    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    stage: test
+    tags:
+        - gpu
+    script:
+        - meson build --buildtype release
+                      --werror
+                      -Dtests=true
+                      -Ddemos=false
+                      -Dshaderc=disabled
+                      -Db_coverage=true
+        - ninja -C build
+        - vulkaninfo
+        - cd build && meson test -t 5 -v --num-processes=1
+        - ninja coverage-html
+        - mv meson-logs/coveragereport ../coverage
+        - ninja coverage-xml
+        - grep -Eo 'line-rate="[^"]+"' meson-logs/coverage.xml | head -n 1 |
+          grep -Eo '[0-9.]+' | awk '{ print "coverage:", $1 * 100 } '
+    coverage: '/^coverage: (\d+.\d+)$/'
+    artifacts:
+        expose_as: 'Coverage HTML report'
+        paths:
+            - coverage/
+        reports:
+            cobertura: build/meson-logs/coverage.xml
+
+asan:
+    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    stage: sanitize
+    tags:
+        - gpu
+    variables:
+        ASAN_OPTIONS: 'detect_leaks=0'
+    script:
+        - meson build --buildtype debugoptimized
+                      -Dtests=true
+                      -Ddemos=false
+                      -Dshaderc=disabled
+                      -Db_sanitize=address
+        - ninja -C build
+        - cd build && time meson test -t 5 -v --num-processes=1
+
+msan:
+    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    stage: sanitize
+    tags:
+        - gpu
+    variables:
+        MSAN_OPTIONS: 'exitcode=1'
+    script:
+        - env CC=clang meson build --buildtype debugoptimized
+                                   -Dtests=true
+                                   -Ddemos=false
+                                   -Dc_args='-DMSAN'
+                                   -Dglslang=disabled
+                                   -Db_sanitize=memory
+                                   -Db_lundef=false
+        - ninja -C build
+        - cd build && time meson test -t 5 -v --num-processes=1
+
+ubsan:
+    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    stage: sanitize
+    tags:
+        - gpu
+    variables:
+        UBSAN_OPTIONS: 'print_stacktrace=1:halt_on_error=1'
+    script:
+        - env CC=clang meson build --buildtype debugoptimized
+                                   -Dtests=true
+                                   -Ddemos=false
+                                   -Dc_args='-fPIE'
+                                   -Dglslang=disabled
+                                   -Db_sanitize=undefined
+                                   -Db_lundef=false
+        - ninja -C build
+        - cd build && time meson test -t 5 -v --num-processes=1

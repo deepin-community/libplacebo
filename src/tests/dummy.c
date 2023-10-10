@@ -1,18 +1,20 @@
 #include "gpu_tests.h"
 
+#include <libplacebo/dummy.h>
+
 int main()
 {
-    struct pl_context *ctx = pl_test_context();
-    const struct pl_gpu *gpu = pl_gpu_dummy_create(ctx, NULL);
+    pl_log log = pl_test_logger();
+    pl_gpu gpu = pl_gpu_dummy_create(log, NULL);
     pl_buffer_tests(gpu);
     pl_texture_tests(gpu);
 
     // Attempt creating a shader and accessing the resulting LUT
-    const struct pl_tex *dummy = pl_tex_dummy_create(gpu, &(struct pl_tex_dummy_params) {
+    pl_tex dummy = pl_tex_dummy_create(gpu, pl_tex_dummy_params(
         .w = 100,
         .h = 100,
         .format = pl_find_named_fmt(gpu, "rgba8"),
-    });
+    ));
 
     struct pl_sample_src src = {
         .tex = dummy,
@@ -20,14 +22,13 @@ int main()
         .new_h = 1000,
     };
 
-    struct pl_shader_obj *lut = NULL;
+    pl_shader_obj lut = NULL;
     struct pl_sample_filter_params filter_params = {
         .filter = pl_filter_ewa_lanczos,
         .lut = &lut,
     };
 
-    struct pl_shader *sh;
-    sh = pl_shader_alloc(ctx, &(struct pl_shader_params) { .gpu = gpu });
+    pl_shader sh = pl_shader_alloc(log, pl_shader_params( .gpu = gpu ));
     REQUIRE(pl_shader_sample_polar(sh, &src, &filter_params));
     const struct pl_shader_res *res = pl_shader_finalize(sh);
     REQUIRE(res);
@@ -37,13 +38,15 @@ int main()
         if (sd->desc.type != PL_DESC_SAMPLED_TEX)
             continue;
 
-        const struct pl_tex *tex = sd->binding.object;
+        pl_tex tex = sd->binding.object;
         const float *data = (float *) pl_tex_dummy_data(tex);
         if (!data)
             continue; // means this was the `dummy` texture
 
+#ifdef PRINT_LUTS
         for (int i = 0; i < tex->params.w; i++)
             printf("lut[%d] = %f\n", i, data[i]);
+#endif
     }
 
     // Try out generation of the sampler2D interface
@@ -54,15 +57,14 @@ int main()
     src.sampler = PL_SAMPLER_NORMAL;
     src.mode = PL_TEX_SAMPLE_LINEAR;
 
-    pl_shader_reset(sh, &(struct pl_shader_params) { .gpu = gpu });
+    pl_shader_reset(sh, pl_shader_params( .gpu = gpu ));
     REQUIRE(pl_shader_sample_polar(sh, &src, &filter_params));
     REQUIRE((res = pl_shader_finalize(sh)));
-    REQUIRE(res->input == PL_SHADER_SIG_SAMPLER);
-    printf("generated sampler2D shader:\n\n%s\n", res->glsl);
+    REQUIRE_CMP(res->input, ==, PL_SHADER_SIG_SAMPLER, "u");
 
     pl_shader_free(&sh);
     pl_shader_obj_destroy(&lut);
     pl_tex_destroy(gpu, &dummy);
     pl_gpu_dummy_destroy(&gpu);
-    pl_context_destroy(&ctx);
+    pl_log_destroy(&log);
 }

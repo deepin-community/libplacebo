@@ -20,12 +20,15 @@
 
 // Sampling operations. These shaders perform some form of sampling operation
 // from a given pl_tex. In order to use these, the pl_shader *must* have been
-// created using the same `ra` as the originating `pl_tex`. Otherwise, this
+// created using the same `gpu` as the originating `pl_tex`. Otherwise, this
 // is undefined behavior. They require nothing (PL_SHADER_SIG_NONE) and return
 // a color (PL_SHADER_SIG_COLOR).
 
+#include <libplacebo/colorspace.h>
 #include <libplacebo/filters.h>
 #include <libplacebo/shaders.h>
+
+PL_API_BEGIN
 
 // Common parameters for sampling operations
 struct pl_sample_src {
@@ -35,8 +38,8 @@ struct pl_sample_src {
     // 1. Provide the texture and sampled region directly. This generates
     // a shader with input signature `PL_SHADER_SIG_NONE`, which binds the
     // texture as a descriptor (and the coordinates as a vertex attribute)
-    const struct pl_tex *tex; // texture to sample
-    struct pl_rect2df rect;   // sub-rect to sample from (optional)
+    pl_tex tex;             // texture to sample
+    pl_rect2df rect;        // sub-rect to sample from (optional)
     enum pl_tex_address_mode address_mode; // preferred texture address mode
 
     // 2. Have the shader take it as an argument. Doing this requires
@@ -57,6 +60,8 @@ struct pl_sample_src {
     // Note: `component_mask` and `components` are mutually exclusive, the
     // former is preferred if both are specified.
 };
+
+#define pl_sample_src(...) (&(struct pl_sample_src) { __VA_ARGS__ })
 
 struct pl_deband_params {
     // The number of debanding steps to perform per sample. Each step reduces a
@@ -83,41 +88,67 @@ struct pl_deband_params {
     //
     // Defaults to 6.0, which is very mild.
     float grain;
+
+    // 'Neutral' grain value for each channel being debanded (sorted in order
+    // from low to high index). Grain application will be modulated to avoid
+    // disturbing colors close to this value. Set this to a value corresponding
+    // to black in the relevant colorspace.
+    float grain_neutral[3];
 };
 
-extern const struct pl_deband_params pl_deband_default_params;
+#define PL_DEBAND_DEFAULTS  \
+    .iterations = 1,        \
+    .threshold  = 4.0,      \
+    .radius     = 16.0,     \
+    .grain      = 6.0,
+
+#define pl_deband_params(...) (&(struct pl_deband_params) {PL_DEBAND_DEFAULTS __VA_ARGS__ })
+PL_API extern const struct pl_deband_params pl_deband_default_params;
 
 // Debands a given texture and returns the sampled color in `vec4 color`. If
 // `params` is left as NULL, it defaults to &pl_deband_default_params. Note
 // that `tex->params.format` must have PL_FMT_CAP_LINEAR. When the given
 // `pl_sample_src` implies scaling, this effectively performs bilinear
-// sampling.
+// sampling on the input (but not the output).
 //
 // Note: This can also be used as a pure grain function, by setting the number
 // of iterations to 0.
-void pl_shader_deband(struct pl_shader *sh, const struct pl_sample_src *src,
-                      const struct pl_deband_params *params);
+PL_API void pl_shader_deband(pl_shader sh, const struct pl_sample_src *src,
+                             const struct pl_deband_params *params);
 
 // Performs direct / native texture sampling, using whatever texture filter is
 // available (linear for linearly sampleable sources, nearest otherwise).
 //
 // Note: This is generally very low quality and should be avoided if possible,
 // for both upscaling and downscaling.
-bool pl_shader_sample_direct(struct pl_shader *sh, const struct pl_sample_src *src);
+PL_API bool pl_shader_sample_direct(pl_shader sh, const struct pl_sample_src *src);
 
 // Performs hardware-accelerated nearest neighbour sampling. This is similar to
 // `pl_shader_sample_direct`, but forces nearest neighbour interpolation.
-bool pl_shader_sample_nearest(struct pl_shader *sh, const struct pl_sample_src *src);
+PL_API bool pl_shader_sample_nearest(pl_shader sh, const struct pl_sample_src *src);
 
 // Performs hardware-accelerated bilinear sampling. This is similar to
 // `pl_shader_sample_direct`, but forces bilinear interpolation.
-bool pl_shader_sample_bilinear(struct pl_shader *sh, const struct pl_sample_src *src);
+PL_API bool pl_shader_sample_bilinear(pl_shader sh, const struct pl_sample_src *src);
 
 // Performs hardware-accelerated / efficient bicubic sampling. This is more
 // efficient than using the generalized sampling routines and
 // pl_filter_function_bicubic. Only works well when upscaling - avoid for
 // downscaling.
-bool pl_shader_sample_bicubic(struct pl_shader *sh, const struct pl_sample_src *src);
+PL_API bool pl_shader_sample_bicubic(pl_shader sh, const struct pl_sample_src *src);
+
+// A sampler that is similar to nearest neighbour sampling, but tries to
+// preserve pixel aspect ratios. This is mathematically equivalent to taking an
+// idealized image with square pixels, sampling it at an infinite resolution,
+// and then downscaling that to the desired resolution. (Hence it being called
+// "oversample"). Good for pixel art.
+//
+// The threshold provides a cutoff threshold below which the contribution of
+// pixels should be ignored, trading some amount of aspect ratio distortion for
+// a slightly crisper image. A value of `threshold == 0.5` makes this filter
+// equivalent to regular nearest neighbour sampling.
+PL_API bool pl_shader_sample_oversample(pl_shader sh, const struct pl_sample_src *src,
+                                        float threshold);
 
 struct pl_sample_filter_params {
     // The filter to use for sampling.
@@ -140,39 +171,81 @@ struct pl_sample_filter_params {
     // if necessary. To avoid thrashing the resource, users should avoid trying
     // to re-use the same LUT for different filter configurations or scaling
     // ratios. Must be set to a valid pointer, and the target NULL-initialized.
-    struct pl_shader_obj **lut;
+    pl_shader_obj *lut;
 };
+
+#define pl_sample_filter_params(...) (&(struct pl_sample_filter_params) { __VA_ARGS__ })
 
 // Performs polar sampling. This internally chooses between an optimized compute
 // shader, and various fragment shaders, depending on the supported GLSL version
 // and GPU features. Returns whether or not it was successful.
 //
 // Note: `params->filter.polar` must be true to use this function.
-bool pl_shader_sample_polar(struct pl_shader *sh,
-                            const struct pl_sample_src *src,
-                            const struct pl_sample_filter_params *params);
-
-enum {
-    PL_SEP_VERT = 0,
-    PL_SEP_HORIZ,
-    PL_SEP_PASSES
-};
+PL_API bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
+                                   const struct pl_sample_filter_params *params);
 
 // Performs orthogonal (1D) sampling. Using this twice in a row (once vertical
 // and once horizontal) effectively performs a 2D upscale. This is lower
 // quality than polar sampling, but significantly faster, and therefore the
 // recommended default. Returns whether or not it was successful.
 //
-// 0 <= pass < PL_SEP_PASSES indicates which component of the transformation to
-// apply. PL_SEP_VERT only applies the vertical component, and PL_SEP_HORIZ
-// only the horizontal. The non-relevant component of the `src->rect` is ignored
-// entirely.
+// `src` must represent a scaling operation that only scales in one direction,
+// i.e. either only X or only Y. The other direction must be left unscaled.
 //
 // Note: Due to internal limitations, this may currently only be used on 2D
 // textures - even though the basic principle would work for 1D and 3D textures
 // as well.
-bool pl_shader_sample_ortho(struct pl_shader *sh, int pass,
-                            const struct pl_sample_src *src,
-                            const struct pl_sample_filter_params *params);
+PL_API bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
+                                    const struct pl_sample_filter_params *params);
+
+struct pl_distort_params {
+    // An arbitrary 2x2 affine transformation to apply to the input image.
+    // For simplicity, the input image is explicitly centered and scaled such
+    // that the longer dimension is in [-1,1], before applying this.
+    pl_transform2x2 transform;
+
+    // If true, the texture is placed inside the center of the canvas without
+    // scaling. If false, it is effectively stretched to the canvas size.
+    bool unscaled;
+
+    // If true, the transformation is automatically scaled down and shifted to
+    // ensure that the resulting image fits inside the output canvas.
+    bool constrain;
+
+    // If true, use bicubic interpolation rather than faster bilinear
+    // interpolation. Higher quality but slower.
+    bool bicubic;
+
+    // Specifies the texture address mode to use when sampling out of bounds.
+    enum pl_tex_address_mode address_mode;
+
+    // If set, all out-of-bounds accesses will instead be treated as
+    // transparent, according to the given alpha mode. (Which should match the
+    // alpha mode of the texture)
+    //
+    // Note: `address_mode` has no effect when this is specified.
+    enum pl_alpha_mode alpha_mode;
+};
+
+#define PL_DISTORT_DEFAULTS \
+    .transform.mat.m = {{ 1, 0 }, {0, 1}},
+
+#define pl_distort_params(...) (&(struct pl_distort_params) {PL_DISTORT_DEFAULTS __VA_ARGS__ })
+PL_API extern const struct pl_distort_params pl_distort_default_params;
+
+// Distorts the input image using a given set of transformation parameters.
+// `out_w` and `out_h` determine the size of the effective canvas inside which
+// the distorted result may be rendered. Areas outside of this canvas will
+// be implicitly cut off.
+PL_API void pl_shader_distort(pl_shader sh, pl_tex tex, int out_w, int out_h,
+                              const struct pl_distort_params *params);
+
+enum PL_DEPRECATED { // for `int pass`
+    PL_SEP_VERT = 0,
+    PL_SEP_HORIZ,
+    PL_SEP_PASSES
+};
+
+PL_API_END
 
 #endif // LIBPLACEBO_SHADERS_SAMPLING_H_

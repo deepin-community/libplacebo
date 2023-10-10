@@ -19,45 +19,60 @@
 #include "utils.h"
 
 // returns VK_SUCCESS (completed), VK_TIMEOUT (not yet completed) or an error
-static VkResult vk_cmd_poll(struct vk_ctx *vk, struct vk_cmd *cmd,
-                            uint64_t timeout)
+static VkResult vk_cmd_poll(struct vk_cmd *cmd, uint64_t timeout)
 {
-    return vk->WaitForFences(vk->dev, 1, &cmd->fence, false, timeout);
+    struct vk_ctx *vk = cmd->pool->vk;
+    return vk->WaitSemaphores(vk->dev, &(VkSemaphoreWaitInfo) {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+        .semaphoreCount = 1,
+        .pSemaphores = &cmd->sync.sem,
+        .pValues = &cmd->sync.value,
+    }, timeout);
 }
 
-static void vk_cmd_reset(struct vk_ctx *vk, struct vk_cmd *cmd)
+static void flush_callbacks(struct vk_ctx *vk)
 {
-    for (int i = 0; i < cmd->callbacks.num; i++) {
-        struct vk_callback *cb = &cmd->callbacks.elem[i];
+    while (vk->num_pending_callbacks) {
+        const struct vk_callback *cb = vk->pending_callbacks++;
+        vk->num_pending_callbacks--;
         cb->run(cb->priv, cb->arg);
     }
+}
+
+static void vk_cmd_reset(struct vk_cmd *cmd)
+{
+    struct vk_ctx *vk = cmd->pool->vk;
+
+    // Flush possible callbacks left over from a previous command still in the
+    // process of being reset, whose callback triggered this command being
+    // reset.
+    flush_callbacks(vk);
+    vk->pending_callbacks = cmd->callbacks.elem;
+    vk->num_pending_callbacks = cmd->callbacks.num;
+    flush_callbacks(vk);
 
     cmd->callbacks.num = 0;
     cmd->deps.num = 0;
-    cmd->depstages.num = 0;
     cmd->sigs.num = 0;
-    cmd->objs.num = 0;
-
-    // also make sure to reset vk->last_cmd in case this was the last command
-    if (vk->last_cmd == cmd)
-        vk->last_cmd = NULL;
 }
 
-static void vk_cmd_destroy(struct vk_ctx *vk, struct vk_cmd *cmd)
+static void vk_cmd_destroy(struct vk_cmd *cmd)
 {
     if (!cmd)
         return;
 
-    vk_cmd_poll(vk, cmd, UINT64_MAX);
-    vk_cmd_reset(vk, cmd);
-    vk->DestroyFence(vk->dev, cmd->fence, PL_VK_ALLOC);
+    struct vk_ctx *vk = cmd->pool->vk;
+    vk_cmd_poll(cmd, UINT64_MAX);
+    vk_cmd_reset(cmd);
+    vk->DestroySemaphore(vk->dev, cmd->sync.sem, PL_VK_ALLOC);
     vk->FreeCommandBuffers(vk->dev, cmd->pool->pool, 1, &cmd->buf);
 
     pl_free(cmd);
 }
 
-static struct vk_cmd *vk_cmd_create(struct vk_ctx *vk, struct vk_cmdpool *pool)
+static struct vk_cmd *vk_cmd_create(struct vk_cmdpool *pool)
 {
+    struct vk_ctx *vk = pool->vk;
     struct vk_cmd *cmd = pl_zalloc_ptr(NULL, cmd);
     cmd->pool = pool;
 
@@ -70,18 +85,24 @@ static struct vk_cmd *vk_cmd_create(struct vk_ctx *vk, struct vk_cmdpool *pool)
 
     VK(vk->AllocateCommandBuffers(vk->dev, &ainfo, &cmd->buf));
 
-    VkFenceCreateInfo finfo = {
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+    static const VkSemaphoreTypeCreateInfo stinfo = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+        .semaphoreType  = VK_SEMAPHORE_TYPE_TIMELINE,
+        .initialValue   = 0,
     };
 
-    VK(vk->CreateFence(vk->dev, &finfo, PL_VK_ALLOC, &cmd->fence));
-    PL_VK_NAME(FENCE, cmd->fence, "cmd");
+    static const VkSemaphoreCreateInfo sinfo = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        .pNext = &stinfo,
+    };
+
+    VK(vk->CreateSemaphore(vk->dev, &sinfo, PL_VK_ALLOC, &cmd->sync.sem));
+    PL_VK_NAME(SEMAPHORE, cmd->sync.sem, "cmd");
 
     return cmd;
 
 error:
-    vk_cmd_destroy(vk, cmd);
+    vk_cmd_destroy(cmd);
     vk->failed = true;
     return NULL;
 }
@@ -89,12 +110,15 @@ error:
 void vk_dev_callback(struct vk_ctx *vk, vk_cb callback,
                      const void *priv, const void *arg)
 {
-    if (vk->last_cmd) {
-        vk_cmd_callback(vk->last_cmd, callback, priv, arg);
+    pl_mutex_lock(&vk->lock);
+    if (vk->cmds_pending.num > 0) {
+        struct vk_cmd *last_cmd = vk->cmds_pending.elem[vk->cmds_pending.num - 1];
+        vk_cmd_callback(last_cmd, callback, priv, arg);
     } else {
         // The device was already idle, so we can just immediately call it
         callback((void *) priv, (void *) arg);
     }
+    pl_mutex_unlock(&vk->lock);
 }
 
 void vk_cmd_callback(struct vk_cmd *cmd, vk_cb callback,
@@ -107,235 +131,254 @@ void vk_cmd_callback(struct vk_cmd *cmd, vk_cb callback,
     });
 }
 
-void vk_cmd_dep(struct vk_cmd *cmd, VkSemaphore dep, VkPipelineStageFlags stage)
+void vk_cmd_dep(struct vk_cmd *cmd, VkPipelineStageFlags2 stage, pl_vulkan_sem dep)
 {
-    pl_assert(cmd->deps.num == cmd->depstages.num);
-    PL_ARRAY_APPEND(cmd, cmd->deps, dep);
-    PL_ARRAY_APPEND(cmd, cmd->depstages, stage);
+    PL_ARRAY_APPEND(cmd, cmd->deps, (VkSemaphoreSubmitInfo) {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .semaphore  = dep.sem,
+        .value      = dep.value,
+        .stageMask  = stage,
+    });
 }
 
-void vk_cmd_obj(struct vk_cmd *cmd, const void *obj)
+void vk_cmd_sig(struct vk_cmd *cmd, VkPipelineStageFlags2 stage, pl_vulkan_sem sig)
 {
-    PL_ARRAY_APPEND(cmd, cmd->objs, obj);
-}
-
-void vk_cmd_sig(struct vk_cmd *cmd, VkSemaphore sig)
-{
-    PL_ARRAY_APPEND(cmd, cmd->sigs, sig);
-}
-
-struct vk_signal {
-    VkSemaphore semaphore;
-    VkEvent event;
-    enum vk_wait_type type; // last signal type
-    VkQueue source;         // last signal source
-};
-
-struct vk_signal *vk_cmd_signal(struct vk_ctx *vk, struct vk_cmd *cmd,
-                                VkPipelineStageFlags stage)
-{
-    struct vk_signal *sig = NULL;
-    if (PL_ARRAY_POP(vk->signals, &sig))
-        goto done;
-
-    // no available signal => initialize a new one
-    sig = pl_zalloc_ptr(NULL, sig);
-    static const VkSemaphoreCreateInfo sinfo = {
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+    VkSemaphoreSubmitInfo sinfo = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .semaphore  = sig.sem,
+        .value      = sig.value,
+        .stageMask  = stage,
     };
 
-    // We can skip creating the semaphores if there's only one queue
-    if (vk->pools.num > 1 || vk->pools.elem[0]->num_queues > 1) {
-        VK(vk->CreateSemaphore(vk->dev, &sinfo, PL_VK_ALLOC, &sig->semaphore));
-        PL_VK_NAME(SEMAPHORE, sig->semaphore, "sig");
-    }
-
-    static const VkEventCreateInfo einfo = {
-        .sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO,
-    };
-
-    if (!vk->disable_events) {
-        VkResult res = vk->CreateEvent(vk->dev, &einfo, PL_VK_ALLOC, &sig->event);
-        if (res == VK_ERROR_FEATURE_NOT_PRESENT) {
-            // Some vulkan implementations don't support VkEvents since they are
-            // not part of the vulkan portable subset. So fail gracefully here.
-            sig->event = VK_NULL_HANDLE;
-            vk->disable_events = true;
-            PL_INFO(vk, "VkEvent creation failed.. disabling events");
-        } else {
-            PL_VK_ASSERT(res, "Creating VkEvent");
-            PL_VK_NAME(EVENT, sig->event, "sig");
+    // Try updating existing semaphore signal operations in-place
+    for (int i = 0; i < cmd->sigs.num; i++) {
+        if (cmd->sigs.elem[i].semaphore == sig.sem) {
+            pl_assert(sig.value > cmd->sigs.elem[i].value);
+            cmd->sigs.elem[i] = sinfo;
+            return;
         }
     }
 
-done:
-    // Signal both the semaphore, and the event if possible. (We will only
-    // end up using one or the other)
-    sig->type = VK_WAIT_NONE;
-    sig->source = cmd->queue;
-    if (sig->semaphore)
-        vk_cmd_sig(cmd, sig->semaphore);
-
-    VkQueueFlags req = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
-    if (sig->event && (cmd->pool->props.queueFlags & req)) {
-        vk->CmdSetEvent(cmd->buf, sig->event, stage);
-        sig->type = VK_WAIT_EVENT;
-    }
-
-    return sig;
-
-error:
-    vk_signal_destroy(vk, &sig);
-    vk->failed = true;
-    return NULL;
+    PL_ARRAY_APPEND(cmd, cmd->sigs, sinfo);
 }
 
-static bool unsignal_cmd(struct vk_cmd *cmd, VkSemaphore sem)
+#define SET(FLAG, CHECK)  \
+    if (flags2 & (CHECK)) \
+        flags |= FLAG
+
+static VkAccessFlags lower_access2(VkAccessFlags2 flags2)
 {
-    if (!sem)
-        return true;
-
-    for (int n = 0; n < cmd->sigs.num; n++) {
-        if (cmd->sigs.elem[n] == sem) {
-            PL_ARRAY_REMOVE_AT(cmd->sigs, n);
-            return true;
-        }
-    }
-
-    return false;
+    VkAccessFlags flags = flags2 & VK_ACCESS_FLAG_BITS_MAX_ENUM;
+    SET(VK_ACCESS_SHADER_READ_BIT,  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    SET(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    return flags;
 }
 
-// Attempts to remove a queued signal operation. Returns true if sucessful,
-// i.e. the signal could be removed before it ever got fired.
-static bool unsignal(struct vk_ctx *vk, struct vk_cmd *cmd, VkSemaphore sem)
+static VkPipelineStageFlags lower_stage2(VkPipelineStageFlags2 flags2)
 {
-    if (unsignal_cmd(cmd, sem))
-        return true;
-
-    // Attempt to remove it from any queued commands
-    for (int i = 0; i < vk->cmds_queued.num; i++) {
-        if (unsignal_cmd(vk->cmds_queued.elem[i], sem))
-            return true;
-    }
-
-    return false;
+    VkPipelineStageFlags flags = flags2 & VK_PIPELINE_STAGE_FLAG_BITS_MAX_ENUM;
+    SET(VK_PIPELINE_STAGE_TRANSFER_BIT,     VK_PIPELINE_STAGE_2_COPY_BIT |
+                                            VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+                                            VK_PIPELINE_STAGE_2_BLIT_BIT |
+                                            VK_PIPELINE_STAGE_2_CLEAR_BIT);
+    SET(VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
+                                            VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT);
+    return flags;
 }
 
-static void release_signal(struct vk_ctx *vk, struct vk_signal *sig)
+#undef SET
+
+void vk_cmd_barrier(struct vk_cmd *cmd, const VkDependencyInfo *info)
 {
-    // The semaphore never needs to be recreated, because it's either
-    // unsignaled while still queued, or unsignaled as a result of a device
-    // wait. But the event *may* need to be reset, so just always reset it.
-    if (sig->event)
-        vk->ResetEvent(vk->dev, sig->event);
-    sig->source = NULL;
-    PL_ARRAY_APPEND(vk->alloc, vk->signals, sig);
-}
-
-enum vk_wait_type vk_cmd_wait(struct vk_ctx *vk, struct vk_cmd *cmd,
-                              struct vk_signal **sigptr,
-                              VkPipelineStageFlags stage,
-                              VkEvent *out_event)
-{
-    struct vk_signal *sig = *sigptr;
-    if (!sig)
-        return VK_WAIT_NONE;
-
-    if (sig->source == cmd->queue && unsignal(vk, cmd, sig->semaphore)) {
-        // If we can remove the semaphore signal operation from the history and
-        // pretend it never happened, then we get to use the more efficient
-        // synchronization primitives. However, this requires that we're still
-        // in the same VkQueue.
-        if (sig->type == VK_WAIT_EVENT && out_event) {
-            *out_event = sig->event;
-        } else {
-            sig->type = VK_WAIT_BARRIER;
-        }
-    } else {
-        // Otherwise, we use the semaphore. (This also unsignals it as a result
-        // of the command execution)
-        vk_cmd_dep(cmd, sig->semaphore, stage);
-        sig->type = VK_WAIT_NONE;
-    }
-
-    // In either case, once the command completes, we can release the signal
-    // resource back to the pool.
-    vk_cmd_callback(cmd, (vk_cb) release_signal, vk, sig);
-    *sigptr = NULL;
-    return sig->type;
-}
-
-void vk_signal_destroy(struct vk_ctx *vk, struct vk_signal **sig)
-{
-    if (!*sig)
+    struct vk_ctx *vk = cmd->pool->vk;
+    if (vk->CmdPipelineBarrier2KHR) {
+        vk->CmdPipelineBarrier2KHR(cmd->buf, info);
         return;
+    }
 
-    vk->DestroySemaphore(vk->dev, (*sig)->semaphore, PL_VK_ALLOC);
-    vk->DestroyEvent(vk->dev, (*sig)->event, PL_VK_ALLOC);
-    pl_free(*sig);
-    *sig = NULL;
+    pl_assert(!info->pNext);
+    pl_assert(info->memoryBarrierCount == 0);
+    pl_assert(info->bufferMemoryBarrierCount + info->imageMemoryBarrierCount == 1);
+
+    if (info->bufferMemoryBarrierCount) {
+
+        const VkBufferMemoryBarrier2 *barr2 = info->pBufferMemoryBarriers;
+        const VkBufferMemoryBarrier barr = {
+            .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .pNext               = barr2->pNext,
+            .srcAccessMask       = lower_access2(barr2->srcAccessMask),
+            .dstAccessMask       = lower_access2(barr2->dstAccessMask),
+            .srcQueueFamilyIndex = barr2->srcQueueFamilyIndex,
+            .dstQueueFamilyIndex = barr2->dstQueueFamilyIndex,
+            .buffer              = barr2->buffer,
+            .offset              = barr2->offset,
+            .size                = barr2->size,
+        };
+
+        vk->CmdPipelineBarrier(cmd->buf, lower_stage2(barr2->srcStageMask),
+                               lower_stage2(barr2->dstStageMask),
+                               info->dependencyFlags,
+                               0, NULL, 1, &barr, 0, NULL);
+
+    } else {
+
+        const VkImageMemoryBarrier2 *barr2 = info->pImageMemoryBarriers;
+        const VkImageMemoryBarrier barr = {
+            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext               = barr2->pNext,
+            .srcAccessMask       = lower_access2(barr2->srcAccessMask),
+            .dstAccessMask       = lower_access2(barr2->dstAccessMask),
+            .oldLayout           = barr2->oldLayout,
+            .newLayout           = barr2->newLayout,
+            .srcQueueFamilyIndex = barr2->srcQueueFamilyIndex,
+            .dstQueueFamilyIndex = barr2->dstQueueFamilyIndex,
+            .image               = barr2->image,
+            .subresourceRange    = barr2->subresourceRange,
+        };
+
+        vk->CmdPipelineBarrier(cmd->buf, lower_stage2(barr2->srcStageMask),
+                               lower_stage2(barr2->dstStageMask),
+                               info->dependencyFlags,
+                               0, NULL, 0, NULL, 1, &barr);
+    }
 }
 
-struct vk_cmdpool *vk_cmdpool_create(struct vk_ctx *vk,
-                                     VkDeviceQueueCreateInfo qinfo,
+struct vk_sync_scope vk_sem_barrier(struct vk_cmd *cmd, struct vk_sem *sem,
+                                    VkPipelineStageFlags2 stage,
+                                    VkAccessFlags2 access, bool is_trans)
+{
+    bool is_write = (access & vk_access_write) || is_trans;
+
+    // Writes need to be synchronized against the last *read* (which is
+    // transitively synchronized against the last write), reads only
+    // need to be synchronized against the last write.
+    struct vk_sync_scope last = sem->write;
+    if (is_write && sem->read.access)
+        last = sem->read;
+
+    if (last.queue != cmd->queue) {
+        if (!is_write && sem->read.queue == cmd->queue) {
+            // No semaphore needed in this case because the implicit submission
+            // order execution dependencies already transitively imply a wait
+            // for the previous write
+        } else if (last.sync.sem) {
+            // Image barrier still needs to depend on this stage for implicit
+            // ordering guarantees to apply properly
+            vk_cmd_dep(cmd, stage, last.sync);
+            last.stage = stage;
+        }
+
+        // Last access is on different queue, so no pipeline barrier needed
+        last.access = 0;
+    }
+
+    if (!is_write && sem->read.queue == cmd->queue &&
+        (sem->read.stage & stage) == stage &&
+        (sem->read.access & access) == access)
+    {
+        // A past pipeline barrier already covers this access transitively, so
+        // we don't need to emit another pipeline barrier at all
+        last.access = 0;
+    }
+
+    if (is_write) {
+        sem->write = (struct vk_sync_scope) {
+            .sync = cmd->sync,
+            .queue = cmd->queue,
+            .stage = stage,
+            .access = access,
+        };
+
+        sem->read = (struct vk_sync_scope) {
+            .sync = cmd->sync,
+            .queue = cmd->queue,
+            // no stage or access scope, because no reads happened yet
+        };
+    } else if (sem->read.queue == cmd->queue) {
+        // Coalesce multiple same-queue reads into a single access scope
+        sem->read.sync = cmd->sync;
+        sem->read.stage |= stage;
+        sem->read.access |= access;
+    } else {
+        sem->read = (struct vk_sync_scope) {
+            .sync = cmd->sync,
+            .queue = cmd->queue,
+            .stage = stage,
+            .access = access,
+        };
+    }
+
+    // We never need to include pipeline barriers for reads, only writes
+    last.access &= vk_access_write;
+    return last;
+}
+
+struct vk_cmdpool *vk_cmdpool_create(struct vk_ctx *vk, int qf, int qnum,
                                      VkQueueFamilyProperties props)
 {
     struct vk_cmdpool *pool = pl_alloc_ptr(NULL, pool);
     *pool = (struct vk_cmdpool) {
-        .props = props,
-        .qf = qinfo.queueFamilyIndex,
-        .queues = pl_calloc(pool, qinfo.queueCount, sizeof(VkQueue)),
-        .num_queues = qinfo.queueCount,
+        .vk         = vk,
+        .props      = props,
+        .qf         = qf,
+        .queues     = pl_calloc(pool, qnum, sizeof(VkQueue)),
+        .num_queues = qnum,
     };
 
-    for (int n = 0; n < pool->num_queues; n++)
-        vk->GetDeviceQueue(vk->dev, pool->qf, n, &pool->queues[n]);
+    for (int n = 0; n < qnum; n++)
+        vk->GetDeviceQueue(vk->dev, qf, n, &pool->queues[n]);
 
     VkCommandPoolCreateInfo cinfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
                  VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-        .queueFamilyIndex = pool->qf,
+        .queueFamilyIndex = qf,
     };
 
     VK(vk->CreateCommandPool(vk->dev, &cinfo, PL_VK_ALLOC, &pool->pool));
-
     return pool;
 
 error:
-    vk_cmdpool_destroy(vk, pool);
+    vk_cmdpool_destroy(pool);
     vk->failed = true;
     return NULL;
 }
 
-void vk_cmdpool_destroy(struct vk_ctx *vk, struct vk_cmdpool *pool)
+void vk_cmdpool_destroy(struct vk_cmdpool *pool)
 {
     if (!pool)
         return;
 
     for (int i = 0; i < pool->cmds.num; i++)
-        vk_cmd_destroy(vk, pool->cmds.elem[i]);
+        vk_cmd_destroy(pool->cmds.elem[i]);
 
+    struct vk_ctx *vk = pool->vk;
     vk->DestroyCommandPool(vk->dev, pool->pool, PL_VK_ALLOC);
     pl_free(pool);
 }
 
-struct vk_cmd *vk_cmd_begin(struct vk_ctx *vk, struct vk_cmdpool *pool)
+struct vk_cmd *vk_cmd_begin(struct vk_cmdpool *pool, pl_debug_tag debug_tag)
 {
+    struct vk_ctx *vk = pool->vk;
+
     // Garbage collect the cmdpool first, to increase the chances of getting
     // an already-available command buffer.
     vk_poll_commands(vk, 0);
 
     struct vk_cmd *cmd = NULL;
-    if (PL_ARRAY_POP(pool->cmds, &cmd))
-        goto done;
+    pl_mutex_lock(&vk->lock);
+    if (!PL_ARRAY_POP(pool->cmds, &cmd)) {
+        cmd = vk_cmd_create(pool);
+        if (!cmd) {
+            pl_mutex_unlock(&vk->lock);
+            goto error;
+        }
+    }
 
-    // No free command buffers => allocate another one
-    cmd = vk_cmd_create(vk, pool);
-    if (!cmd)
-        goto error;
-
-done: ;
+    cmd->qindex = pool->idx_queues;
+    cmd->queue = pool->queues[cmd->qindex];
+    pl_mutex_unlock(&vk->lock);
 
     VkCommandBufferBeginInfo binfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -344,39 +387,132 @@ done: ;
 
     VK(vk->BeginCommandBuffer(cmd->buf, &binfo));
 
-    cmd->queue = pool->queues[pool->idx_queues];
+    debug_tag = PL_DEF(debug_tag, "vk_cmd");
+    PL_VK_NAME_HANDLE(COMMAND_BUFFER, cmd->buf, debug_tag);
+    PL_VK_NAME(SEMAPHORE, cmd->sync.sem, debug_tag);
+
+    cmd->sync.value++;
+    vk_cmd_sig(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, cmd->sync);
     return cmd;
 
 error:
     // Something has to be seriously messed up if we get to this point
-    vk_cmd_destroy(vk, cmd);
+    vk_cmd_destroy(cmd);
     vk->failed = true;
     return NULL;
 }
 
-bool vk_cmd_queue(struct vk_ctx *vk, struct vk_cmd **pcmd)
+static VkResult vk_queue_submit2(struct vk_ctx *vk, VkQueue queue,
+                                 const VkSubmitInfo2 *info2, VkFence fence)
+{
+    if (vk->QueueSubmit2KHR)
+        return vk->QueueSubmit2KHR(queue, 1, info2, fence);
+
+    const uint32_t num_deps = info2->waitSemaphoreInfoCount;
+    const uint32_t num_sigs = info2->signalSemaphoreInfoCount;
+    const uint32_t num_cmds = info2->commandBufferInfoCount;
+
+    void *tmp = pl_tmp(NULL);
+    VkSemaphore *deps           = pl_calloc_ptr(tmp, num_deps, deps);
+    VkPipelineStageFlags *masks = pl_calloc_ptr(tmp, num_deps, masks);
+    uint64_t *depvals           = pl_calloc_ptr(tmp, num_deps, depvals);
+    VkSemaphore *sigs           = pl_calloc_ptr(tmp, num_sigs, sigs);
+    uint64_t *sigvals           = pl_calloc_ptr(tmp, num_sigs, sigvals);
+    VkCommandBuffer *cmds       = pl_calloc_ptr(tmp, num_cmds, cmds);
+
+    for (int i = 0; i < num_deps; i++) {
+        deps[i] = info2->pWaitSemaphoreInfos[i].semaphore;
+        masks[i] = info2->pWaitSemaphoreInfos[i].stageMask;
+        depvals[i] = info2->pWaitSemaphoreInfos[i].value;
+    }
+    for (int i = 0; i < num_sigs; i++) {
+        sigs[i] = info2->pSignalSemaphoreInfos[i].semaphore;
+        sigvals[i] = info2->pSignalSemaphoreInfos[i].value;
+    }
+    for (int i = 0; i < num_cmds; i++)
+        cmds[i] = info2->pCommandBufferInfos[i].commandBuffer;
+
+    const VkTimelineSemaphoreSubmitInfo tinfo = {
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .pNext = info2->pNext,
+        .waitSemaphoreValueCount = num_deps,
+        .pWaitSemaphoreValues = depvals,
+        .signalSemaphoreValueCount = num_sigs,
+        .pSignalSemaphoreValues = sigvals,
+    };
+
+    const VkSubmitInfo info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = &tinfo,
+        .waitSemaphoreCount = num_deps,
+        .pWaitSemaphores = deps,
+        .pWaitDstStageMask = masks,
+        .commandBufferCount = num_cmds,
+        .pCommandBuffers = cmds,
+        .signalSemaphoreCount = num_sigs,
+        .pSignalSemaphores = sigs,
+    };
+
+    VkResult res = vk->QueueSubmit(queue, 1, &info, fence);
+    pl_free(tmp);
+    return res;
+}
+
+bool vk_cmd_submit(struct vk_cmd **pcmd)
 {
     struct vk_cmd *cmd = *pcmd;
-    struct vk_cmdpool *pool = cmd->pool;
+    if (!cmd)
+        return true;
+
     *pcmd = NULL;
+    struct vk_cmdpool *pool = cmd->pool;
+    struct vk_ctx *vk = pool->vk;
 
     VK(vk->EndCommandBuffer(cmd->buf));
 
-    VK(vk->ResetFences(vk->dev, 1, &cmd->fence));
-    PL_ARRAY_APPEND(vk->alloc, vk->cmds_queued, cmd);
-    vk->last_cmd = cmd;
+    VkSubmitInfo2 sinfo = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .waitSemaphoreInfoCount = cmd->deps.num,
+        .pWaitSemaphoreInfos = cmd->deps.elem,
+        .signalSemaphoreInfoCount = cmd->sigs.num,
+        .pSignalSemaphoreInfos = cmd->sigs.elem,
+        .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &(VkCommandBufferSubmitInfo) {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+            .commandBuffer = cmd->buf,
+        },
+    };
 
-    if (vk->cmds_queued.num >= PL_VK_MAX_QUEUED_CMDS) {
-        PL_WARN(vk, "Exhausted the queued command limit.. forcing a flush now. "
-                "Consider using pl_gpu_flush after submitting a batch of work?");
-        vk_flush_commands(vk);
+    if (pl_msg_test(vk->log, PL_LOG_TRACE)) {
+        PL_TRACE(vk, "Submitting command %p on queue %p (QF %d):",
+                 (void *) cmd->buf, (void *) cmd->queue, pool->qf);
+        for (int n = 0; n < cmd->deps.num; n++) {
+            PL_TRACE(vk, "    waits on semaphore 0x%"PRIx64" = %"PRIu64,
+                     (uint64_t) cmd->deps.elem[n].semaphore, cmd->deps.elem[n].value);
+        }
+        for (int n = 0; n < cmd->sigs.num; n++) {
+            PL_TRACE(vk, "    signals semaphore 0x%"PRIx64" = %"PRIu64,
+                    (uint64_t) cmd->sigs.elem[n].semaphore, cmd->sigs.elem[n].value);
+        }
+        if (cmd->callbacks.num)
+            PL_TRACE(vk, "    signals %d callbacks", cmd->callbacks.num);
     }
 
+    vk->lock_queue(vk->queue_ctx, pool->qf, cmd->qindex);
+    VkResult res = vk_queue_submit2(vk, cmd->queue, &sinfo, VK_NULL_HANDLE);
+    vk->unlock_queue(vk->queue_ctx, pool->qf, cmd->qindex);
+    PL_VK_ASSERT(res, "vkQueueSubmit2");
+
+    pl_mutex_lock(&vk->lock);
+    PL_ARRAY_APPEND(vk->alloc, vk->cmds_pending, cmd);
+    pl_mutex_unlock(&vk->lock);
     return true;
 
 error:
-    vk_cmd_reset(vk, cmd);
+    vk_cmd_reset(cmd);
+    pl_mutex_lock(&vk->lock);
     PL_ARRAY_APPEND(pool, pool->cmds, cmd);
+    pl_mutex_unlock(&vk->lock);
     vk->failed = true;
     return false;
 }
@@ -384,128 +520,52 @@ error:
 bool vk_poll_commands(struct vk_ctx *vk, uint64_t timeout)
 {
     bool ret = false;
+    pl_mutex_lock(&vk->lock);
 
-    while (vk->cmds_pending.num > 0) {
+    while (vk->cmds_pending.num) {
         struct vk_cmd *cmd = vk->cmds_pending.elem[0];
         struct vk_cmdpool *pool = cmd->pool;
-        VkResult res = vk_cmd_poll(vk, cmd, timeout);
-        if (res == VK_TIMEOUT)
-            break;
-        PL_TRACE(vk, "VkFence signalled: %p", (void *) cmd->fence);
-        vk_cmd_reset(vk, cmd);
-        PL_ARRAY_REMOVE_AT(vk->cmds_pending, 0);
+        pl_mutex_unlock(&vk->lock); // don't hold mutex while blocking
+        if (vk_cmd_poll(cmd, timeout) == VK_TIMEOUT)
+            return ret;
+        pl_mutex_lock(&vk->lock);
+        if (!vk->cmds_pending.num || vk->cmds_pending.elem[0] != cmd)
+            continue; // another thread modified this state while blocking
+
+        PL_TRACE(vk, "VkSemaphore signalled: 0x%"PRIx64" = %"PRIu64,
+                 (uint64_t) cmd->sync.sem, cmd->sync.value);
+        PL_ARRAY_REMOVE_AT(vk->cmds_pending, 0); // remove before callbacks
+        vk_cmd_reset(cmd);
         PL_ARRAY_APPEND(pool, pool->cmds, cmd);
         ret = true;
 
         // If we've successfully spent some time waiting for at least one
         // command, disable the timeout. This has the dual purpose of both
-        // making sure we don't over-wait due to repeat timeout applicaiton,
+        // making sure we don't over-wait due to repeat timeout application,
         // but also makes sure we don't block on future commands if we've
         // already spend time waiting for one.
         timeout = 0;
     }
 
-    return ret;
-}
-
-bool vk_flush_commands(struct vk_ctx *vk)
-{
-    return vk_flush_obj(vk, NULL);
-}
-
-bool vk_flush_obj(struct vk_ctx *vk, const void *obj)
-{
-    // Count how many commands we want to flush
-    int num_to_flush = vk->cmds_queued.num;
-    if (obj) {
-        num_to_flush = 0;
-        for (int i = 0; i < vk->cmds_queued.num; i++) {
-            struct vk_cmd *cmd = vk->cmds_queued.elem[i];
-            for (int o = 0; o < cmd->objs.num; o++) {
-                if (cmd->objs.elem[o] == obj) {
-                    num_to_flush = i+1;
-                    goto next_cmd;
-                }
-            }
-
-next_cmd: ;
-        }
-    }
-
-    if (!num_to_flush)
-        return true;
-
-    PL_TRACE(vk, "Flushing %d/%d queued commands",
-             num_to_flush, vk->cmds_queued.num);
-
-    bool ret = true;
-
-    for (int i = 0; i < num_to_flush; i++) {
-        struct vk_cmd *cmd = vk->cmds_queued.elem[i];
-        struct vk_cmdpool *pool = cmd->pool;
-
-        VkSubmitInfo sinfo = {
-            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &cmd->buf,
-            .waitSemaphoreCount = cmd->deps.num,
-            .pWaitSemaphores = cmd->deps.elem,
-            .pWaitDstStageMask = cmd->depstages.elem,
-            .signalSemaphoreCount = cmd->sigs.num,
-            .pSignalSemaphores = cmd->sigs.elem,
-        };
-
-        if (pl_msg_test(vk->ctx, PL_LOG_TRACE)) {
-            PL_TRACE(vk, "Submitting command on queue %p (QF %d):",
-                     (void *)cmd->queue, pool->qf);
-            for (int n = 0; n < cmd->objs.num; n++)
-                PL_TRACE(vk, "    uses object %p", cmd->objs.elem[n]);
-            for (int n = 0; n < cmd->deps.num; n++)
-                PL_TRACE(vk, "    waits on semaphore %p", (void *) cmd->deps.elem[n]);
-            for (int n = 0; n < cmd->sigs.num; n++)
-                PL_TRACE(vk, "    signals semaphore %p", (void *) cmd->sigs.elem[n]);
-            PL_TRACE(vk, "    signals fence %p", (void *) cmd->fence);
-            if (cmd->callbacks.num)
-                PL_TRACE(vk, "    signals %d callbacks", cmd->callbacks.num);
-        }
-
-        VK(vk->QueueSubmit(cmd->queue, 1, &sinfo, cmd->fence));
-        PL_ARRAY_APPEND(vk->alloc, vk->cmds_pending, cmd);
-        continue;
-
-error:
-        vk_cmd_reset(vk, cmd);
-        PL_ARRAY_APPEND(pool, pool->cmds, cmd);
-        vk->failed = true;
-        ret = false;
-    }
-
-    // Move remaining commands back to index 0
-    vk->cmds_queued.num -= num_to_flush;
-    if (vk->cmds_queued.num) {
-        memmove(vk->cmds_queued.elem, &vk->cmds_queued.elem[num_to_flush],
-                vk->cmds_queued.num * sizeof(vk->cmds_queued.elem[0]));
-    }
-
-    // Wait until we've processed some of the now pending commands
-    while (vk->cmds_pending.num > PL_VK_MAX_PENDING_CMDS)
-        vk_poll_commands(vk, UINT64_MAX);
-
+    pl_mutex_unlock(&vk->lock);
     return ret;
 }
 
 void vk_rotate_queues(struct vk_ctx *vk)
 {
+    pl_mutex_lock(&vk->lock);
+
     // Rotate the queues to ensure good parallelism across frames
     for (int i = 0; i < vk->pools.num; i++) {
         struct vk_cmdpool *pool = vk->pools.elem[i];
         pool->idx_queues = (pool->idx_queues + 1) % pool->num_queues;
         PL_TRACE(vk, "QF %d: %d/%d", pool->qf, pool->idx_queues, pool->num_queues);
     }
+
+    pl_mutex_unlock(&vk->lock);
 }
 
 void vk_wait_idle(struct vk_ctx *vk)
 {
-    vk_flush_commands(vk);
     while (vk_poll_commands(vk, UINT64_MAX)) ;
 }

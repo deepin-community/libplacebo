@@ -19,14 +19,19 @@
 
 #include "common.h"
 
+#include <libplacebo/swapchain.h>
+
+// This struct must be the first member of the swapchains's priv struct. The
+// `pl_swapchain` helpers will cast the priv struct to this struct!
+
 #define SW_PFN(name) __typeof__(pl_swapchain_##name) *name
 struct pl_sw_fns {
     // This destructor follows the same rules as `pl_gpu_fns`
-    void (*destroy)(const struct pl_swapchain *sw);
+    void (*destroy)(pl_swapchain sw);
 
     SW_PFN(latency); // optional
     SW_PFN(resize); // optional
-    SW_PFN(hdr_metadata); // optional
+    SW_PFN(colorspace_hint); // optional
     SW_PFN(start_frame);
     SW_PFN(submit_frame);
     SW_PFN(swap_buffers);

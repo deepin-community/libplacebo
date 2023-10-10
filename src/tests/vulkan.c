@@ -1,40 +1,42 @@
+#include <vulkan/vulkan.h>
+
 #include "gpu_tests.h"
 #include "vulkan/command.h"
 #include "vulkan/gpu.h"
-#include <vulkan/vulkan.h>
 
-static void vulkan_interop_tests(const struct pl_vulkan *pl_vk,
+#include <libplacebo/vulkan.h>
+
+static void vulkan_interop_tests(pl_vulkan pl_vk,
                                  enum pl_handle_type handle_type)
 {
-    const struct pl_gpu *gpu = pl_vk->gpu;
+    pl_gpu gpu = pl_vk->gpu;
     printf("testing vulkan interop for handle type 0x%x\n", handle_type);
 
     if (gpu->export_caps.buf & handle_type) {
-        const struct pl_buf *buf = pl_buf_create(gpu, &(struct pl_buf_params) {
+        pl_buf buf = pl_buf_create(gpu, pl_buf_params(
             .size = 1024,
             .export_handle = handle_type,
-        });
+        ));
 
         REQUIRE(buf);
-        REQUIRE(buf->shared_mem.handle.fd > -1);
-        REQUIRE(buf->shared_mem.size >= buf->params.size);
+        REQUIRE_HANDLE(buf->shared_mem, handle_type);
+        REQUIRE_CMP(buf->shared_mem.size, >=, buf->params.size, "zu");
         REQUIRE(pl_buf_export(gpu, buf));
         pl_buf_destroy(gpu, &buf);
     }
 
-    const struct pl_fmt *fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 0, 0,
-                                           PL_FMT_CAP_BLITTABLE);
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 0, 0, PL_FMT_CAP_BLITTABLE);
     if (!fmt)
         return;
 
     if (gpu->export_caps.sync & handle_type) {
-        const struct pl_sync *sync = pl_sync_create(gpu, handle_type);
-        const struct pl_tex *tex = pl_tex_create(gpu, &(struct pl_tex_params) {
+        pl_sync sync = pl_sync_create(gpu, handle_type);
+        pl_tex tex = pl_tex_create(gpu, pl_tex_params(
             .w = 32,
             .h = 32,
             .format = fmt,
             .blit_dst = true,
-        });
+        ));
 
         REQUIRE(sync);
         REQUIRE(tex);
@@ -48,13 +50,11 @@ static void vulkan_interop_tests(const struct pl_vulkan *pl_vk,
 
         // Re-use our internal helpers to signal this VkSemaphore
         struct vk_ctx *vk = PL_PRIV(pl_vk);
-        struct vk_cmd *cmd = vk_cmd_begin(vk, vk->pool_graphics);
-        VkSemaphore signal;
+        struct vk_cmd *cmd = vk_cmd_begin(vk->pool_graphics, NULL);
         REQUIRE(cmd);
-        pl_vk_sync_unwrap(sync, NULL, &signal);
-        vk_cmd_sig(cmd, signal);
-        vk_cmd_queue(vk, &cmd);
-        REQUIRE(vk_flush_commands(vk));
+        struct pl_sync_vk *sync_vk = PL_PRIV(sync);
+        vk_cmd_sig(cmd, VK_PIPELINE_STAGE_2_NONE, (pl_vulkan_sem){ sync_vk->signal });
+        REQUIRE(vk_cmd_submit(&cmd));
 
         // Do something with the image again to "import" it
         pl_tex_clear(gpu, tex, (float[4]){0});
@@ -64,19 +64,59 @@ static void vulkan_interop_tests(const struct pl_vulkan *pl_vk,
         pl_sync_destroy(gpu, &sync);
         pl_tex_destroy(gpu, &tex);
     }
+
+    // Test interop API
+    if (gpu->export_caps.tex & handle_type) {
+        VkSemaphore sem = pl_vulkan_sem_create(gpu, pl_vulkan_sem_params(
+            .type           = VK_SEMAPHORE_TYPE_TIMELINE,
+            .initial_value  = 0,
+        ));
+
+        pl_tex tex = pl_tex_create(gpu, pl_tex_params(
+            .w              = 32,
+            .h              = 32,
+            .format         = fmt,
+            .blit_dst       = true,
+            .export_handle  = handle_type,
+        ));
+
+        REQUIRE(sem);
+        REQUIRE(tex);
+
+        REQUIRE(pl_vulkan_hold_ex(gpu, pl_vulkan_hold_params(
+            .tex            = tex,
+            .layout         = VK_IMAGE_LAYOUT_GENERAL,
+            .qf             = VK_QUEUE_FAMILY_EXTERNAL,
+            .semaphore      = { sem, 1 },
+        )));
+
+        pl_vulkan_release_ex(gpu, pl_vulkan_release_params(
+            .tex            = tex,
+            .layout         = VK_IMAGE_LAYOUT_GENERAL,
+            .qf             = VK_QUEUE_FAMILY_EXTERNAL,
+            .semaphore      = { sem, 1 },
+        ));
+
+        pl_tex_clear(gpu, tex, (float[4]){0});
+        pl_gpu_finish(gpu);
+        REQUIRE(!pl_tex_poll(gpu, tex, 0));
+
+        pl_vulkan_sem_destroy(gpu, &sem);
+        pl_tex_destroy(gpu, &tex);
+    }
 }
 
-static void vulkan_swapchain_tests(const struct pl_vulkan *vk, VkSurfaceKHR surf)
+static void vulkan_swapchain_tests(pl_vulkan vk, VkSurfaceKHR surf)
 {
     if (!surf)
         return;
 
     printf("testing vulkan swapchain\n");
-    const struct pl_gpu *gpu = vk->gpu;
-    const struct pl_swapchain *sw;
-    sw = pl_vulkan_create_swapchain(vk, &(struct pl_vulkan_swapchain_params) {
+    pl_gpu gpu = vk->gpu;
+    pl_swapchain sw;
+    sw = pl_vulkan_create_swapchain(vk, pl_vulkan_swapchain_params(
         .surface = surf,
-    });
+    ));
     REQUIRE(sw);
 
     // Attempt actually initializing the swapchain
@@ -109,23 +149,23 @@ static void vulkan_swapchain_tests(const struct pl_vulkan *vk, VkSurfaceKHR surf
 
 int main()
 {
-    struct pl_context *ctx = pl_test_context();
-    const struct pl_vk_inst *inst;
-    inst = pl_vk_inst_create(ctx, &(struct pl_vk_inst_params) {
+    pl_log log = pl_test_logger();
+    pl_vk_inst inst = pl_vk_inst_create(log, pl_vk_inst_params(
         .debug = true,
         .debug_extra = true,
+        .get_proc_addr = vkGetInstanceProcAddr,
         .opt_extensions = (const char *[]){
             VK_KHR_SURFACE_EXTENSION_NAME,
-            "VK_EXT_headless_surface", // in case it isn't defined
+            VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME,
         },
         .num_opt_extensions = 2,
-    });
+    ));
 
     if (!inst)
         return SKIP;
 
-    PL_VK_LOAD_FUN(inst->instance, EnumeratePhysicalDevices, vkGetInstanceProcAddr);
-    PL_VK_LOAD_FUN(inst->instance, GetPhysicalDeviceProperties, vkGetInstanceProcAddr);
+    PL_VK_LOAD_FUN(inst->instance, EnumeratePhysicalDevices, inst->get_proc_addr);
+    PL_VK_LOAD_FUN(inst->instance, GetPhysicalDeviceProperties, inst->get_proc_addr);
 
     uint32_t num = 0;
     EnumeratePhysicalDevices(inst->instance, &num, NULL);
@@ -137,58 +177,71 @@ int main()
         return 1;
     EnumeratePhysicalDevices(inst->instance, &num, devices);
 
-    VkSurfaceKHR surf = NULL;
+    VkSurfaceKHR surf = VK_NULL_HANDLE;
 
-#ifdef VK_EXT_headless_surface
-    PL_VK_LOAD_FUN(inst->instance, CreateHeadlessSurfaceEXT, vkGetInstanceProcAddr);
+    PL_VK_LOAD_FUN(inst->instance, CreateHeadlessSurfaceEXT, inst->get_proc_addr);
     if (CreateHeadlessSurfaceEXT) {
         VkHeadlessSurfaceCreateInfoEXT info = {
             .sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT,
         };
 
         VkResult res = CreateHeadlessSurfaceEXT(inst->instance, &info, NULL, &surf);
-        REQUIRE(res == VK_SUCCESS);
+        REQUIRE_CMP(res, ==, VK_SUCCESS, "u");
     }
-#endif // VK_EXT_headless_surface
 
     // Make sure choosing any device works
     VkPhysicalDevice dev;
-    dev = pl_vulkan_choose_device(ctx, &(struct pl_vulkan_device_params) {
+    dev = pl_vulkan_choose_device(log, pl_vulkan_device_params(
         .instance = inst->instance,
+        .get_proc_addr = inst->get_proc_addr,
         .allow_software = true,
         .surface = surf,
-    });
-    REQUIRE(dev);
+    ));
+    if (!dev)
+        return SKIP;
 
     // Test all attached devices
     for (int i = 0; i < num; i++) {
         VkPhysicalDeviceProperties props = {0};
         GetPhysicalDeviceProperties(devices[i], &props);
+#ifndef CI_ALLOW_SW
+        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+            printf("Skipping device %d: %s\n", i, props.deviceName);
+            continue;
+        }
+#endif
         printf("Testing device %d: %s\n", i, props.deviceName);
 
         // Make sure we can choose this device by name
-        dev = pl_vulkan_choose_device(ctx, &(struct pl_vulkan_device_params) {
+        dev = pl_vulkan_choose_device(log, pl_vulkan_device_params(
             .instance = inst->instance,
+            .get_proc_addr = inst->get_proc_addr,
             .device_name = props.deviceName,
-        });
-        REQUIRE(dev == devices[i]);
+        ));
+        REQUIRE_CMP(dev, ==, devices[i], "p");
 
-        struct pl_vulkan_params params = pl_vulkan_default_params;
-        params.instance = inst->instance;
-        params.device = devices[i];
-        params.queue_count = 8; // test inter-queue stuff
-        params.surface = surf;
+        struct pl_vulkan_params params = *pl_vulkan_params(
+            .instance = inst->instance,
+            .get_proc_addr = inst->get_proc_addr,
+            .device = devices[i],
+            .queue_count = 8, // test inter-queue stuff
+            .surface = surf,
+        );
 
-        const struct pl_vulkan *vk = pl_vulkan_create(ctx, &params);
+        pl_vulkan vk = pl_vulkan_create(log, &params);
         if (!vk)
             continue;
 
         gpu_shader_tests(vk->gpu);
         vulkan_swapchain_tests(vk, surf);
 
+        // Print heap statistics
+        pl_vk_print_heap(vk->gpu, PL_LOG_DEBUG);
+
         // Test importing this context via the vulkan interop API
-        struct pl_vulkan_import_params iparams = {
+        pl_vulkan vk2 = pl_vulkan_import(log, pl_vulkan_import_params(
             .instance = vk->instance,
+            .get_proc_addr = inst->get_proc_addr,
             .phys_device = vk->phys_device,
             .device = vk->device,
 
@@ -198,8 +251,7 @@ int main()
             .queue_graphics = vk->queue_graphics,
             .queue_compute = vk->queue_compute,
             .queue_transfer = vk->queue_transfer,
-        };
-        const struct pl_vulkan *vk2 = pl_vulkan_import(ctx, &iparams);
+        ));
         REQUIRE(vk2);
         pl_vulkan_destroy(&vk2);
 
@@ -218,7 +270,7 @@ int main()
         // Re-run the same export/import tests with async queues disabled
         params.async_compute = false;
         params.async_transfer = false;
-        vk = pl_vulkan_create(ctx, &params);
+        vk = pl_vulkan_create(log, &params);
         REQUIRE(vk); // it succeeded the first time
 
 #ifdef PL_HAVE_UNIX
@@ -233,11 +285,12 @@ int main()
         pl_vulkan_destroy(&vk);
 
         // Reduce log spam after first tested device
-        pl_test_set_verbosity(ctx, PL_LOG_INFO);
+        pl_log_level_update(log, PL_LOG_INFO);
     }
 
-    vkDestroySurfaceKHR(inst->instance, surf, NULL);
+    if (surf)
+        vkDestroySurfaceKHR(inst->instance, surf, NULL);
     pl_vk_inst_destroy(&inst);
-    pl_context_destroy(&ctx);
+    pl_log_destroy(&log);
     free(devices);
 }

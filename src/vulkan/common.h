@@ -17,8 +17,15 @@
 
 #pragma once
 
+#define VK_NO_PROTOTYPES
+#define VK_ENABLE_BETA_EXTENSIONS // for VK_KHR_portability_subset
+#define VK_USE_PLATFORM_METAL_EXT
+
 #include "../common.h"
-#include "../context.h"
+#include "../log.h"
+#include "../pl_thread.h"
+
+#include <libplacebo/vulkan.h>
 
 #ifdef PL_HAVE_WIN32
 #include <windows.h>
@@ -37,24 +44,22 @@
 #define PL_VK_LOAD_FUN(inst, name, get_addr) \
     PL_VK_FUN(name) = (PFN_vk##name) get_addr(inst, "vk" #name);
 
-// Hard-coded limit on the number of pending commands, to avoid OOM loops
-#define PL_VK_MAX_QUEUED_CMDS 1024
-#define PL_VK_MAX_PENDING_CMDS 1024
-
-// Shitty compatibility alias for very old vulkan.h versions
-#ifndef VK_API_VERSION_1_2
-#define VK_API_VERSION_1_2 VK_MAKE_VERSION(1, 2, 0)
+#ifndef VK_VENDOR_ID_NVIDIA
+#define VK_VENDOR_ID_NVIDIA 0x10DE
 #endif
 
 // Shared struct used to hold vulkan context information
 struct vk_ctx {
-    void *alloc; // allocations bound to the lifetime of this vk_ctx
-    const struct pl_vk_inst *internal_instance;
-    struct pl_context *ctx;
+    pl_mutex lock;
+    pl_vulkan vulkan;
+    void *alloc; // host allocations bound to the lifetime of this vk_ctx
+    struct vk_malloc *ma; // VRAM malloc layer
+    pl_vk_inst internal_instance;
+    pl_log log;
     VkInstance inst;
     VkPhysicalDevice physd;
-    VkPhysicalDeviceLimits limits;
-    VkPhysicalDeviceFeatures2KHR features;
+    VkPhysicalDeviceProperties props;
+    VkPhysicalDeviceFeatures2 features;
     uint32_t api_ver; // device API version
     VkDevice dev;
     bool imported; // device was not created by us
@@ -68,39 +73,41 @@ struct vk_ctx {
     // Command pools (one per queue family)
     PL_ARRAY(struct vk_cmdpool *) pools;
 
-    // Pointers into `pools`
-    struct vk_cmdpool *pool_graphics; // required
-    struct vk_cmdpool *pool_compute;  // optional
-    struct vk_cmdpool *pool_transfer; // optional
+    // Pointers into `pools` (always set)
+    struct vk_cmdpool *pool_graphics;
+    struct vk_cmdpool *pool_compute;
+    struct vk_cmdpool *pool_transfer;
 
-    // Queued/pending commands. These are shared for the entire mpvk_ctx to
-    // ensure submission and callbacks are FIFO
-    PL_ARRAY(struct vk_cmd *) cmds_queued;  // recorded but not yet submitted
+    // Queue locking functions
+    PL_ARRAY(PL_ARRAY(pl_mutex)) queue_locks;
+    void (*lock_queue)(void *queue_ctx, uint32_t qf, uint32_t idx);
+    void (*unlock_queue)(void *queue_ctx, uint32_t qf, uint32_t idx);
+    void *queue_ctx;
+
+    // Pending commands. These are shared for the entire mpvk_ctx to ensure
+    // submission and callbacks are FIFO
     PL_ARRAY(struct vk_cmd *) cmds_pending; // submitted but not completed
 
-    // A dynamic reference to the most recently submitted command that has not
-    // yet completed. Used to implement vk_dev_callback. Gets cleared when
-    // the command completes.
-    struct vk_cmd *last_cmd;
-
-    // Common pool of signals, to avoid having to re-create these objects often
-    PL_ARRAY(struct vk_signal *) signals;
-    bool disable_events;
+    // Pending callbacks that still need to be drained before processing
+    // callbacks for the next command (in case commands are recursively being
+    // polled from another callback)
+    const struct vk_callback *pending_callbacks;
+    int num_pending_callbacks;
 
     // Instance-level function pointers
     PL_VK_FUN(CreateDevice);
     PL_VK_FUN(EnumerateDeviceExtensionProperties);
     PL_VK_FUN(GetDeviceProcAddr);
     PL_VK_FUN(GetInstanceProcAddr);
-    PL_VK_FUN(GetPhysicalDeviceExternalBufferPropertiesKHR);
-    PL_VK_FUN(GetPhysicalDeviceExternalSemaphorePropertiesKHR);
+    PL_VK_FUN(GetPhysicalDeviceExternalBufferProperties);
+    PL_VK_FUN(GetPhysicalDeviceExternalSemaphoreProperties);
     PL_VK_FUN(GetPhysicalDeviceFeatures2KHR);
     PL_VK_FUN(GetPhysicalDeviceFormatProperties);
     PL_VK_FUN(GetPhysicalDeviceFormatProperties2KHR);
     PL_VK_FUN(GetPhysicalDeviceImageFormatProperties2KHR);
     PL_VK_FUN(GetPhysicalDeviceMemoryProperties);
     PL_VK_FUN(GetPhysicalDeviceProperties);
-    PL_VK_FUN(GetPhysicalDeviceProperties2KHR);
+    PL_VK_FUN(GetPhysicalDeviceProperties2);
     PL_VK_FUN(GetPhysicalDeviceQueueFamilyProperties);
     PL_VK_FUN(GetPhysicalDeviceSurfaceCapabilitiesKHR);
     PL_VK_FUN(GetPhysicalDeviceSurfaceFormatsKHR);
@@ -133,14 +140,13 @@ struct vk_ctx {
     PL_VK_FUN(CmdEndDebugUtilsLabelEXT);
     PL_VK_FUN(CmdEndRenderPass);
     PL_VK_FUN(CmdPipelineBarrier);
+    PL_VK_FUN(CmdPipelineBarrier2KHR);
     PL_VK_FUN(CmdPushConstants);
     PL_VK_FUN(CmdPushDescriptorSetKHR);
     PL_VK_FUN(CmdResetQueryPool);
-    PL_VK_FUN(CmdSetEvent);
     PL_VK_FUN(CmdSetScissor);
     PL_VK_FUN(CmdSetViewport);
     PL_VK_FUN(CmdUpdateBuffer);
-    PL_VK_FUN(CmdWaitEvents);
     PL_VK_FUN(CmdWriteTimestamp);
     PL_VK_FUN(CreateBuffer);
     PL_VK_FUN(CreateBufferView);
@@ -149,7 +155,6 @@ struct vk_ctx {
     PL_VK_FUN(CreateDebugReportCallbackEXT);
     PL_VK_FUN(CreateDescriptorPool);
     PL_VK_FUN(CreateDescriptorSetLayout);
-    PL_VK_FUN(CreateEvent);
     PL_VK_FUN(CreateFence);
     PL_VK_FUN(CreateFramebuffer);
     PL_VK_FUN(CreateGraphicsPipelines);
@@ -170,7 +175,6 @@ struct vk_ctx {
     PL_VK_FUN(DestroyDescriptorPool);
     PL_VK_FUN(DestroyDescriptorSetLayout);
     PL_VK_FUN(DestroyDevice);
-    PL_VK_FUN(DestroyEvent);
     PL_VK_FUN(DestroyFence);
     PL_VK_FUN(DestroyFramebuffer);
     PL_VK_FUN(DestroyImage);
@@ -185,6 +189,7 @@ struct vk_ctx {
     PL_VK_FUN(DestroySemaphore);
     PL_VK_FUN(DestroyShaderModule);
     PL_VK_FUN(DestroySwapchainKHR);
+    PL_VK_FUN(DeviceWaitIdle);
     PL_VK_FUN(EndCommandBuffer);
     PL_VK_FUN(FlushMappedMemoryRanges);
     PL_VK_FUN(FreeCommandBuffers);
@@ -192,8 +197,7 @@ struct vk_ctx {
     PL_VK_FUN(GetBufferMemoryRequirements);
     PL_VK_FUN(GetDeviceQueue);
     PL_VK_FUN(GetImageDrmFormatModifierPropertiesEXT);
-    PL_VK_FUN(GetImageMemoryRequirements);
-    PL_VK_FUN(GetImageMemoryRequirements2KHR);
+    PL_VK_FUN(GetImageMemoryRequirements2);
     PL_VK_FUN(GetImageSubresourceLayout);
     PL_VK_FUN(GetMemoryFdKHR);
     PL_VK_FUN(GetMemoryFdPropertiesKHR);
@@ -206,16 +210,25 @@ struct vk_ctx {
     PL_VK_FUN(MapMemory);
     PL_VK_FUN(QueuePresentKHR);
     PL_VK_FUN(QueueSubmit);
-    PL_VK_FUN(ResetEvent);
+    PL_VK_FUN(QueueSubmit2KHR);
+    PL_VK_FUN(QueueWaitIdle);
     PL_VK_FUN(ResetFences);
-    PL_VK_FUN(ResetQueryPoolEXT);
+    PL_VK_FUN(ResetQueryPool);
     PL_VK_FUN(SetDebugUtilsObjectNameEXT);
     PL_VK_FUN(SetHdrMetadataEXT);
     PL_VK_FUN(UpdateDescriptorSets);
     PL_VK_FUN(WaitForFences);
+    PL_VK_FUN(WaitSemaphores);
 
 #ifdef PL_HAVE_WIN32
     PL_VK_FUN(GetMemoryWin32HandleKHR);
     PL_VK_FUN(GetSemaphoreWin32HandleKHR);
+#endif
+
+#ifdef VK_EXT_metal_objects
+    PL_VK_FUN(ExportMetalObjectsEXT);
+#endif
+#ifdef VK_EXT_full_screen_exclusive
+    PL_VK_FUN(AcquireFullScreenExclusiveModeEXT);
 #endif
 };

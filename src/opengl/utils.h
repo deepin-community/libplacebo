@@ -21,18 +21,37 @@
 
 // Iterate through callbacks attached to the `pl_gl` and execute all of the
 // ones that have completed.
-void gl_poll_callbacks(const struct pl_gpu *gpu);
+//
+// Thread-safety: Unsafe
+void gl_poll_callbacks(pl_gpu gpu);
 
 // Return a human-readable name for various OpenGL errors
+//
+// Thread-safety: Safe
 const char *gl_err_str(GLenum err);
 
 // Check for errors and log them + return false if detected
-bool gl_check_err(const struct pl_gpu *gpu, const char *fun);
+//
+// Thread-safety: Unsafe
+bool gl_check_err(pl_gpu gpu, const char *fun);
 
 // Returns true if the context is a suspected software rasterizer
-bool gl_is_software(void);
+//
+// Thread-safety: Unsafe
+bool gl_is_software(pl_opengl gl);
 
-#ifdef EPOXY_HAS_EGL
+// Returns true if the context is detected as OpenGL ES
+//
+// Thread-safety: Unsafe
+bool gl_is_gles(pl_opengl gl);
+
+// Check for presence of an extension, alternatively a minimum GL version
+//
+// Thread-safety: Unsafe
+bool gl_test_ext(pl_gpu gpu, const char *ext, int gl_ver, int gles_ver);
+
+// Thread-safety: Safe
 const char *egl_err_str(EGLenum err);
-bool egl_check_err(const struct pl_gpu *gpu, const char *fun);
-#endif
+
+// Thread-safety: Unsafe
+bool egl_check_err(pl_gpu gpu, const char *fun);

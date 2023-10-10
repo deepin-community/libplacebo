@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include <stdalign.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -57,7 +59,7 @@ void pl_free_children(void *ptr);
     } while (0)
 
 // Get the current size of an allocation.
-size_t pl_get_size(void *ptr);
+size_t pl_get_size(const void *ptr);
 
 #define pl_grow(parent, ptr, size)                      \
     do {                                                \
@@ -81,49 +83,50 @@ char *pl_strndup0(void *parent, const char *str, size_t size);
 // `priv` at the address of `pub` + sizeof(pub), rounded up to the maximum
 // alignment requirements.
 
-#define pl_max_align offsetof(struct { char c; intmax_t x; }, x)
-#define PL_ALIGN_MEM(size) \
-    (((size) + pl_max_align - 1) & ~(pl_max_align - 1))
+#define PL_ALIGN_MEM(size) PL_ALIGN2(size, alignof(max_align_t))
 
 #define PL_PRIV(pub) \
     (void *) ((uintptr_t) (pub) + PL_ALIGN_MEM(sizeof(*(pub))))
 
-#define pl_alloc_priv(parent, pub, priv) \
-    (pub *) pl_alloc(parent, PL_ALIGN_MEM(sizeof(pub)) + sizeof(priv))
-
-#define pl_zalloc_priv(parent, pub, priv) \
-    (pub *) pl_zalloc(parent, PL_ALIGN_MEM(sizeof(pub)) + sizeof(priv))
-
-#define pl_alloc_ptr_priv(parent, ptr, priv) \
+#define pl_alloc_obj(parent, ptr, priv) \
     (__typeof__(ptr)) pl_alloc(parent, PL_ALIGN_MEM(sizeof(*(ptr))) + sizeof(priv))
 
-// Refcounting helper
-
-struct pl_ref;
-
-// pl_ref_deref will free the ref and all of its children as soon as the
-// internal refcount reaches 0
-struct pl_ref *pl_ref_new(void *parent);
-struct pl_ref *pl_ref_dup(struct pl_ref *ref);
-void pl_ref_deref(struct pl_ref **ref);
+#define pl_zalloc_obj(parent, ptr, priv) \
+    (__typeof__(ptr)) pl_zalloc(parent, PL_ALIGN_MEM(sizeof(*(ptr))) + sizeof(priv))
 
 // Helper functions for dealing with arrays
 
 #define PL_ARRAY(type) struct { type *elem; int num; }
 
-#define PL_ARRAY_RESIZE(parent, arr, len)                                       \
+#define PL_ARRAY_REALLOC(parent, arr, len)                                      \
     do {                                                                        \
         size_t _new_size = (len) * sizeof((arr).elem[0]);                       \
         (arr).elem = pl_realloc((void *) parent, (arr).elem, _new_size);        \
+    } while (0)
+
+#define PL_ARRAY_RESIZE(parent, arr, len)                                       \
+    do {                                                                        \
+        size_t _avail = pl_get_size((arr).elem) / sizeof((arr).elem[0]);        \
+        size_t _min_len = (len);                                                \
+        if (_avail < _min_len)                                                  \
+            PL_ARRAY_REALLOC(parent, arr, _min_len);                            \
+    } while (0)
+
+#define PL_ARRAY_MEMDUP(parent, arr, ptr, len)                                  \
+    do {                                                                        \
+        size_t _len = (len);                                                    \
+        PL_ARRAY_RESIZE(parent, arr, _len);                                     \
+        memcpy((arr).elem, ptr, _len * sizeof((arr).elem[0]));                  \
+        (arr).num = _len;                                                       \
     } while (0)
 
 #define PL_ARRAY_GROW(parent, arr)                                              \
     do {                                                                        \
         size_t _avail = pl_get_size((arr).elem) / sizeof((arr).elem[0]);        \
         if (_avail < 10) {                                                      \
-            PL_ARRAY_RESIZE(parent, arr, 10);                                   \
+            PL_ARRAY_REALLOC(parent, arr, 10);                                  \
         } else if ((arr).num == _avail) {                                       \
-            PL_ARRAY_RESIZE(parent, arr, (arr).num * 1.5);                      \
+            PL_ARRAY_REALLOC(parent, arr, (arr).num * 1.5);                     \
         } else {                                                                \
             assert((arr).elem);                                                 \
         }                                                                       \
@@ -160,7 +163,7 @@ void pl_ref_deref(struct pl_ref **ref);
 #define PL_ARRAY_INSERT_AT(parent, arr, idx, ...)                               \
     do {                                                                        \
         size_t _idx = (idx);                                                    \
-        assert(_idx < (arr).num);                                               \
+        assert(_idx <= (arr).num);                                              \
         PL_ARRAY_GROW(parent, arr);                                             \
         memmove(&(arr).elem[_idx + 1], &(arr).elem[_idx],                       \
                 ((arr).num++ - _idx) * sizeof((arr).elem[0]));                  \

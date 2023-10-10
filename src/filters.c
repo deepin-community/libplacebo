@@ -37,7 +37,12 @@
 #include <math.h>
 
 #include "common.h"
-#include "context.h"
+#include "filters.h"
+#include "log.h"
+
+#ifdef PL_HAVE_WIN32
+#define j1 _j1
+#endif
 
 bool pl_filter_function_eq(const struct pl_filter_function *a,
                            const struct pl_filter_function *b)
@@ -101,7 +106,7 @@ double pl_filter_sample(const struct pl_filter_config *c, double x)
 
 // Compute a single row of weights for a given filter in one dimension, indexed
 // by the indicated subpixel offset. Writes `f->row_size` values to `out`.
-static void compute_row(struct pl_filter *f, double offset, float *out)
+static void compute_row(struct pl_filter_t *f, double offset, float *out)
 {
     double wsum = 0.0;
     for (int i = 0; i < f->row_size; i++) {
@@ -135,16 +140,15 @@ static struct pl_filter_function *dupfilter(void *alloc,
     return f ? pl_memdup(alloc, (void *)f, sizeof(*f)) : NULL;
 }
 
-const struct pl_filter *pl_filter_generate(struct pl_context *ctx,
-                                       const struct pl_filter_params *params)
+pl_filter pl_filter_generate(pl_log log, const struct pl_filter_params *params)
 {
     pl_assert(params);
     if (params->lut_entries <= 0 || !params->config.kernel) {
-        pl_fatal(ctx, "Invalid params: missing lut_entries or config.kernel");
+        pl_fatal(log, "Invalid params: missing lut_entries or config.kernel");
         return NULL;
     }
 
-    struct pl_filter *f = pl_zalloc_ptr(ctx, f);
+    struct pl_filter_t *f = pl_zalloc_ptr(NULL, f);
     f->params = *params;
     f->params.config.kernel = dupfilter(f, params->config.kernel);
     f->params.config.window = dupfilter(f, params->config.window);
@@ -164,13 +168,13 @@ const struct pl_filter *pl_filter_generate(struct pl_context *ctx,
             double x = radius * i / (params->lut_entries - 1);
             weights[i] = pl_filter_sample(&f->params.config, x);
             if (fabs(weights[i]) > params->cutoff)
-                f->radius_cutoff = x;
+                f->radius_cutoff = x * params->filter_scale;
         }
     } else {
         // Pick the most appropriate row size
         f->row_size = ceil(f->radius) * 2;
         if (params->max_row_size && f->row_size > params->max_row_size) {
-            pl_info(ctx, "Required filter size %d exceeds the maximum allowed "
+            pl_info(log, "Required filter size %d exceeds the maximum allowed "
                     "size of %d. This may result in adverse effects (aliasing, "
                     "or moiré artifacts).", f->row_size, params->max_row_size);
             f->row_size = params->max_row_size;
@@ -190,7 +194,7 @@ const struct pl_filter *pl_filter_generate(struct pl_context *ctx,
     return f;
 }
 
-void pl_filter_free(const struct pl_filter **filter)
+void pl_filter_free(pl_filter *filter)
 {
     pl_free_ptr((void **) filter);
 }
@@ -229,8 +233,8 @@ static double box(const struct pl_filter_function *f, double x)
 }
 
 const struct pl_filter_function pl_filter_function_box = {
-    .resizable = true,
     .weight    = box,
+    .name      = "box",
     .radius    = 1.0,
 };
 
@@ -242,7 +246,19 @@ static double triangle(const struct pl_filter_function *f, double x)
 const struct pl_filter_function pl_filter_function_triangle = {
     .resizable = true,
     .weight    = triangle,
+    .name      = "triangle",
     .radius    = 1.0,
+};
+
+static double cosine(const struct pl_filter_function *f, double x)
+{
+    return cos(x);
+}
+
+const struct pl_filter_function pl_filter_function_cosine = {
+    .weight = cosine,
+    .name   = "cosine",
+    .radius = M_PI / 2.0,
 };
 
 static double hann(const struct pl_filter_function *f, double x)
@@ -252,6 +268,7 @@ static double hann(const struct pl_filter_function *f, double x)
 
 const struct pl_filter_function pl_filter_function_hann = {
     .weight = hann,
+    .name   = "hann",
     .radius = 1.0,
 };
 
@@ -262,6 +279,7 @@ static double hamming(const struct pl_filter_function *f, double x)
 
 const struct pl_filter_function pl_filter_function_hamming = {
     .weight = hamming,
+    .name   = "hamming",
     .radius = 1.0,
 };
 
@@ -272,6 +290,7 @@ static double welch(const struct pl_filter_function *f, double x)
 
 const struct pl_filter_function pl_filter_function_welch = {
     .weight = welch,
+    .name   = "welch",
     .radius = 1.0,
 };
 
@@ -298,6 +317,7 @@ static double kaiser(const struct pl_filter_function *f, double x)
 const struct pl_filter_function pl_filter_function_kaiser = {
     .tunable = {true},
     .weight  = kaiser,
+    .name    = "kaiser",
     .radius  = 1.0,
     .params  = {2.0},
 };
@@ -313,8 +333,21 @@ static double blackman(const struct pl_filter_function *f, double x)
 const struct pl_filter_function pl_filter_function_blackman = {
     .tunable = {true},
     .weight  = blackman,
+    .name    = "blackman",
     .radius  = 1.0,
     .params  = {0.16},
+};
+
+static double bohman(const struct pl_filter_function *f, double x)
+{
+    double pix = M_PI * x;
+    return (1.0 - x) * cos(pix) + sin(pix) / M_PI;
+}
+
+const struct pl_filter_function pl_filter_function_bohman = {
+    .weight = bohman,
+    .name   = "bohman",
+    .radius = 1.0,
 };
 
 static double gaussian(const struct pl_filter_function *f, double x)
@@ -326,8 +359,24 @@ const struct pl_filter_function pl_filter_function_gaussian = {
     .resizable = true,
     .tunable   = {true},
     .weight    = gaussian,
+    .name      = "gaussian",
     .radius    = 2.0,
     .params    = {1.0},
+};
+
+static double quadratic(const struct pl_filter_function *f, double x)
+{
+    if (x < 0.5) {
+        return 0.75 - x * x;
+    } else {
+        return 0.5 * (x - 1.5) * (x - 1.5);
+    }
+}
+
+const struct pl_filter_function pl_filter_function_quadratic = {
+    .weight = quadratic,
+    .name   = "quadratic",
+    .radius = 1.5,
 };
 
 static double sinc(const struct pl_filter_function *f, double x)
@@ -341,6 +390,7 @@ static double sinc(const struct pl_filter_function *f, double x)
 const struct pl_filter_function pl_filter_function_sinc = {
     .resizable = true,
     .weight    = sinc,
+    .name      = "sinc",
     .radius    = 1.0,
 };
 
@@ -355,6 +405,7 @@ static double jinc(const struct pl_filter_function *f, double x)
 const struct pl_filter_function pl_filter_function_jinc = {
     .resizable = true,
     .weight    = jinc,
+    .name      = "jinc",
     .radius    = 1.2196698912665045, // first zero
 };
 
@@ -369,6 +420,7 @@ static double sphinx(const struct pl_filter_function *f, double x)
 const struct pl_filter_function pl_filter_function_sphinx = {
     .resizable = true,
     .weight    = sphinx,
+    .name      = "sphinx",
     .radius    = 1.4302966531242027, // first zero
 };
 
@@ -397,6 +449,7 @@ static double bcspline(const struct pl_filter_function *f, double x)
 const struct pl_filter_function pl_filter_function_bcspline = {
     .tunable = {true, true},
     .weight  = bcspline,
+    .name    = "bcspline",
     .radius  = 2.0,
     .params  = {0.5, 0.5},
 };
@@ -404,6 +457,7 @@ const struct pl_filter_function pl_filter_function_bcspline = {
 const struct pl_filter_function pl_filter_function_catmull_rom = {
     .tunable = {true, true},
     .weight  = bcspline,
+    .name    = "catmull_rom",
     .radius  = 2.0,
     .params  = {0.0, 0.5},
 };
@@ -411,6 +465,7 @@ const struct pl_filter_function pl_filter_function_catmull_rom = {
 const struct pl_filter_function pl_filter_function_mitchell = {
     .tunable = {true, true},
     .weight  = bcspline,
+    .name    = "mitchell",
     .radius  = 2.0,
     .params  = {1/3.0, 1/3.0},
 };
@@ -418,6 +473,7 @@ const struct pl_filter_function pl_filter_function_mitchell = {
 const struct pl_filter_function pl_filter_function_robidoux = {
     .tunable = {true, true},
     .weight  = bcspline,
+    .name    = "robidoux",
     .radius  = 2.0,
     .params  = {12 / (19 + 9 * M_SQRT2), 113 / (58 + 216 * M_SQRT2)},
 };
@@ -425,6 +481,7 @@ const struct pl_filter_function pl_filter_function_robidoux = {
 const struct pl_filter_function pl_filter_function_robidouxsharp = {
     .tunable = {true, true},
     .weight  = bcspline,
+    .name    = "robidouxsharp",
     .radius  = 2.0,
     .params  = {6 / (13 + 7 * M_SQRT2), 7 / (2 + 12 * M_SQRT2)},
 };
@@ -440,6 +497,7 @@ static double bicubic(const struct pl_filter_function *f, double x)
 
 const struct pl_filter_function pl_filter_function_bicubic = {
     .weight = bicubic,
+    .name   = "bicubic",
     .radius = 2.0,
 };
 
@@ -454,6 +512,7 @@ static double spline16(const struct pl_filter_function *f, double x)
 
 const struct pl_filter_function pl_filter_function_spline16 = {
     .weight = spline16,
+    .name   = "spline16",
     .radius = 2.0,
 };
 
@@ -470,6 +529,7 @@ static double spline36(const struct pl_filter_function *f, double x)
 
 const struct pl_filter_function pl_filter_function_spline36 = {
     .weight = spline36,
+    .name   = "spline36",
     .radius = 3.0,
 };
 
@@ -488,6 +548,7 @@ static double spline64(const struct pl_filter_function *f, double x)
 
 const struct pl_filter_function pl_filter_function_spline64 = {
     .weight = spline64,
+    .name   = "spline64",
     .radius = 4.0,
 };
 
@@ -497,13 +558,17 @@ const struct pl_filter_function_preset pl_filter_function_presets[] = {
     {"box",             &pl_filter_function_box},
     {"dirichlet",       &pl_filter_function_box}, // alias
     {"triangle",        &pl_filter_function_triangle},
+    {"cosine",          &pl_filter_function_cosine},
     {"hann",            &pl_filter_function_hann},
     {"hanning",         &pl_filter_function_hann}, // alias
     {"hamming",         &pl_filter_function_hamming},
     {"welch",           &pl_filter_function_welch},
     {"kaiser",          &pl_filter_function_kaiser},
     {"blackman",        &pl_filter_function_blackman},
+    {"bohman",          &pl_filter_function_bohman},
     {"gaussian",        &pl_filter_function_gaussian},
+    {"quadratic",       &pl_filter_function_quadratic},
+    {"quadric",         &pl_filter_function_quadratic}, // alias
     {"sinc",            &pl_filter_function_sinc},
     {"jinc",            &pl_filter_function_jinc},
     {"sphinx",          &pl_filter_function_sphinx},
@@ -525,147 +590,143 @@ const int pl_num_filter_function_presets = PL_ARRAY_SIZE(pl_filter_function_pres
 // Built-in filter function presets
 const struct pl_filter_config pl_filter_spline16 = {
     .kernel = &pl_filter_function_spline16,
+    .name   = "spline16",
 };
 
 const struct pl_filter_config pl_filter_spline36 = {
     .kernel = &pl_filter_function_spline36,
+    .name   = "spline36",
 };
 
 const struct pl_filter_config pl_filter_spline64 = {
     .kernel = &pl_filter_function_spline64,
+    .name   = "spline64"
 };
 
 const struct pl_filter_config pl_filter_nearest = {
     .kernel = &pl_filter_function_box,
+    .name   = "nearest",
 };
 
 const struct pl_filter_config pl_filter_bilinear = {
     .kernel = &pl_filter_function_triangle,
+    .name   = "bilinear",
 };
 
 const struct pl_filter_config pl_filter_gaussian = {
     .kernel = &pl_filter_function_gaussian,
+    .name   = "gaussian",
 };
 
 // Sinc configured to three taps
 static const struct pl_filter_function sinc3 = {
     .resizable = true,
     .weight    = sinc,
+    .name      = "sinc3",
     .radius    = 3.0,
 };
 
 const struct pl_filter_config pl_filter_sinc = {
     .kernel = &sinc3,
+    .name   = "sinc",
 };
 
 const struct pl_filter_config pl_filter_lanczos = {
     .kernel = &sinc3,
     .window = &pl_filter_function_sinc,
+    .name   = "lanczos",
 };
 
 const struct pl_filter_config pl_filter_ginseng = {
     .kernel = &sinc3,
     .window = &pl_filter_function_jinc,
+    .name   = "ginseng",
 };
 
 // Jinc configured to three taps
 static const struct pl_filter_function jinc3 = {
     .resizable = true,
     .weight    = jinc,
+    .name      = "jinc3",
     .radius    = 3.2383154841662362, // third zero
 };
 
 const struct pl_filter_config pl_filter_ewa_jinc = {
     .kernel = &jinc3,
-    .polar = true,
+    .polar  = true,
+    .name   = "ewa_jinc",
 };
 
 const struct pl_filter_config pl_filter_ewa_lanczos = {
     .kernel = &jinc3,
     .window = &pl_filter_function_jinc,
-    .polar = true,
+    .polar  = true,
+    .name   = "ewa_lanczos",
 };
 
 const struct pl_filter_config pl_filter_ewa_ginseng = {
     .kernel = &jinc3,
     .window = &pl_filter_function_sinc,
-    .polar = true,
+    .polar  = true,
+    .name   = "ewa_ginseng",
 };
 
 const struct pl_filter_config pl_filter_ewa_hann = {
     .kernel = &jinc3,
     .window = &pl_filter_function_hann,
-    .polar = true,
+    .polar  = true,
+    .name   = "ewa_hann",
 };
 
 // Spline family
 const struct pl_filter_config pl_filter_bicubic = {
     .kernel = &pl_filter_function_bicubic,
+    .name   = "bicubic",
 };
 
 const struct pl_filter_config pl_filter_catmull_rom = {
     .kernel = &pl_filter_function_catmull_rom,
+    .name   = "catmull_rom",
 };
 
 const struct pl_filter_config pl_filter_mitchell = {
     .kernel = &pl_filter_function_mitchell,
+    .name   = "mitchell",
 };
 
 const struct pl_filter_config pl_filter_mitchell_clamp = {
     .kernel = &pl_filter_function_mitchell,
-    .clamp = 1.0,
+    .clamp  = 1.0,
+    .name   = "mitchell_clamp",
 };
 
 const struct pl_filter_config pl_filter_robidoux = {
     .kernel = &pl_filter_function_robidoux,
+    .name   = "robidoux",
 };
 
 const struct pl_filter_config pl_filter_robidouxsharp = {
     .kernel = &pl_filter_function_robidouxsharp,
+    .name   = "robidouxsharp",
 };
 
 const struct pl_filter_config pl_filter_ewa_robidoux = {
     .kernel = &pl_filter_function_robidoux,
-    .polar = true,
+    .polar  = true,
+    .name   = "ewa_robidoux",
 };
 
 const struct pl_filter_config pl_filter_ewa_robidouxsharp = {
     .kernel = &pl_filter_function_robidouxsharp,
-    .polar = true,
+    .polar  = true,
+    .name   = "ewa_robidouxsharp",
 };
 
 // Named filter configs
 const struct pl_filter_preset pl_filter_presets[] = {
-    // Highest priority / recommended filters
     {"none",                NULL,                   "Built-in sampling"},
-    {"bilinear",            &pl_filter_bilinear,    "Bilinear"},
-    {"nearest",             &pl_filter_nearest,     "Nearest neighbour"},
-    {"bicubic",             &pl_filter_bicubic,     "Bicubic"},
-    {"lanczos",             &pl_filter_lanczos,     "Lanczos"},
-    {"ewa_lanczos",         &pl_filter_ewa_lanczos, "Jinc (EWA Lanczos)"},
-    {"gaussian",            &pl_filter_gaussian,    "Gaussian"},
-    {"spline16",            &pl_filter_spline16,    "Spline (2 taps)"},
-    {"spline36",            &pl_filter_spline36,    "Spline (3 taps)"},
-    {"spline64",            &pl_filter_spline64,    "Spline (4 taps)"},
-    {"mitchell",            &pl_filter_mitchell,    "Mitchell-Netravali"},
-
-    // Remaining filters
-    {"sinc",                &pl_filter_sinc,        "Sinc (unwindowed)"},
-    {"ginseng",             &pl_filter_ginseng,     "Ginseng (Jinc-Sinc)"},
-    {"ewa_jinc",            &pl_filter_ewa_jinc,    "EWA Jinc (unwindowed)"},
-    {"ewa_ginseng",         &pl_filter_ewa_ginseng, "EWA Ginseng"},
-    {"ewa_hann",            &pl_filter_ewa_hann,    "EWA Hann"},
-    {"catmull_rom",         &pl_filter_catmull_rom, "Catmull-Rom"},
-    {"robidoux",            &pl_filter_robidoux,            "Robidoux"},
-    {"robidouxsharp",       &pl_filter_robidouxsharp,       "RobidouxSharp"},
-    {"ewa_robidoux",        &pl_filter_ewa_robidoux,        "EWA Robidoux"},
-    {"ewa_robidouxsharp",   &pl_filter_ewa_robidouxsharp,   "EWA RobidouxSharp"},
-
-    // Aliases
-    {"box",                 &pl_filter_nearest}, // alias
-    {"triangle",            &pl_filter_bilinear}, // alias
-    {"ewa_hanning",         &pl_filter_ewa_hann}, // alias
-    {0},
+    COMMON_FILTER_PRESETS,
+    {0}
 };
 
 const int pl_num_filter_presets = PL_ARRAY_SIZE(pl_filter_presets) - 1;

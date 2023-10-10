@@ -20,6 +20,12 @@
 #include "utils.h"
 #include "gpu.h"
 
+#ifdef PL_HAVE_VK_PROC_ADDR
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(
+    VkInstance                                  instance,
+    const char*                                 pName);
+#endif
+
 const struct pl_vk_inst_params pl_vk_inst_default_params = {0};
 
 struct vk_fun {
@@ -30,8 +36,7 @@ struct vk_fun {
 
 struct vk_ext {
     const char *name;
-    uint32_t core_ver;
-    struct vk_fun *funs;
+    const struct vk_fun *funs;
 };
 
 #define PL_VK_INST_FUN(N)                   \
@@ -51,6 +56,7 @@ static const char *vk_instance_extensions[] = {
     VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,
     VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
+    VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,
 };
 
 // List of mandatory instance-level function pointers, including functions
@@ -59,13 +65,15 @@ static const struct vk_fun vk_inst_funs[] = {
     PL_VK_INST_FUN(CreateDevice),
     PL_VK_INST_FUN(EnumerateDeviceExtensionProperties),
     PL_VK_INST_FUN(GetDeviceProcAddr),
+    PL_VK_INST_FUN(GetPhysicalDeviceExternalBufferProperties),
+    PL_VK_INST_FUN(GetPhysicalDeviceExternalSemaphoreProperties),
     PL_VK_INST_FUN(GetPhysicalDeviceFeatures2KHR),
     PL_VK_INST_FUN(GetPhysicalDeviceFormatProperties),
     PL_VK_INST_FUN(GetPhysicalDeviceFormatProperties2KHR),
     PL_VK_INST_FUN(GetPhysicalDeviceImageFormatProperties2KHR),
     PL_VK_INST_FUN(GetPhysicalDeviceMemoryProperties),
     PL_VK_INST_FUN(GetPhysicalDeviceProperties),
-    PL_VK_INST_FUN(GetPhysicalDeviceProperties2KHR),
+    PL_VK_INST_FUN(GetPhysicalDeviceProperties2),
     PL_VK_INST_FUN(GetPhysicalDeviceQueueFamilyProperties),
 
     // These are not actually mandatory, but they're universal enough that we
@@ -84,7 +92,7 @@ static const struct vk_fun vk_inst_funs[] = {
 static const struct vk_ext vk_device_extensions[] = {
     {
         .name = VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-        .funs = (struct vk_fun[]) {
+        .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(AcquireNextImageKHR),
             PL_VK_DEV_FUN(CreateSwapchainKHR),
             PL_VK_DEV_FUN(DestroySwapchainKHR),
@@ -94,111 +102,89 @@ static const struct vk_ext vk_device_extensions[] = {
         },
     }, {
         .name = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-        .funs = (struct vk_fun[]) {
+        .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(CmdPushDescriptorSetKHR),
             {0}
         },
     }, {
-        .name = VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
-        .core_ver = VK_API_VERSION_1_1,
-        .funs = (struct vk_fun[]) {
-            PL_VK_DEV_FUN(GetImageMemoryRequirements2KHR),
-            {0}
-        },
-    }, {
-        .name = VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
-        .core_ver = VK_API_VERSION_1_1,
-        .funs = (struct vk_fun[]) {
-            PL_VK_INST_FUN(GetPhysicalDeviceExternalBufferPropertiesKHR),
-            {0}
-        },
-    }, {
         .name = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-        .funs = (struct vk_fun[]) {
+        .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(GetMemoryFdKHR),
             {0}
         },
     }, {
         .name = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-        .funs = (struct vk_fun[]) {
+        .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(GetMemoryFdPropertiesKHR),
             {0}
         },
 #ifdef PL_HAVE_WIN32
     }, {
         .name = VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
-        .funs = (struct vk_fun[]) {
+        .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(GetMemoryWin32HandleKHR),
             {0}
         },
 #endif
     }, {
         .name = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
-        .funs = (struct vk_fun[]) {
+        .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(GetMemoryHostPointerPropertiesEXT),
             {0}
         },
     }, {
-        .name = VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
-        .core_ver = VK_API_VERSION_1_1,
-        .funs = (struct vk_fun[]) {
-            PL_VK_INST_FUN(GetPhysicalDeviceExternalSemaphorePropertiesKHR),
-            {0}
-        },
-    }, {
         .name = VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
-        .funs = (struct vk_fun[]) {
+        .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(GetSemaphoreFdKHR),
             {0}
         },
 #ifdef PL_HAVE_WIN32
     }, {
         .name = VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
-        .funs = (struct vk_fun[]) {
+        .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(GetSemaphoreWin32HandleKHR),
             {0}
         },
 #endif
     }, {
         .name = VK_EXT_PCI_BUS_INFO_EXTENSION_NAME,
-        .funs = (struct vk_fun[]) {
-            {0}
-        },
     }, {
         .name = VK_EXT_HDR_METADATA_EXTENSION_NAME,
-        .funs = (struct vk_fun[]) {
+        .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(SetHdrMetadataEXT),
             {0}
         },
     }, {
-        .name = VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME,
-        .core_ver = VK_API_VERSION_1_2,
-        .funs = (struct vk_fun[]) {
-            PL_VK_DEV_FUN(ResetQueryPoolEXT),
-            {0}
-        },
-    }, {
-        .name = VK_KHR_BIND_MEMORY_2_EXTENSION_NAME,
-        .core_ver = VK_API_VERSION_1_1,
-        .funs = (struct vk_fun[]) {
-            {0}
-        },
-    }, {
-        .name = VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
-        .core_ver = VK_API_VERSION_1_2,
-        .funs = (struct vk_fun[]) {
-            {0}
-        },
-    }, {
-        .name = VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME,
-        .core_ver = VK_API_VERSION_1_1,
-        .funs = (struct vk_fun[]) {
-            {0}
-        },
-    }, {
         .name = VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
-        .funs = (struct vk_fun[]) {
+        .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(GetImageDrmFormatModifierPropertiesEXT),
+            {0}
+        },
+#ifdef VK_KHR_portability_subset
+    }, {
+        .name = VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
+#endif
+#ifdef VK_EXT_metal_objects
+    }, {
+        .name = VK_EXT_METAL_OBJECTS_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) {
+            PL_VK_DEV_FUN(ExportMetalObjectsEXT),
+            {0}
+        },
+#endif
+#ifdef VK_EXT_full_screen_exclusive
+    }, {
+        .name = VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) {
+            PL_VK_DEV_FUN(AcquireFullScreenExclusiveModeEXT),
+            {0}
+        },
+#endif
+    }, {
+        .name = VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) {
+            PL_VK_DEV_FUN(CmdPipelineBarrier2KHR),
+            PL_VK_DEV_FUN(QueueSubmit2KHR),
             {0}
         },
     },
@@ -207,12 +193,9 @@ static const struct vk_ext vk_device_extensions[] = {
 // Make sure to keep this in sync with the above!
 const char * const pl_vulkan_recommended_extensions[] = {
     VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-    VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
-    VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
 #ifdef PL_HAVE_WIN32
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
@@ -220,25 +203,61 @@ const char * const pl_vulkan_recommended_extensions[] = {
 #endif
     VK_EXT_PCI_BUS_INFO_EXTENSION_NAME,
     VK_EXT_HDR_METADATA_EXTENSION_NAME,
-    VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME,
-    VK_KHR_BIND_MEMORY_2_EXTENSION_NAME,
-    VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
-    VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME,
     VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+#ifdef VK_KHR_portability_subset
+    VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
+#endif
+#ifdef VK_EXT_metal_objects
+    VK_EXT_METAL_OBJECTS_EXTENSION_NAME,
+#endif
+#ifdef VK_EXT_full_screen_exclusive
+    VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME,
+#endif
+    VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
 };
 
 const int pl_vulkan_num_recommended_extensions =
     PL_ARRAY_SIZE(pl_vulkan_recommended_extensions);
 
-// pNext chain of features we want enabled
-static const VkPhysicalDeviceHostQueryResetFeaturesEXT host_query_reset = {
-    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT,
-    .hostQueryReset = true,
+// +1 because VK_KHR_swapchain is not automatically pulled in
+static_assert(PL_ARRAY_SIZE(pl_vulkan_recommended_extensions) + 1 ==
+              PL_ARRAY_SIZE(vk_device_extensions),
+              "pl_vulkan_recommended_extensions out of sync with "
+              "vk_device_extensions?");
+
+// Recommended features; keep in sync with libavutil vulkan hwcontext
+static const VkPhysicalDeviceVulkan13Features recommended_vk13 = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+    .computeFullSubgroups = true,
+    .maintenance4 = true,
+    .shaderZeroInitializeWorkgroupMemory = true,
+    .synchronization2 = true,
 };
 
-const VkPhysicalDeviceFeatures2KHR pl_vulkan_recommended_features = {
-    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR,
-    .pNext = (void *) &host_query_reset,
+static const VkPhysicalDeviceVulkan12Features recommended_vk12 = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+    .pNext = (void *) &recommended_vk13,
+    .bufferDeviceAddress = true,
+    .storagePushConstant8 = true,
+    .shaderInt8 = true,
+    .shaderFloat16 = true,
+    .shaderSharedInt64Atomics = true,
+    .storageBuffer8BitAccess = true,
+    .uniformAndStorageBuffer8BitAccess = true,
+    .vulkanMemoryModel = true,
+    .vulkanMemoryModelDeviceScope = true,
+};
+
+static const VkPhysicalDeviceVulkan11Features recommended_vk11 = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+    .pNext = (void *) &recommended_vk12,
+    .samplerYcbcrConversion = true,
+    .storagePushConstant16 = true,
+};
+
+const VkPhysicalDeviceFeatures2 pl_vulkan_recommended_features = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+    .pNext = (void *) &recommended_vk11,
     .features = {
         .shaderImageGatherExtended = true,
         .shaderStorageImageReadWithoutFormat = true,
@@ -250,6 +269,43 @@ const VkPhysicalDeviceFeatures2KHR pl_vulkan_recommended_features = {
         .shaderInt64 = true,
     }
 };
+
+// Required features
+static const VkPhysicalDeviceVulkan12Features required_vk12 = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+    .hostQueryReset = true,
+    .timelineSemaphore = true,
+};
+
+static const VkPhysicalDeviceVulkan11Features required_vk11 = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+    .pNext = (void *) &required_vk12,
+};
+
+const VkPhysicalDeviceFeatures2 pl_vulkan_required_features = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+    .pNext = (void *) &required_vk11,
+};
+
+static bool check_required_features(struct vk_ctx *vk)
+{
+    #define CHECK_FEATURE(maj, min, feat) do {                                  \
+        const VkPhysicalDeviceVulkan##maj##min##Features *f;                    \
+        f = vk_find_struct(&vk->features,                                       \
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_##maj##_##min##_FEATURES); \
+        if (!f || !f->feat) {                                                   \
+            PL_ERR(vk, "Missing device feature: " #feat);                       \
+            return false;                                                       \
+        }                                                                       \
+    } while (0)
+
+    CHECK_FEATURE(1, 2, hostQueryReset);
+    CHECK_FEATURE(1, 2, timelineSemaphore);
+
+    #undef CHECK_FEATURE
+    return true;
+}
+
 
 // List of mandatory device-level functions
 //
@@ -282,20 +338,16 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(CmdPipelineBarrier),
     PL_VK_DEV_FUN(CmdPushConstants),
     PL_VK_DEV_FUN(CmdResetQueryPool),
-    PL_VK_DEV_FUN(CmdSetEvent),
     PL_VK_DEV_FUN(CmdSetScissor),
     PL_VK_DEV_FUN(CmdSetViewport),
     PL_VK_DEV_FUN(CmdUpdateBuffer),
-    PL_VK_DEV_FUN(CmdWaitEvents),
     PL_VK_DEV_FUN(CmdWriteTimestamp),
     PL_VK_DEV_FUN(CreateBuffer),
     PL_VK_DEV_FUN(CreateBufferView),
     PL_VK_DEV_FUN(CreateCommandPool),
     PL_VK_DEV_FUN(CreateComputePipelines),
-    PL_VK_DEV_FUN(CreateDebugReportCallbackEXT),
     PL_VK_DEV_FUN(CreateDescriptorPool),
     PL_VK_DEV_FUN(CreateDescriptorSetLayout),
-    PL_VK_DEV_FUN(CreateEvent),
     PL_VK_DEV_FUN(CreateFence),
     PL_VK_DEV_FUN(CreateFramebuffer),
     PL_VK_DEV_FUN(CreateGraphicsPipelines),
@@ -311,11 +363,9 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(DestroyBuffer),
     PL_VK_DEV_FUN(DestroyBufferView),
     PL_VK_DEV_FUN(DestroyCommandPool),
-    PL_VK_DEV_FUN(DestroyDebugReportCallbackEXT),
     PL_VK_DEV_FUN(DestroyDescriptorPool),
     PL_VK_DEV_FUN(DestroyDescriptorSetLayout),
     PL_VK_DEV_FUN(DestroyDevice),
-    PL_VK_DEV_FUN(DestroyEvent),
     PL_VK_DEV_FUN(DestroyFence),
     PL_VK_DEV_FUN(DestroyFramebuffer),
     PL_VK_DEV_FUN(DestroyImage),
@@ -329,24 +379,27 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(DestroySampler),
     PL_VK_DEV_FUN(DestroySemaphore),
     PL_VK_DEV_FUN(DestroyShaderModule),
+    PL_VK_DEV_FUN(DeviceWaitIdle),
     PL_VK_DEV_FUN(EndCommandBuffer),
     PL_VK_DEV_FUN(FlushMappedMemoryRanges),
     PL_VK_DEV_FUN(FreeCommandBuffers),
     PL_VK_DEV_FUN(FreeMemory),
     PL_VK_DEV_FUN(GetBufferMemoryRequirements),
     PL_VK_DEV_FUN(GetDeviceQueue),
-    PL_VK_DEV_FUN(GetImageMemoryRequirements),
+    PL_VK_DEV_FUN(GetImageMemoryRequirements2),
     PL_VK_DEV_FUN(GetImageSubresourceLayout),
     PL_VK_DEV_FUN(GetPipelineCacheData),
     PL_VK_DEV_FUN(GetQueryPoolResults),
     PL_VK_DEV_FUN(InvalidateMappedMemoryRanges),
     PL_VK_DEV_FUN(MapMemory),
     PL_VK_DEV_FUN(QueueSubmit),
-    PL_VK_DEV_FUN(ResetEvent),
+    PL_VK_DEV_FUN(QueueWaitIdle),
     PL_VK_DEV_FUN(ResetFences),
+    PL_VK_DEV_FUN(ResetQueryPool),
     PL_VK_DEV_FUN(SetDebugUtilsObjectNameEXT),
     PL_VK_DEV_FUN(UpdateDescriptorSets),
     PL_VK_DEV_FUN(WaitForFences),
+    PL_VK_DEV_FUN(WaitSemaphores),
 };
 
 static void load_vk_fun(struct vk_ctx *vk, const struct vk_fun *fun)
@@ -385,22 +438,16 @@ static void load_vk_fun(struct vk_ctx *vk, const struct vk_fun *fun)
 
 // Private struct for pl_vk_inst
 struct priv {
-    VkDebugReportCallbackEXT debug_report_cb;
     VkDebugUtilsMessengerEXT debug_utils_cb;
 };
 
-void pl_vk_inst_destroy(const struct pl_vk_inst **inst_ptr)
+void pl_vk_inst_destroy(pl_vk_inst *inst_ptr)
 {
-    const struct pl_vk_inst *inst = *inst_ptr;
+    pl_vk_inst inst = *inst_ptr;
     if (!inst)
         return;
 
     struct priv *p = PL_PRIV(inst);
-    if (p->debug_report_cb) {
-        PL_VK_LOAD_FUN(inst->instance, DestroyDebugReportCallbackEXT, inst->get_proc_addr);
-        DestroyDebugReportCallbackEXT(inst->instance, p->debug_report_cb, PL_VK_ALLOC);
-    }
-
     if (p->debug_utils_cb) {
         PL_VK_LOAD_FUN(inst->instance, DestroyDebugUtilsMessengerEXT, inst->get_proc_addr);
         DestroyDebugUtilsMessengerEXT(inst->instance, p->debug_utils_cb, PL_VK_ALLOC);
@@ -411,27 +458,19 @@ void pl_vk_inst_destroy(const struct pl_vk_inst **inst_ptr)
     pl_free_ptr((void **) inst_ptr);
 }
 
+#ifdef MSAN
+__attribute__((no_sanitize("memory")))
+#endif
 static VkBool32 VKAPI_PTR vk_dbg_utils_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev,
                                           VkDebugUtilsMessageTypeFlagsEXT msgType,
                                           const VkDebugUtilsMessengerCallbackDataEXT *data,
                                           void *priv)
 {
-    struct pl_context *ctx = priv;
+    pl_log log = priv;
 
     // MSAN really doesn't like reading from the stack-allocated memory
     // allocated by the non-instrumented vulkan library, so just comment it out
     // when building with MSAN as a cheap hack-around.
-#ifndef MSAN
-
-    // We will ignore errors for a designated object, but we need to explicitly
-    // handle the case where no object is designated, because errors can have no
-    // object associated with them, and we don't want to suppress those errors.
-    if (ctx->suppress_errors_for_object) {
-        for (int i = 0; i < data->objectCount; i++) {
-            if (data->pObjects[i].objectHandle == ctx->suppress_errors_for_object)
-                return false;
-        }
-    }
 
     // Ignore errors for messages that we consider false positives
     switch (data->messageIdNumber) {
@@ -439,15 +478,21 @@ static VkBool32 VKAPI_PTR vk_dbg_utils_cb(VkDebugUtilsMessageSeverityFlagBitsEXT
     case 0x8928392f: // UNASSIGNED-BestPractices-NonSuccess-Result
     case 0xdc18ad6b: // UNASSIGNED-BestPractices-vkAllocateMemory-small-allocation
     case 0xb3d4346b: // UNASSIGNED-BestPractices-vkBindMemory-small-dedicated-allocation
+    case 0x6cfe18a5: // UNASSIGNED-BestPractices-SemaphoreCount
+    case 0x48a09f6c: // UNASSIGNED-BestPractices-pipeline-stage-flags
+    // profile chain expectations
+    case 0x30f4ac70: // VUID-VkImageCreateInfo-pNext-06811
         return false;
 
     case 0x5f379b89: // UNASSIGNED-BestPractices-Error-Result
         if (strstr(data->pMessage, "VK_ERROR_FORMAT_NOT_SUPPORTED"))
             return false;
         break;
-    }
 
-#endif
+    case 0xf6a37cfa: // VUID-vkGetImageSubresourceLayout-format-04461
+        // Work around https://github.com/KhronosGroup/Vulkan-Docs/issues/2109
+        return false;
+    }
 
     enum pl_log_level lev;
     switch (sev) {
@@ -458,21 +503,19 @@ static VkBool32 VKAPI_PTR vk_dbg_utils_cb(VkDebugUtilsMessageSeverityFlagBitsEXT
     default:                                                lev = PL_LOG_INFO;  break;
     }
 
-    pl_msg(ctx, lev, "vk %s", data->pMessage);
+    pl_msg(log, lev, "vk %s", data->pMessage);
 
-#ifndef MSAN
     for (int i = 0; i < data->queueLabelCount; i++)
-        pl_msg(ctx, lev, "    during %s", data->pQueueLabels[i].pLabelName);
+        pl_msg(log, lev, "    during %s", data->pQueueLabels[i].pLabelName);
     for (int i = 0; i < data->cmdBufLabelCount; i++)
-        pl_msg(ctx, lev, "    inside %s", data->pCmdBufLabels[i].pLabelName);
+        pl_msg(log, lev, "    inside %s", data->pCmdBufLabels[i].pLabelName);
     for (int i = 0; i < data->objectCount; i++) {
         const VkDebugUtilsObjectNameInfoEXT *obj = &data->pObjects[i];
-        pl_msg(ctx, lev, "    using %s: %s (0x%llx)",
+        pl_msg(log, lev, "    using %s: %s (0x%llx)",
                vk_obj_type(obj->objectType),
                obj->pObjectName ? obj->pObjectName : "anon",
                (unsigned long long) obj->objectHandle);
     }
-#endif
 
     // The return value of this function determines whether the call will
     // be explicitly aborted (to prevent GPU errors) or not. In this case,
@@ -481,41 +524,16 @@ static VkBool32 VKAPI_PTR vk_dbg_utils_cb(VkDebugUtilsMessageSeverityFlagBitsEXT
     bool is_error = (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) &&
                     (msgType & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT);
 
-    return is_error;
+    if (is_error) {
+        pl_log_stack_trace(log, lev);
+        pl_debug_abort();
+        return true;
+    }
+
+    return false;
 }
 
-// Legacy version of the above callback for the simpler VK_EXT_debug_report
-static VkBool32 VKAPI_PTR vk_dbg_report_cb(VkDebugReportFlagsEXT flags,
-                                           VkDebugReportObjectTypeEXT objType,
-                                           uint64_t obj, size_t loc,
-                                           int32_t msgCode, const char *layer,
-                                           const char *msg, void *priv)
-{
-    struct pl_context *ctx = priv;
-
-    if (ctx->suppress_errors_for_object != VK_NULL_HANDLE &&
-        ctx->suppress_errors_for_object == obj)
-        return false;
-
-    enum pl_log_level lev;
-    switch (flags) {
-    case VK_DEBUG_REPORT_ERROR_BIT_EXT:                 lev = PL_LOG_ERR;   break;
-    case VK_DEBUG_REPORT_WARNING_BIT_EXT:               lev = PL_LOG_WARN;  break;
-    case VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT:   lev = PL_LOG_WARN;  break;
-    case VK_DEBUG_REPORT_DEBUG_BIT_EXT:                 lev = PL_LOG_DEBUG; break;
-    case VK_DEBUG_REPORT_INFORMATION_BIT_EXT:           lev = PL_LOG_TRACE; break;
-    default:                                            lev = PL_LOG_INFO;  break;
-    };
-
-    // Note: We can freely cast VkDebugReportObjectTypeEXT to VkObjectType
-    pl_msg(ctx, lev, "vk [%s] %d: %s (obj 0x%llx (%s), loc 0x%zx)",
-           layer, (int) msgCode, msg, (unsigned long long) obj,
-           vk_obj_type((VkObjectType) objType), loc);
-
-    return !!(flags & VK_DEBUG_REPORT_ERROR_BIT_EXT);
-}
-
-static PFN_vkGetInstanceProcAddr get_proc_addr_fallback(struct pl_context *ctx,
+static PFN_vkGetInstanceProcAddr get_proc_addr_fallback(pl_log log,
                                     PFN_vkGetInstanceProcAddr get_proc_addr)
 {
     if (get_proc_addr)
@@ -524,19 +542,18 @@ static PFN_vkGetInstanceProcAddr get_proc_addr_fallback(struct pl_context *ctx,
 #ifdef PL_HAVE_VK_PROC_ADDR
     return vkGetInstanceProcAddr;
 #else
-    pl_fatal(ctx, "No `vkGetInstanceProcAddr` function provided, and "
+    pl_fatal(log, "No `vkGetInstanceProcAddr` function provided, and "
              "libplacebo built without linking against this function!");
     return NULL;
 #endif
 }
 
 #define PRINTF_VER(ver) \
-    (int) VK_VERSION_MAJOR(ver), \
-    (int) VK_VERSION_MINOR(ver), \
-    (int) VK_VERSION_PATCH(ver)
+    (int) VK_API_VERSION_MAJOR(ver), \
+    (int) VK_API_VERSION_MINOR(ver), \
+    (int) VK_API_VERSION_PATCH(ver)
 
-const struct pl_vk_inst *pl_vk_inst_create(struct pl_context *ctx,
-                                           const struct pl_vk_inst_params *params)
+pl_vk_inst pl_vk_inst_create(pl_log log, const struct pl_vk_inst_params *params)
 {
     void *tmp = pl_tmp(NULL);
     params = PL_DEF(params, &pl_vk_inst_default_params);
@@ -545,7 +562,7 @@ const struct pl_vk_inst *pl_vk_inst_create(struct pl_context *ctx,
     PL_ARRAY(const char *) exts = {0};
 
     PFN_vkGetInstanceProcAddr get_addr;
-    if (!(get_addr = get_proc_addr_fallback(ctx, params->get_proc_addr)))
+    if (!(get_addr = get_proc_addr_fallback(log, params->get_proc_addr)))
         goto error;
 
     // Query instance version support
@@ -554,12 +571,19 @@ const struct pl_vk_inst *pl_vk_inst_create(struct pl_context *ctx,
     if (EnumerateInstanceVersion && EnumerateInstanceVersion(&api_ver) != VK_SUCCESS)
         goto error;
 
-    pl_debug(ctx, "Available instance version: %d.%d.%d", PRINTF_VER(api_ver));
+    pl_debug(log, "Available instance version: %d.%d.%d", PRINTF_VER(api_ver));
 
     if (params->max_api_version) {
         api_ver = PL_MIN(api_ver, params->max_api_version);
-        pl_info(ctx, "Restricting API version to %d.%d.%d... new version %d.%d.%d",
+        pl_info(log, "Restricting API version to %d.%d.%d... new version %d.%d.%d",
                 PRINTF_VER(params->max_api_version), PRINTF_VER(api_ver));
+    }
+
+    if (api_ver < PL_VK_MIN_VERSION) {
+        pl_fatal(log, "Instance API version %d.%d.%d is lower than the minimum "
+                 "required version of %d.%d.%d, cannot proceed!",
+                 PRINTF_VER(api_ver), PRINTF_VER(PL_VK_MIN_VERSION));
+        goto error;
     }
 
     VkInstanceCreateInfo info = {
@@ -570,32 +594,6 @@ const struct pl_vk_inst *pl_vk_inst_create(struct pl_context *ctx,
         },
     };
 
-#ifdef VK_EXT_validation_features
-    // Try enabling as many validation features as possible. Ignored for
-    // instances not supporting VK_EXT_validation_features.
-    VkValidationFeatureEnableEXT validation_features[] = {
-        VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
-        VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT,
-# if VK_EXT_VALIDATION_FEATURES_SPEC_VERSION >= 2
-        VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT,
-# endif
-    };
-
-    VkValidationFeaturesEXT vinfo = {
-        .sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
-        .pEnabledValidationFeatures = validation_features,
-        .enabledValidationFeatureCount = PL_ARRAY_SIZE(validation_features),
-    };
-
-    if (params->debug_extra)
-        info.pNext = &vinfo;
-#else
-    if (params->debug_extra) {
-        pl_warn(ctx, "Enabled extra debugging but vulkan headers too old to "
-                "support it, please update vulkan and recompile libplacebo!");
-    }
-#endif
-
     // Enumerate all supported layers
     PL_VK_LOAD_FUN(NULL, EnumerateInstanceLayerProperties, get_addr);
     uint32_t num_layers_avail = 0;
@@ -603,9 +601,9 @@ const struct pl_vk_inst *pl_vk_inst_create(struct pl_context *ctx,
     VkLayerProperties *layers_avail = pl_calloc_ptr(tmp, num_layers_avail, layers_avail);
     EnumerateInstanceLayerProperties(&num_layers_avail, layers_avail);
 
-    pl_debug(ctx, "Available layers:");
+    pl_debug(log, "Available layers:");
     for (int i = 0; i < num_layers_avail; i++) {
-        pl_debug(ctx, "    %s (v%d.%d.%d)", layers_avail[i].layerName,
+        pl_debug(log, "    %s (v%d.%d.%d)", layers_avail[i].layerName,
                  PRINTF_VER(layers_avail[i].specVersion));
     }
 
@@ -620,20 +618,25 @@ const struct pl_vk_inst *pl_vk_inst_create(struct pl_context *ctx,
     // This layer has to be initialized first, otherwise all sorts of weirdness
     // happens (random segfaults, yum)
     bool debug = params->debug;
+    uint32_t debug_layer = 0; // layer idx of debug layer
+    uint32_t debug_layer_version = 0;
     if (debug) {
         for (int i = 0; i < PL_ARRAY_SIZE(debug_layers); i++) {
             for (int n = 0; n < num_layers_avail; n++) {
                 if (strcmp(debug_layers[i], layers_avail[n].layerName) != 0)
                     continue;
 
-                pl_info(ctx, "Enabling debug meta layer: %s", debug_layers[i]);
+                debug_layer = n;
+                debug_layer_version = layers_avail[n].specVersion;
+                pl_info(log, "Enabling debug meta layer: %s (v%d.%d.%d)",
+                        debug_layers[i], PRINTF_VER(debug_layer_version));
                 PL_ARRAY_APPEND(tmp, layers, debug_layers[i]);
                 goto debug_layers_done;
             }
         }
 
         // No layer found..
-        pl_warn(ctx, "API debugging requested but no debug meta layers present... ignoring");
+        pl_warn(log, "API debugging requested but no debug meta layers present... ignoring");
         debug = false;
     }
 
@@ -652,6 +655,19 @@ debug_layers_done: ;
         }
     }
 
+    static const char *extra_layers[] = {
+        "VK_LAYER_KHRONOS_synchronization2",
+    };
+
+    for (int i = 0; i < PL_ARRAY_SIZE(extra_layers); i++) {
+        for (int n = 0; n < num_layers_avail; n++) {
+            if (strcmp(extra_layers[i], layers_avail[n].layerName) == 0) {
+                PL_ARRAY_APPEND(tmp, layers, extra_layers[i]);
+                break;
+            }
+        }
+    }
+
     // Enumerate all supported extensions
     PL_VK_LOAD_FUN(NULL, EnumerateInstanceExtensionProperties, get_addr);
     uint32_t num_exts_avail = 0;
@@ -661,13 +677,13 @@ debug_layers_done: ;
 
     struct {
         VkExtensionProperties *exts;
-        int num_exts;
+        uint32_t num_exts;
     } *layer_exts = pl_calloc_ptr(tmp, num_layers_avail, layer_exts);
 
     // Enumerate extensions from layers
     for (int i = 0; i < num_layers_avail; i++) {
         VkExtensionProperties **lexts = &layer_exts[i].exts;
-        int *num = &layer_exts[i].num_exts;
+        uint32_t *num = &layer_exts[i].num_exts;
 
         EnumerateInstanceExtensionProperties(layers_avail[i].layerName, num, NULL);
         *lexts = pl_calloc_ptr(tmp, *num, *lexts);
@@ -682,15 +698,15 @@ debug_layers_done: ;
         }
     }
 
-    pl_debug(ctx, "Available instance extensions:");
+    pl_debug(log, "Available instance extensions:");
     for (int i = 0; i < num_exts_avail; i++)
-        pl_debug(ctx, "    %s", exts_avail[i].extensionName);
+        pl_debug(log, "    %s", exts_avail[i].extensionName);
     for (int i = 0; i < num_layers_avail; i++) {
         for (int j = 0; j < layer_exts[i].num_exts; j++) {
             if (!layer_exts[i].exts[j].extensionName[0])
                 continue;
 
-            pl_debug(ctx, "    %s (via %s)",
+            pl_debug(log, "    %s (via %s)",
                      layer_exts[i].exts[j].extensionName,
                      layers_avail[i].layerName);
         }
@@ -709,6 +725,17 @@ debug_layers_done: ;
             }
         }
     }
+
+#ifdef VK_KHR_portability_enumeration
+    // Required for macOS ( MoltenVK ) compatibility
+    for (int n = 0; n < num_exts_avail; n++) {
+        if (strcmp(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME, exts_avail[n].extensionName) == 0) {
+            PL_ARRAY_APPEND(tmp, exts, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+            info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+            break;
+        }
+    }
+#endif
 
     // Add extra user extensions
     for (int i = 0; i < params->num_extensions; i++) {
@@ -755,61 +782,98 @@ next_user_ext: ;
 next_opt_user_ext: ;
     }
 
-    // If debugging is enabled, add the debug report extension so we get useful
-    // debugging callbacks, sorted by priority since debug_utils deprecates
-    // debug_report
-    static const char *debug_ext = NULL;
-    static const char *debug_exts[] = {
-        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
-        VK_EXT_DEBUG_REPORT_EXTENSION_NAME,
-    };
-
+    // If debugging is enabled, load the necessary debug utils extension
     if (debug) {
-        for (int i = 0; i < PL_ARRAY_SIZE(debug_exts); i++) {
-            for (int n = 0; n < num_exts_avail; n++) {
-                if (strcmp(debug_exts[i], exts_avail[n].extensionName) != 0)
-                    continue;
+        const char * const ext = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+        for (int n = 0; n < num_exts_avail; n++) {
+            if (strcmp(ext, exts_avail[n].extensionName) == 0) {
+                PL_ARRAY_APPEND(tmp, exts, ext);
+                goto debug_ext_done;
+            }
+        }
 
-                pl_info(ctx, "Enabling debug report extension: %s", debug_exts[i]);
-                PL_ARRAY_APPEND(tmp, exts, debug_exts[i]);
-                debug_ext = debug_exts[i];
-                goto debug_exts_done;
+        for (int n = 0; n < layer_exts[debug_layer].num_exts; n++) {
+            if (strcmp(ext, layer_exts[debug_layer].exts[n].extensionName) == 0) {
+                PL_ARRAY_APPEND(tmp, exts, ext);
+                goto debug_ext_done;
             }
         }
 
         // No extension found
-        pl_warn(ctx, "API debug layers enabled but no debug report extension "
+        pl_warn(log, "API debug layers enabled but no debug report extension "
                 "found... ignoring. Debug messages may be spilling to "
                 "stdout/stderr!");
+        debug = false;
     }
 
-debug_exts_done: ;
+debug_ext_done: ;
+
+    // Limit this to 1.3.250+ because of bugs in older versions.
+    if (debug && params->debug_extra &&
+        debug_layer_version >= VK_MAKE_API_VERSION(0, 1, 3, 259))
+    {
+        // Try enabling as many validation features as possible
+        static const VkValidationFeatureEnableEXT validation_features[] = {
+            VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
+            VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT,
+            VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT,
+            VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
+        };
+
+        static const VkValidationFeaturesEXT vinfo = {
+            .sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
+            .pEnabledValidationFeatures = validation_features,
+            .enabledValidationFeatureCount = PL_ARRAY_SIZE(validation_features),
+        };
+
+        const char * const ext = VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME;
+        for (int n = 0; n < num_exts_avail; n++) {
+            if (strcmp(ext, exts_avail[n].extensionName) == 0) {
+                PL_ARRAY_APPEND(tmp, exts, ext);
+                vk_link_struct(&info, &vinfo);
+                goto debug_extra_ext_done;
+            }
+        }
+
+        for (int n = 0; n < layer_exts[debug_layer].num_exts; n++) {
+            if (strcmp(ext, layer_exts[debug_layer].exts[n].extensionName) == 0) {
+                PL_ARRAY_APPEND(tmp, exts, ext);
+                vk_link_struct(&info, &vinfo);
+                goto debug_extra_ext_done;
+            }
+        }
+
+        pl_warn(log, "GPU-assisted validation enabled but not supported by "
+                "instance, disabling...");
+    }
+
+debug_extra_ext_done: ;
 
     info.ppEnabledExtensionNames = exts.elem;
     info.enabledExtensionCount = exts.num;
     info.ppEnabledLayerNames = layers.elem;
     info.enabledLayerCount = layers.num;
 
-    pl_info(ctx, "Creating vulkan instance%s", exts.num ? " with extensions:" : "");
+    pl_info(log, "Creating vulkan instance%s", exts.num ? " with extensions:" : "");
     for (int i = 0; i < exts.num; i++)
-        pl_info(ctx, "    %s", exts.elem[i]);
+        pl_info(log, "    %s", exts.elem[i]);
 
     if (layers.num) {
-        pl_info(ctx, "  and layers:");
+        pl_info(log, "  and layers:");
         for (int i = 0; i < layers.num; i++)
-            pl_info(ctx, "    %s", layers.elem[i]);
+            pl_info(log, "    %s", layers.elem[i]);
     }
 
     PL_VK_LOAD_FUN(NULL, CreateInstance, get_addr);
     VkResult res = CreateInstance(&info, PL_VK_ALLOC, &inst);
     if (res != VK_SUCCESS) {
-        pl_fatal(ctx, "Failed creating instance: %s", vk_res_str(res));
+        pl_fatal(log, "Failed creating instance: %s", vk_res_str(res));
         goto error;
     }
 
-    struct pl_vk_inst *pl_vk = pl_zalloc_priv(NULL, struct pl_vk_inst, struct priv);
+    struct pl_vk_inst_t *pl_vk = pl_zalloc_obj(NULL, pl_vk, struct priv);
     struct priv *p = PL_PRIV(pl_vk);
-    *pl_vk = (struct pl_vk_inst) {
+    *pl_vk = (struct pl_vk_inst_t) {
         .instance = inst,
         .api_version = api_ver,
         .get_proc_addr = get_addr,
@@ -820,7 +884,7 @@ debug_exts_done: ;
     };
 
     // Set up a debug callback to catch validation messages
-    if (debug_ext && strcmp(debug_ext, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+    if (debug) {
         VkDebugUtilsMessengerCreateInfoEXT dinfo = {
             .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
             .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
@@ -831,32 +895,18 @@ debug_exts_done: ;
                            VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
                            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
             .pfnUserCallback = vk_dbg_utils_cb,
-            .pUserData = ctx,
+            .pUserData = (void *) log,
         };
 
         PL_VK_LOAD_FUN(inst, CreateDebugUtilsMessengerEXT, get_addr);
         CreateDebugUtilsMessengerEXT(inst, &dinfo, PL_VK_ALLOC, &p->debug_utils_cb);
-    } else if (debug_ext && strcmp(debug_ext, VK_EXT_DEBUG_REPORT_EXTENSION_NAME) == 0) {
-        VkDebugReportCallbackCreateInfoEXT dinfo = {
-            .sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT,
-            .flags = VK_DEBUG_REPORT_INFORMATION_BIT_EXT |
-                     VK_DEBUG_REPORT_WARNING_BIT_EXT |
-                     VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT |
-                     VK_DEBUG_REPORT_ERROR_BIT_EXT |
-                     VK_DEBUG_REPORT_DEBUG_BIT_EXT,
-            .pfnCallback = vk_dbg_report_cb,
-            .pUserData = ctx,
-        };
-
-        PL_VK_LOAD_FUN(inst, CreateDebugReportCallbackEXT, get_addr)
-        CreateDebugReportCallbackEXT(inst, &dinfo, PL_VK_ALLOC, &p->debug_report_cb);
     }
 
     pl_free(tmp);
     return pl_vk;
 
 error:
-    pl_fatal(ctx, "Failed initializing vulkan instance");
+    pl_fatal(log, "Failed initializing vulkan instance");
     if (inst) {
         PL_VK_LOAD_FUN(inst, DestroyInstance, get_addr);
         DestroyInstance(inst, PL_VK_ALLOC);
@@ -865,44 +915,46 @@ error:
     return NULL;
 }
 
-const struct pl_vulkan_params pl_vulkan_default_params = {
-    .async_transfer = true,
-    .async_compute  = true,
-    .queue_count    = 1, // enabling multiple queues often decreases perf
-};
+const struct pl_vulkan_params pl_vulkan_default_params = { PL_VULKAN_DEFAULTS };
 
-void pl_vulkan_destroy(const struct pl_vulkan **pl_vk)
+void pl_vulkan_destroy(pl_vulkan *pl_vk)
 {
     if (!*pl_vk)
         return;
 
-    pl_gpu_destroy((*pl_vk)->gpu);
-
     struct vk_ctx *vk = PL_PRIV(*pl_vk);
     if (vk->dev) {
-        PL_DEBUG(vk, "Flushing remaining commands...");
-        vk_wait_idle(vk);
-        pl_assert(vk->cmds_queued.num == 0);
-        pl_assert(vk->cmds_pending.num == 0);
+        if ((*pl_vk)->gpu) {
+            PL_DEBUG(vk, "Waiting for remaining commands...");
+            pl_gpu_finish((*pl_vk)->gpu);
+            pl_assert(vk->cmds_pending.num == 0);
+
+            pl_gpu_destroy((*pl_vk)->gpu);
+        }
+        vk_malloc_destroy(&vk->ma);
         for (int i = 0; i < vk->pools.num; i++)
-            vk_cmdpool_destroy(vk, vk->pools.elem[i]);
-        for (int i = 0; i < vk->signals.num; i++)
-            vk_signal_destroy(vk, &vk->signals.elem[i]);
+            vk_cmdpool_destroy(vk->pools.elem[i]);
 
         if (!vk->imported)
             vk->DestroyDevice(vk->dev, PL_VK_ALLOC);
     }
 
+    for (int i = 0; i < vk->queue_locks.num; i++) {
+        for (int n = 0; n < vk->queue_locks.elem[i].num; n++)
+            pl_mutex_destroy(&vk->queue_locks.elem[i].elem[n]);
+    }
+
     pl_vk_inst_destroy(&vk->internal_instance);
+    pl_mutex_destroy(&vk->lock);
     pl_free_ptr((void **) pl_vk);
 }
 
-static bool supports_surf(struct pl_context *ctx, VkInstance inst,
+static bool supports_surf(pl_log log, VkInstance inst,
                           PFN_vkGetInstanceProcAddr get_addr,
                           VkPhysicalDevice physd, VkSurfaceKHR surf)
 {
     // Hack for the VK macro's logging to work
-    struct { struct pl_context *ctx; } *vk = (void *) &ctx;
+    struct { pl_log log; } *vk = (void *) &log;
 
     PL_VK_LOAD_FUN(inst, GetPhysicalDeviceQueueFamilyProperties, get_addr);
     PL_VK_LOAD_FUN(inst, GetPhysicalDeviceSurfaceSupportKHR, get_addr);
@@ -920,11 +972,11 @@ error:
     return false;
 }
 
-VkPhysicalDevice pl_vulkan_choose_device(struct pl_context *ctx,
-                                         const struct pl_vulkan_device_params *params)
+VkPhysicalDevice pl_vulkan_choose_device(pl_log log,
+                                const struct pl_vulkan_device_params *params)
 {
     // Hack for the VK macro's logging to work
-    struct { struct pl_context *ctx; } *vk = (void *) &ctx;
+    struct { pl_log log; } *vk = (void *) &log;
     PL_INFO(vk, "Probing for vulkan devices:");
 
     pl_assert(params->instance);
@@ -932,18 +984,12 @@ VkPhysicalDevice pl_vulkan_choose_device(struct pl_context *ctx,
     VkPhysicalDevice dev = VK_NULL_HANDLE;
 
     PFN_vkGetInstanceProcAddr get_addr;
-    if (!(get_addr = get_proc_addr_fallback(ctx, params->get_proc_addr)))
+    if (!(get_addr = get_proc_addr_fallback(log, params->get_proc_addr)))
         return NULL;
 
     PL_VK_LOAD_FUN(inst, EnumeratePhysicalDevices, get_addr);
-    PL_VK_LOAD_FUN(inst, GetPhysicalDeviceProperties2KHR, get_addr);
-
-    if (!GetPhysicalDeviceProperties2KHR) {
-        PL_FATAL(vk, "Provided VkInstance does not support "
-                 VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME
-                 ", cannot continue!");
-        return VK_NULL_HANDLE;
-    }
+    PL_VK_LOAD_FUN(inst, GetPhysicalDeviceProperties2, get_addr);
+    pl_assert(GetPhysicalDeviceProperties2);
 
     VkPhysicalDevice *devices = NULL;
     uint32_t num = 0;
@@ -973,22 +1019,15 @@ VkPhysicalDevice pl_vulkan_choose_device(struct pl_context *ctx,
             .pNext = &id_props,
         };
 
-        GetPhysicalDeviceProperties2KHR(devices[i], &prop);
+        GetPhysicalDeviceProperties2(devices[i], &prop);
         VkPhysicalDeviceType t = prop.properties.deviceType;
-        bool has_uuid = memcmp(id_props.deviceUUID, nil, VK_UUID_SIZE) != 0;
-        if (uuid_set && !has_uuid) {
-            PL_FATAL(vk, "params.device_uuid set but provided instance does "
-                     "not support the extensions required to query device UUIDs!");
-            goto error;
-        }
-
         const char *dtype = t < PL_ARRAY_SIZE(types) ? types[t].name : "unknown?";
-        PL_INFO(vk, "    GPU %d: %s (%s)", i, prop.properties.deviceName, dtype);
-        if (has_uuid)
-            PL_INFO(vk, "           uuid: %s", PRINT_UUID(id_props.deviceUUID));
+        PL_INFO(vk, "    GPU %d: %s v%d.%d.%d (%s)", i, prop.properties.deviceName,
+                PRINTF_VER(prop.properties.apiVersion), dtype);
+        PL_INFO(vk, "           uuid: %s", PRINT_UUID(id_props.deviceUUID));
 
         if (params->surface) {
-            if (!supports_surf(ctx, inst, get_addr, devices[i], params->surface)) {
+            if (!supports_surf(log, inst, get_addr, devices[i], params->surface)) {
                 PL_DEBUG(vk, "      -> excluding due to lack of surface support");
                 continue;
             }
@@ -1013,7 +1052,12 @@ VkPhysicalDevice pl_vulkan_choose_device(struct pl_context *ctx,
         }
 
         if (!params->allow_software && t == VK_PHYSICAL_DEVICE_TYPE_CPU) {
-            PL_DEBUG(vk, "      -> excluding due to params->allow_software");
+            PL_DEBUG(vk, "      -> excluding due to !params->allow_software");
+            continue;
+        }
+
+        if (prop.properties.apiVersion < PL_VK_MIN_VERSION) {
+            PL_DEBUG(vk, "      -> excluding due to too low API version");
             continue;
         }
 
@@ -1029,6 +1073,36 @@ error:
     return dev;
 }
 
+static void lock_queue_internal(void *priv, uint32_t qf, uint32_t qidx)
+{
+    struct vk_ctx *vk = priv;
+    pl_mutex_lock(&vk->queue_locks.elem[qf].elem[qidx]);
+}
+
+static void unlock_queue_internal(void *priv, uint32_t qf, uint32_t qidx)
+{
+    struct vk_ctx *vk = priv;
+    pl_mutex_unlock(&vk->queue_locks.elem[qf].elem[qidx]);
+}
+
+static void init_queue_locks(struct vk_ctx *vk, uint32_t qfnum,
+                             const VkQueueFamilyProperties *qfs)
+{
+    vk->queue_locks.elem = pl_calloc_ptr(vk->alloc, qfnum, vk->queue_locks.elem);
+    vk->queue_locks.num = qfnum;
+    for (int i = 0; i < qfnum; i++) {
+        const uint32_t qnum = qfs[i].queueCount;
+        vk->queue_locks.elem[i].elem = pl_calloc(vk->alloc, qnum, sizeof(pl_mutex));
+        vk->queue_locks.elem[i].num = qnum;
+        for (int n = 0; n < qnum; n++)
+            pl_mutex_init(&vk->queue_locks.elem[i].elem[n]);
+    }
+
+    vk->lock_queue = lock_queue_internal;
+    vk->unlock_queue = unlock_queue_internal;
+    vk->queue_ctx = vk;
+}
+
 // Find the most specialized queue supported a combination of flags. In cases
 // where there are multiple queue families at the same specialization level,
 // this finds the one with the most queues. Returns -1 if no queue was found.
@@ -1036,7 +1110,7 @@ static int find_qf(VkQueueFamilyProperties *qfs, int qfnum, VkQueueFlags flags)
 {
     int idx = -1;
     for (int i = 0; i < qfnum; i++) {
-        if (!(qfs[i].queueFlags & flags))
+        if ((qfs[i].queueFlags & flags) != flags)
             continue;
 
         // QF is more specialized. Since we don't care about other bits like
@@ -1057,63 +1131,48 @@ static int find_qf(VkQueueFamilyProperties *qfs, int qfnum, VkQueueFlags flags)
     return idx;
 }
 
-typedef PL_ARRAY(VkDeviceQueueCreateInfo) qinfo_arr_t;
-
-static void add_qinfo(void *alloc, qinfo_arr_t *qinfos,
-                      VkQueueFamilyProperties *qfs, int idx, int qcount)
-{
-    if (idx < 0)
-        return;
-
-    // Check to see if we've already added this queue family
-    for (int i = 0; i < qinfos->num; i++) {
-        if (qinfos->elem[i].queueFamilyIndex == idx)
-            return;
-    }
-
-    if (!qcount)
-        qcount = qfs[idx].queueCount;
-
-    float *priorities = pl_calloc_ptr(alloc, qcount, priorities);
-    VkDeviceQueueCreateInfo qinfo = {
-        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueFamilyIndex = idx,
-        .queueCount = PL_MIN(qcount, qfs[idx].queueCount),
-        .pQueuePriorities = priorities,
-    };
-
-    PL_ARRAY_APPEND(alloc, *qinfos, qinfo);
-}
-
 static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params)
 {
     pl_assert(vk->physd);
     void *tmp = pl_tmp(NULL);
 
     // Enumerate the queue families and find suitable families for each task
-    int qfnum = 0;
+    uint32_t qfnum = 0;
     vk->GetPhysicalDeviceQueueFamilyProperties(vk->physd, &qfnum, NULL);
     VkQueueFamilyProperties *qfs = pl_calloc_ptr(tmp, qfnum, qfs);
     vk->GetPhysicalDeviceQueueFamilyProperties(vk->physd, &qfnum, qfs);
+    init_queue_locks(vk, qfnum, qfs);
 
     PL_DEBUG(vk, "Queue families supported by device:");
-
     for (int i = 0; i < qfnum; i++) {
-        PL_DEBUG(vk, "    %d: flags 0x%x num %d", i,
-                 (unsigned) qfs[i].queueFlags, (int) qfs[i].queueCount);
+        PL_DEBUG(vk, "    %d: flags 0x%"PRIx32" num %"PRIu32, i,
+                 qfs[i].queueFlags, qfs[i].queueCount);
     }
 
-    int idx_gfx = -1, idx_comp = -1, idx_tf = -1;
-    idx_gfx = find_qf(qfs, qfnum, VK_QUEUE_GRAPHICS_BIT);
-    if (params->async_compute)
-        idx_comp = find_qf(qfs, qfnum, VK_QUEUE_COMPUTE_BIT);
-    if (params->async_transfer)
-        idx_tf = find_qf(qfs, qfnum, VK_QUEUE_TRANSFER_BIT);
+    VkQueueFlagBits gfx_flags = VK_QUEUE_GRAPHICS_BIT;
+    if (!params->async_compute)
+        gfx_flags |= VK_QUEUE_COMPUTE_BIT;
 
-    // Vulkan requires at least one GRAPHICS queue, so if this fails something
-    // is horribly wrong.
-    pl_assert(idx_gfx >= 0);
+    int idx_gfx  = find_qf(qfs, qfnum, gfx_flags);
+    int idx_comp = find_qf(qfs, qfnum, VK_QUEUE_COMPUTE_BIT);
+    int idx_tf   = find_qf(qfs, qfnum, VK_QUEUE_TRANSFER_BIT);
+    if (idx_tf < 0)
+        idx_tf = idx_comp;
+
+    if (!params->async_compute)
+        idx_comp = idx_gfx;
+    if (!params->async_transfer)
+        idx_tf = idx_gfx;
+
     PL_DEBUG(vk, "Using graphics queue %d", idx_gfx);
+    if (idx_tf != idx_gfx)
+        PL_INFO(vk, "Using async transfer (queue %d)", idx_tf);
+    if (idx_comp != idx_gfx)
+        PL_INFO(vk, "Using async compute (queue %d)", idx_comp);
+
+    // Vulkan requires at least one GRAPHICS+COMPUTE queue, so if this fails
+    // something is horribly wrong.
+    pl_assert(idx_gfx >= 0 && idx_comp >= 0 && idx_tf >= 0);
 
     // If needed, ensure we can actually present to the surface using this queue
     if (params->surface) {
@@ -1125,27 +1184,6 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
             goto error;
         }
     }
-
-    // Fall back to supporting compute shaders via the graphics pool for
-    // devices which support compute shaders but not async compute.
-    if (idx_comp < 0 && qfs[idx_gfx].queueFlags & VK_QUEUE_COMPUTE_BIT)
-        idx_comp = idx_gfx;
-
-    if (params->blacklist_caps & PL_GPU_CAP_COMPUTE) {
-        PL_INFO(vk, "Disabling compute shaders (blacklisted)");
-        idx_comp = -1;
-    }
-
-    if (idx_tf >= 0 && idx_tf != idx_gfx)
-        PL_INFO(vk, "Using async transfer (queue %d)", idx_tf);
-    if (idx_comp >= 0 && idx_comp != idx_gfx)
-        PL_INFO(vk, "Using async compute (queue %d)", idx_comp);
-
-    // Now that we know which QFs we want, we can create the logical device
-    qinfo_arr_t qinfos = {0};
-    add_qinfo(tmp, &qinfos, qfs, idx_gfx, params->queue_count);
-    add_qinfo(tmp, &qinfos, qfs, idx_comp, params->queue_count);
-    add_qinfo(tmp, &qinfos, qfs, idx_tf, params->queue_count);
 
     // Enumerate all supported extensions
     uint32_t num_exts_avail = 0;
@@ -1167,9 +1205,10 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
     // Add all optional device-level extensions extensions
     for (int i = 0; i < PL_ARRAY_SIZE(vk_device_extensions); i++) {
         const struct vk_ext *ext = &vk_device_extensions[i];
-        if (ext->core_ver && vk->api_ver >= ext->core_ver) {
+        uint32_t core_ver = vk_ext_promoted_ver(ext->name);
+        if (core_ver && vk->api_ver >= core_ver) {
             // Layer is already implicitly enabled by the API version
-            for (const struct vk_fun *f = ext->funs; f->name; f++)
+            for (const struct vk_fun *f = ext->funs; f && f->name; f++)
                 PL_ARRAY_APPEND(tmp, ext_funs,  f);
             continue;
         }
@@ -1177,7 +1216,7 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
         for (int n = 0; n < num_exts_avail; n++) {
             if (strcmp(ext->name, exts_avail[n].extensionName) == 0) {
                 PL_ARRAY_APPEND(vk->alloc, vk->exts, ext->name);
-                for (const struct vk_fun *f = ext->funs; f->name; f++)
+                for (const struct vk_fun *f = ext->funs; f && f->name; f++)
                     PL_ARRAY_APPEND(tmp, ext_funs, f);
                 break;
             }
@@ -1199,54 +1238,62 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
         }
     }
 
-    // Query all supported device features by constructing a pNext chain
-    // starting with the features we care about and ending with whatever
-    // features were requested by the user
-    vk->features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR;
-    for (const VkBaseInStructure *in = pl_vulkan_recommended_features.pNext;
-            in; in = in->pNext)
-        vk_link_struct(&vk->features, vk_struct_memdup(vk->alloc, in));
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR
+    };
 
-    for (const VkBaseInStructure *in = (const VkBaseInStructure *) params->features;
-            in; in = in->pNext)
-    {
-        if (vk_find_struct(&vk->features, in->sType))
-            continue; // skip structs already present
+    vk_features_normalize(tmp, &pl_vulkan_required_features, vk->api_ver, &features);
+    vk_features_normalize(tmp, &pl_vulkan_recommended_features, vk->api_ver, &features);
+    vk_features_normalize(tmp, params->features, vk->api_ver, &features);
 
-        void *copy = vk_struct_memdup(vk->alloc, in);
-        if (!copy) {
-            PL_ERR(vk, "Unknown struct type %"PRIu64"?", (uint64_t) in->sType);
-            continue;
-        }
-
-        vk_link_struct(&vk->features, copy);
+    // Explicitly clear the features struct before querying feature support
+    // from the driver. This way, we don't mistakenly mark as supported
+    // features coming from structs the driver doesn't have support for.
+    VkPhysicalDeviceFeatures2 *features_sup = vk_chain_memdup(tmp, &features);;
+    for (VkBaseOutStructure *out = (void *) features_sup; out; out = out->pNext) {
+        const size_t size = vk_struct_size(out->sType);
+        memset(&out[1], 0, size - sizeof(out[0]));
     }
 
-    vk->GetPhysicalDeviceFeatures2KHR(vk->physd, &vk->features);
+    vk->GetPhysicalDeviceFeatures2KHR(vk->physd, features_sup);
 
-    // Go through the features chain a second time and mask every option
-    // that wasn't whitelisted by either libplacebo or the user
-    for (VkBaseOutStructure *chain = (VkBaseOutStructure *) &vk->features;
-            chain; chain = chain->pNext)
-    {
-        const VkBaseInStructure *in_a, *in_b;
-        in_a = vk_find_struct(&pl_vulkan_recommended_features, chain->sType);
-        in_b = vk_find_struct(params->features, chain->sType);
-        in_a = PL_DEF(in_a, in_b);
-        in_b = PL_DEF(in_b, in_a);
-        pl_assert(in_a && in_b);
-
-        VkBool32 *req = (VkBool32 *) &chain[1];
-        const VkBool32 *wl_a = (const VkBool32 *) &in_a[1];
-        const VkBool32 *wl_b = (const VkBool32 *) &in_b[1];
-        size_t size = vk_struct_size(chain->sType) - sizeof(chain[0]);
+    // Filter out unsupported features
+    for (VkBaseOutStructure *f = (VkBaseOutStructure *) &features; f; f = f->pNext) {
+        const VkBaseInStructure *sup = vk_find_struct(features_sup, f->sType);
+        VkBool32 *flags = (VkBool32 *) &f[1];
+        const VkBool32 *flags_sup = (const VkBool32 *) &sup[1];
+        const size_t size = vk_struct_size(f->sType) - sizeof(VkBaseOutStructure);
         for (int i = 0; i < size / sizeof(VkBool32); i++)
-            req[i] &= wl_a[i] || wl_b[i];
+            flags[i] &= flags_sup[i];
+    }
+
+    // Construct normalized output chain
+    vk->features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    vk_features_normalize(vk->alloc, &features, 0, &vk->features);
+    if (!check_required_features(vk)) {
+        PL_FATAL(vk, "Vulkan device does not support all required features!");
+        goto error;
+    }
+
+    // Enable all queues at device creation time, to maximize compatibility
+    // with other API users (e.g. FFmpeg)
+    PL_ARRAY(VkDeviceQueueCreateInfo) qinfos = {0};
+    for (int i = 0; i < qfnum; i++) {
+        bool use_qf = i == idx_gfx || i == idx_comp || i == idx_tf;
+        use_qf |= qfs[i].queueFlags & params->extra_queues;
+        if (!use_qf)
+            continue;
+        PL_ARRAY_APPEND(tmp, qinfos, (VkDeviceQueueCreateInfo) {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .queueFamilyIndex = i,
+            .queueCount = qfs[i].queueCount,
+            .pQueuePriorities = pl_calloc(tmp, qfs[i].queueCount, sizeof(float)),
+        });
     }
 
     VkDeviceCreateInfo dinfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = &vk->features,
+        .pNext = &features,
         .pQueueCreateInfos = qinfos.elem,
         .queueCreateInfoCount = qinfos.num,
         .ppEnabledExtensionNames = vk->exts.elem,
@@ -1267,31 +1314,40 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
     for (int i = 0; i < ext_funs.num; i++)
         load_vk_fun(vk, ext_funs.elem[i]);
 
-    // Create the command pools
-    for (int i = 0; i < qinfos.num; i++) {
-        int qf = qinfos.elem[i].queueFamilyIndex;
-        struct vk_cmdpool *pool = vk_cmdpool_create(vk, qinfos.elem[i], qfs[qf]);
+    // Create the command pools for the queues we care about
+    const uint32_t qmax = PL_DEF(params->queue_count, UINT32_MAX);
+    for (int i = 0; i < qfnum; i++) {
+        if (i != idx_gfx && i != idx_tf && i != idx_comp)
+            continue; // ignore QFs not used internally
+
+        int qnum = qfs[i].queueCount;
+        if (qmax < qnum) {
+            PL_DEBUG(vk, "Restricting QF %d from %d queues to %d", i, qnum, qmax);
+            qnum = qmax;
+        }
+
+        struct vk_cmdpool *pool = vk_cmdpool_create(vk, i, qnum, qfs[i]);
         if (!pool)
             goto error;
         PL_ARRAY_APPEND(vk->alloc, vk->pools, pool);
 
         // Update the pool_* pointers based on the corresponding index
         const char *qf_name = NULL;
-        if (qf == idx_tf) {
+        if (i == idx_tf) {
             vk->pool_transfer = pool;
             qf_name = "transfer";
         }
-        if (qf == idx_comp) {
+        if (i == idx_comp) {
             vk->pool_compute = pool;
             qf_name = "compute";
         }
-        if (qf == idx_gfx) {
+        if (i == idx_gfx) {
             vk->pool_graphics = pool;
             qf_name = "graphics";
         }
 
         for (int n = 0; n < pool->num_queues; n++)
-            PL_VK_NAME(QUEUE, pool->queues[n], qf_name);
+            PL_VK_NAME_HANDLE(QUEUE, pool->queues[n], qf_name);
     }
 
     pl_free(tmp);
@@ -1304,19 +1360,91 @@ error:
     return false;
 }
 
-const struct pl_vulkan *pl_vulkan_create(struct pl_context *ctx,
-                                         const struct pl_vulkan_params *params)
+static void lock_queue(pl_vulkan pl_vk, uint32_t qf, uint32_t qidx)
+{
+    struct vk_ctx *vk = PL_PRIV(pl_vk);
+    vk->lock_queue(vk->queue_ctx, qf, qidx);
+}
+
+static void unlock_queue(pl_vulkan pl_vk, uint32_t qf, uint32_t qidx)
+{
+    struct vk_ctx *vk = PL_PRIV(pl_vk);
+    vk->unlock_queue(vk->queue_ctx, qf, qidx);
+}
+
+static bool finalize_context(struct pl_vulkan_t *pl_vk, int max_glsl_version)
+{
+    struct vk_ctx *vk = PL_PRIV(pl_vk);
+
+    pl_assert(vk->pool_graphics);
+    pl_assert(vk->pool_compute);
+    pl_assert(vk->pool_transfer);
+
+    vk->ma = vk_malloc_create(vk);
+    if (!vk->ma)
+        return false;
+
+    pl_vk->gpu = pl_gpu_create_vk(vk);
+    if (!pl_vk->gpu)
+        return false;
+
+    // Blacklist / restrict features
+    if (max_glsl_version) {
+        struct pl_glsl_version *glsl = (struct pl_glsl_version *) &pl_vk->gpu->glsl;
+        glsl->version = PL_MIN(glsl->version, max_glsl_version);
+        glsl->version = PL_MAX(glsl->version, 140); // required for GL_KHR_vulkan_glsl
+        PL_INFO(vk, "Restricting GLSL version to %d... new version is %d",
+                max_glsl_version, glsl->version);
+    }
+
+    // Expose the resulting vulkan objects
+    pl_vk->instance = vk->inst;
+    pl_vk->phys_device = vk->physd;
+    pl_vk->device = vk->dev;
+    pl_vk->get_proc_addr = vk->GetInstanceProcAddr;
+    pl_vk->api_version = vk->api_ver;
+    pl_vk->extensions = vk->exts.elem;
+    pl_vk->num_extensions = vk->exts.num;
+    pl_vk->features = &vk->features;
+    pl_vk->num_queues = vk->pools.num;
+    pl_vk->queues = pl_calloc_ptr(vk->alloc, vk->pools.num, pl_vk->queues);
+    pl_vk->lock_queue = lock_queue;
+    pl_vk->unlock_queue = unlock_queue;
+
+    for (int i = 0; i < vk->pools.num; i++) {
+        struct pl_vulkan_queue *queues = (struct pl_vulkan_queue *) pl_vk->queues;
+        queues[i] = (struct pl_vulkan_queue) {
+            .index = vk->pools.elem[i]->qf,
+            .count = vk->pools.elem[i]->num_queues,
+        };
+
+        if (vk->pools.elem[i] == vk->pool_graphics)
+            pl_vk->queue_graphics = queues[i];
+        if (vk->pools.elem[i] == vk->pool_compute)
+            pl_vk->queue_compute = queues[i];
+        if (vk->pools.elem[i] == vk->pool_transfer)
+            pl_vk->queue_transfer = queues[i];
+    }
+
+    pl_assert(vk->lock_queue);
+    pl_assert(vk->unlock_queue);
+    return true;
+}
+
+pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params)
 {
     params = PL_DEF(params, &pl_vulkan_default_params);
-    struct pl_vulkan *pl_vk = pl_zalloc_priv(NULL, struct pl_vulkan, struct vk_ctx);
+    struct pl_vulkan_t *pl_vk = pl_zalloc_obj(NULL, pl_vk, struct vk_ctx);
     struct vk_ctx *vk = PL_PRIV(pl_vk);
     *vk = (struct vk_ctx) {
+        .vulkan = pl_vk,
         .alloc = pl_vk,
-        .ctx = ctx,
+        .log = log,
         .inst = params->instance,
-        .GetInstanceProcAddr = get_proc_addr_fallback(ctx, params->get_proc_addr),
+        .GetInstanceProcAddr = get_proc_addr_fallback(log, params->get_proc_addr),
     };
 
+    pl_mutex_init_type(&vk->lock, PL_MUTEX_RECURSIVE);
     if (!vk->GetInstanceProcAddr)
         goto error;
 
@@ -1329,7 +1457,7 @@ const struct pl_vulkan *pl_vulkan_create(struct pl_context *ctx,
         struct pl_vk_inst_params iparams;
         iparams = *PL_DEF(params->instance_params, &pl_vk_inst_default_params);
         iparams.get_proc_addr = params->get_proc_addr;
-        vk->internal_instance = pl_vk_inst_create(ctx, &iparams);
+        vk->internal_instance = pl_vk_inst_create(log, &iparams);
         if (!vk->internal_instance)
             goto error;
         vk->inst = vk->internal_instance->instance;
@@ -1347,13 +1475,14 @@ const struct pl_vulkan *pl_vulkan_create(struct pl_context *ctx,
     } else {
         struct pl_vulkan_device_params dparams = {
             .instance       = vk->inst,
+            .get_proc_addr  = params->get_proc_addr,
             .surface        = params->surface,
             .device_name    = params->device_name,
             .allow_software = params->allow_software,
         };
         memcpy(dparams.device_uuid, params->device_uuid, VK_UUID_SIZE);
 
-        vk->physd = pl_vulkan_choose_device(ctx, &dparams);
+        vk->physd = pl_vulkan_choose_device(log, &dparams);
         if (!vk->physd) {
             PL_FATAL(vk, "Found no suitable device, giving up.");
             goto error;
@@ -1369,15 +1498,15 @@ const struct pl_vulkan *pl_vulkan_create(struct pl_context *ctx,
         .pNext = &id_props,
     };
 
-    vk->GetPhysicalDeviceProperties2KHR(vk->physd, &prop);
-    vk->limits = prop.properties.limits;
+    vk->GetPhysicalDeviceProperties2(vk->physd, &prop);
+    vk->props = prop.properties;
 
     PL_INFO(vk, "Vulkan device properties:");
     PL_INFO(vk, "    Device Name: %s", prop.properties.deviceName);
-    PL_INFO(vk, "    Device ID: %x:%x", (unsigned) prop.properties.vendorID,
-            (unsigned) prop.properties.deviceID);
+    PL_INFO(vk, "    Device ID: %"PRIx32":%"PRIx32, prop.properties.vendorID,
+            prop.properties.deviceID);
     PL_INFO(vk, "    Device UUID: %s", PRINT_UUID(id_props.deviceUUID));
-    PL_INFO(vk, "    Driver version: %d", (int) prop.properties.driverVersion);
+    PL_INFO(vk, "    Driver version: %"PRIx32, prop.properties.driverVersion);
     PL_INFO(vk, "    API version: %d.%d.%d", PRINTF_VER(prop.properties.apiVersion));
 
     // Needed by device_init
@@ -1388,93 +1517,54 @@ const struct pl_vulkan *pl_vulkan_create(struct pl_context *ctx,
                 PRINTF_VER(params->max_api_version), PRINTF_VER(vk->api_ver));
     }
 
+    if (vk->api_ver < PL_VK_MIN_VERSION) {
+        PL_FATAL(vk, "Device API version %d.%d.%d is lower than the minimum "
+                 "required version of %d.%d.%d, cannot proceed!",
+                 PRINTF_VER(vk->api_ver), PRINTF_VER(PL_VK_MIN_VERSION));
+        goto error;
+    }
+
     // Finally, initialize the logical device and the rest of the vk_ctx
     if (!device_init(vk, params))
         goto error;
 
-    pl_vk->gpu = pl_gpu_create_vk(vk);
-    if (!pl_vk->gpu)
+    if (!finalize_context(pl_vk, params->max_glsl_version))
         goto error;
-
-    // Blacklist / restrict features
-    if (params->blacklist_caps) {
-        pl_gpu_caps *caps = (pl_gpu_caps*) &pl_vk->gpu->caps;
-        *caps &= ~(params->blacklist_caps);
-        PL_INFO(vk, "Restricting capabilities 0x%x... new caps are 0x%x",
-                (unsigned int) params->blacklist_caps, (unsigned int) *caps);
-    }
-
-    if (params->max_glsl_version) {
-        struct pl_glsl_desc *desc = (struct pl_glsl_desc *) &pl_vk->gpu->glsl;
-        desc->version = PL_MIN(desc->version, params->max_glsl_version);
-        PL_INFO(vk, "Restricting GLSL version to %d... new version is %d",
-                params->max_glsl_version, desc->version);
-    }
-
-    vk->disable_events = params->disable_events;
-
-    // Expose the resulting vulkan objects
-    pl_vk->instance = vk->inst;
-    pl_vk->phys_device = vk->physd;
-    pl_vk->device = vk->dev;
-    pl_vk->api_version = vk->api_ver;
-    pl_vk->extensions = vk->exts.elem;
-    pl_vk->num_extensions = vk->exts.num;
-    pl_vk->features = &vk->features;
-    pl_vk->num_queues = vk->pools.num;
-    pl_vk->queues = pl_calloc_ptr(pl_vk, vk->pools.num, pl_vk->queues);
-    for (int i = 0; i < vk->pools.num; i++) {
-        struct pl_vulkan_queue *queues = (struct pl_vulkan_queue *) pl_vk->queues;
-        queues[i] = (struct pl_vulkan_queue) {
-            .index = vk->pools.elem[i]->qf,
-            .count = vk->pools.elem[i]->num_queues,
-        };
-
-        if (vk->pools.elem[i] == vk->pool_graphics)
-            pl_vk->queue_graphics = queues[i];
-        if (vk->pools.elem[i] == vk->pool_compute && vk->pool_compute != vk->pool_graphics)
-            pl_vk->queue_compute = queues[i];
-        if (vk->pools.elem[i] == vk->pool_compute)
-            pl_vk->queue_compute = queues[i];
-    }
 
     return pl_vk;
 
 error:
     PL_FATAL(vk, "Failed initializing vulkan device");
-    pl_vulkan_destroy((const struct pl_vulkan **) &pl_vk);
+    pl_vulkan_destroy((pl_vulkan *) &pl_vk);
     return NULL;
 }
 
-const struct pl_vulkan *pl_vulkan_import(struct pl_context *ctx,
-                                         const struct pl_vulkan_import_params *params)
+pl_vulkan pl_vulkan_import(pl_log log, const struct pl_vulkan_import_params *params)
 {
     void *tmp = pl_tmp(NULL);
 
-    struct pl_vulkan *pl_vk = pl_zalloc_priv(NULL, struct pl_vulkan, struct vk_ctx);
+    struct pl_vulkan_t *pl_vk = pl_zalloc_obj(NULL, pl_vk, struct vk_ctx);
     struct vk_ctx *vk = PL_PRIV(pl_vk);
     *vk = (struct vk_ctx) {
+        .vulkan = pl_vk,
         .alloc = pl_vk,
-        .ctx = ctx,
+        .log = log,
         .imported = true,
         .inst = params->instance,
         .physd = params->phys_device,
         .dev = params->device,
-        .GetInstanceProcAddr = get_proc_addr_fallback(ctx, params->get_proc_addr),
+        .GetInstanceProcAddr = get_proc_addr_fallback(log, params->get_proc_addr),
+        .lock_queue = params->lock_queue,
+        .unlock_queue = params->unlock_queue,
+        .queue_ctx = params->queue_ctx,
     };
 
+    pl_mutex_init_type(&vk->lock, PL_MUTEX_RECURSIVE);
     if (!vk->GetInstanceProcAddr)
         goto error;
 
     for (int i = 0; i < PL_ARRAY_SIZE(vk_inst_funs); i++)
         load_vk_fun(vk, &vk_inst_funs[i]);
-
-    if (!vk->GetPhysicalDeviceProperties2KHR) {
-        PL_FATAL(vk, "Provided VkInstance does not support "
-                 VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME
-                 ", cannot continue!");
-        goto error;
-    }
 
     VkPhysicalDeviceIDPropertiesKHR id_props = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES_KHR,
@@ -1485,15 +1575,16 @@ const struct pl_vulkan *pl_vulkan_import(struct pl_context *ctx,
         .pNext = &id_props,
     };
 
-    vk->GetPhysicalDeviceProperties2KHR(vk->physd, &prop);
-    vk->limits = prop.properties.limits;
+    pl_assert(vk->GetPhysicalDeviceProperties2);
+    vk->GetPhysicalDeviceProperties2(vk->physd, &prop);
+    vk->props = prop.properties;
 
     PL_INFO(vk, "Imported vulkan device properties:");
     PL_INFO(vk, "    Device Name: %s", prop.properties.deviceName);
-    PL_INFO(vk, "    Device ID: %x:%x", (unsigned) prop.properties.vendorID,
-            (unsigned) prop.properties.deviceID);
+    PL_INFO(vk, "    Device ID: %"PRIx32":%"PRIx32, prop.properties.vendorID,
+            prop.properties.deviceID);
     PL_INFO(vk, "    Device UUID: %s", PRINT_UUID(id_props.deviceUUID));
-    PL_INFO(vk, "    Driver version: %d", (int) prop.properties.driverVersion);
+    PL_INFO(vk, "    Driver version: %"PRIx32, prop.properties.driverVersion);
     PL_INFO(vk, "    API version: %d.%d.%d", PRINTF_VER(prop.properties.apiVersion));
 
     vk->api_ver = prop.properties.apiVersion;
@@ -1503,10 +1594,20 @@ const struct pl_vulkan *pl_vulkan_import(struct pl_context *ctx,
                 PRINTF_VER(params->max_api_version), PRINTF_VER(vk->api_ver));
     }
 
-    VkPhysicalDeviceFeatures2KHR *features;
-    features = vk_chain_memdup(vk->alloc, params->features);
-    if (features)
-        vk->features = *features;
+    if (vk->api_ver < PL_VK_MIN_VERSION) {
+        PL_FATAL(vk, "Device API version %d.%d.%d is lower than the minimum "
+                 "required version of %d.%d.%d, cannot proceed!",
+                 PRINTF_VER(vk->api_ver), PRINTF_VER(PL_VK_MIN_VERSION));
+        goto error;
+    }
+
+    vk->features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    vk_features_normalize(vk->alloc, params->features, 0, &vk->features);
+    if (!check_required_features(vk)) {
+        PL_FATAL(vk, "Imported Vulkan device was not created with all required "
+                 "features!");
+        goto error;
+    }
 
     // Load all mandatory device-level functions
     for (int i = 0; i < PL_ARRAY_SIZE(vk_dev_funs); i++)
@@ -1515,37 +1616,48 @@ const struct pl_vulkan *pl_vulkan_import(struct pl_context *ctx,
     // Load all of the optional functions from the extensions enabled
     for (int i = 0; i < PL_ARRAY_SIZE(vk_device_extensions); i++) {
         const struct vk_ext *ext = &vk_device_extensions[i];
+        uint32_t core_ver = vk_ext_promoted_ver(ext->name);
+        if (core_ver && vk->api_ver >= core_ver) {
+            for (const struct vk_fun *f = ext->funs; f && f->name; f++)
+                load_vk_fun(vk, f);
+            continue;
+        }
         for (int n = 0; n < params->num_extensions; n++) {
-            if (strcmp(ext->name, params->extensions[n]) == 0 ||
-                (ext->core_ver && ext->core_ver >= vk->api_ver))
-            {
-                // Extension is available, directly load it
-                for (const struct vk_fun *f = ext->funs; f->name; f++)
+            if (strcmp(ext->name, params->extensions[n]) == 0) {
+                for (const struct vk_fun *f = ext->funs; f && f->name; f++)
                     load_vk_fun(vk, f);
                 break;
             }
         }
     }
 
-    int qfnum = 0;
+    uint32_t qfnum = 0;
     vk->GetPhysicalDeviceQueueFamilyProperties(vk->physd, &qfnum, NULL);
     VkQueueFamilyProperties *qfs = pl_calloc_ptr(tmp, qfnum, qfs);
     vk->GetPhysicalDeviceQueueFamilyProperties(vk->physd, &qfnum, qfs);
+    if (!params->lock_queue)
+        init_queue_locks(vk, qfnum, qfs);
 
     // Create the command pools for each unique qf that exists
     struct {
         const struct pl_vulkan_queue *info;
         struct vk_cmdpool **pool;
+        VkQueueFlagBits flags; // *any* of these flags provide the cap
     } qinfos[] = {
         {
             .info = &params->queue_graphics,
             .pool = &vk->pool_graphics,
+            .flags = VK_QUEUE_GRAPHICS_BIT,
         }, {
             .info = &params->queue_compute,
             .pool = &vk->pool_compute,
+            .flags = VK_QUEUE_COMPUTE_BIT,
         }, {
             .info = &params->queue_transfer,
             .pool = &vk->pool_transfer,
+            .flags = VK_QUEUE_TRANSFER_BIT |
+                     VK_QUEUE_GRAPHICS_BIT |
+                     VK_QUEUE_COMPUTE_BIT,
         }
     };
 
@@ -1555,6 +1667,9 @@ const struct pl_vulkan *pl_vulkan_import(struct pl_context *ctx,
         if (!qinfos[i].info->count)
             continue;
 
+        // API sanity check
+        pl_assert(qfs[qf].queueFlags & qinfos[i].flags);
+
         // See if we already created a pool for this queue family
         for (int j = 0; j < i; j++) {
             if (qinfos[j].info->count && qinfos[j].info->index == qf) {
@@ -1563,78 +1678,34 @@ const struct pl_vulkan *pl_vulkan_import(struct pl_context *ctx,
             }
         }
 
-        struct VkDeviceQueueCreateInfo qinfo = {
-            .queueFamilyIndex = qf,
-            .queueCount = qinfos[i].info->count,
-        };
-
-        *pool = vk_cmdpool_create(vk, qinfo, qfs[qf]);
+        *pool = vk_cmdpool_create(vk, qf, qinfos[i].info->count, qfs[qf]);
         if (!*pool)
             goto error;
         PL_ARRAY_APPEND(vk->alloc, vk->pools, *pool);
 
+        // Pre-emptively set "lower priority" pools as well
+        for (int j = i+1; j < PL_ARRAY_SIZE(qinfos); j++) {
+            if (qfs[qf].queueFlags & qinfos[j].flags)
+                *qinfos[j].pool = *pool;
+        }
+
 next_qf: ;
     }
 
-    if (!vk->pool_compute && (vk->pool_graphics->props.queueFlags & VK_QUEUE_COMPUTE_BIT))
-        vk->pool_compute = vk->pool_graphics;
-
-    if (params->blacklist_caps & PL_GPU_CAP_COMPUTE)
-        vk->pool_compute = NULL;
-
-    pl_vk->gpu = pl_gpu_create_vk(vk);
-    if (!pl_vk->gpu)
+    if (!vk->pool_graphics) {
+        PL_ERR(vk, "No valid queues provided?");
         goto error;
-
-    // Blacklist / restrict features
-    if (params->blacklist_caps) {
-        pl_gpu_caps *caps = (pl_gpu_caps*) &pl_vk->gpu->caps;
-        *caps &= ~(params->blacklist_caps);
-        PL_INFO(vk, "Restricting capabilities 0x%x... new caps are 0x%x",
-                (unsigned int) params->blacklist_caps, (unsigned int) *caps);
     }
 
-    if (params->max_glsl_version) {
-        struct pl_glsl_desc *desc = (struct pl_glsl_desc *) &pl_vk->gpu->glsl;
-        desc->version = PL_MIN(desc->version, params->max_glsl_version);
-        PL_INFO(vk, "Restricting GLSL version to %d... new version is %d",
-                params->max_glsl_version, desc->version);
-    }
-
-    vk->disable_events = params->disable_events;
-
-    // Expose the resulting vulkan objects
-    pl_vk->instance = vk->inst;
-    pl_vk->phys_device = vk->physd;
-    pl_vk->device = vk->dev;
-    pl_vk->api_version = vk->api_ver;
-    pl_vk->extensions = vk->exts.elem;
-    pl_vk->num_extensions = vk->exts.num;
-    pl_vk->features = &vk->features;
-    pl_vk->num_queues = vk->pools.num;
-    pl_vk->queues = pl_calloc_ptr(pl_vk, vk->pools.num, pl_vk->queues);
-    struct pl_vulkan_queue *queues = (struct pl_vulkan_queue *) pl_vk->queues;
-
-    for (int i = 0; i < vk->pools.num; i++) {
-        queues[i] = (struct pl_vulkan_queue) {
-            .index = vk->pools.elem[i]->qf,
-            .count = vk->pools.elem[i]->num_queues,
-        };
-
-        if (vk->pools.elem[i] == vk->pool_graphics)
-            pl_vk->queue_graphics = queues[i];
-        if (vk->pools.elem[i] == vk->pool_compute && vk->pool_compute != vk->pool_graphics)
-            pl_vk->queue_compute = queues[i];
-        if (vk->pools.elem[i] == vk->pool_compute)
-            pl_vk->queue_compute = queues[i];
-    }
+    if (!finalize_context(pl_vk, params->max_glsl_version))
+        goto error;
 
     pl_free(tmp);
     return pl_vk;
 
 error:
     PL_FATAL(vk, "Failed importing vulkan device");
+    pl_vulkan_destroy((pl_vulkan *) &pl_vk);
     pl_free(tmp);
-    pl_vulkan_destroy((const struct pl_vulkan **) &pl_vk);
     return NULL;
 }

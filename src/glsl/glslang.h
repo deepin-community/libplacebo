@@ -20,11 +20,16 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
+typedef struct TLimits TLimits;
+typedef struct TBuiltInResource TBuiltInResource;
+#include <glslang/Include/ResourceLimits.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-int pl_glslang_version(void);
+#include "utils.h"
+
 bool pl_glslang_init(void);
 void pl_glslang_uninit(void);
 
@@ -38,16 +43,14 @@ struct pl_glslang_res {
     size_t size;
 };
 
-enum pl_glslang_stage {
-    PL_GLSLANG_VERTEX,
-    PL_GLSLANG_FRAGMENT,
-    PL_GLSLANG_COMPUTE,
-};
-
 // Compile GLSL into a SPIRV stream, if possible. The resulting
 // pl_glslang_res can simply be freed with pl_free() when done.
-struct pl_glslang_res *pl_glslang_compile(const char *glsl, uint32_t api_ver,
-                                          enum pl_glslang_stage stage);
+struct pl_glslang_res *pl_glslang_compile(const struct pl_glsl_version *glsl,
+                                          const struct pl_spirv_version *spirv_ver,
+                                          enum glsl_shader_stage stage,
+                                          const char *shader);
+
+extern const TBuiltInResource DefaultTBuiltInResource;
 
 #ifdef __cplusplus
 }

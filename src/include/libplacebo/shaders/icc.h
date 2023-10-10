@@ -18,100 +18,112 @@
 #ifndef LIBPLACEBO_SHADERS_ICC_H_
 #define LIBPLACEBO_SHADERS_ICC_H_
 
-// Functions for generating and applying ICC-derived 3DLUTs
+// Functions for generating and applying ICC-derived (3D)LUTs
 
 #include <libplacebo/colorspace.h>
 #include <libplacebo/shaders.h>
 
-// ICC profiles
+PL_API_BEGIN
 
 struct pl_icc_params {
-    // The rendering intent to use when computing the color transformation. A
+    // The rendering intent to use, for profiles with multiple intents. A
     // recommended value is PL_INTENT_RELATIVE_COLORIMETRIC for color-accurate
     // video reproduction, or PL_INTENT_PERCEPTUAL for profiles containing
-    // meaningful perceptual mapping tables.
+    // meaningful perceptual mapping tables for some more suitable color space
+    // like BT.709.
+    //
+    // If this is set to the special value PL_INTENT_AUTO, will use the
+    // preferred intent provided by the profile header.
     enum pl_rendering_intent intent;
 
     // The size of the 3DLUT to generate. If left as NULL, these individually
-    // default to 64, which is the recommended default for all three.
+    // default to values appropriate for the profile. (Based on internal
+    // precision heuristics)
     size_t size_r, size_g, size_b;
-};
 
-extern const struct pl_icc_params pl_icc_default_params;
+    // This field can be used to override the detected brightness level of the
+    // ICC profile. If you set this to the special value 0 (or a negative
+    // number), libplacebo will attempt reading the brightness value from the
+    // ICC profile's tagging (if available), falling back to PL_COLOR_SDR_WHITE
+    // if unavailable.
+    float max_luma;
 
-struct pl_icc_color_space {
-    // The nominal, closest approximation representation of the color profile,
-    // as permitted by `pl_color_space` enums. This will be used as a fallback
-    // in the event that an ICC profile is absent, or that parsing the ICC
-    // profile fails. This is also that will be returned for the corresponding
-    // field in `pl_icc_result` when the ICC profile is in use.
-    struct pl_color_space color;
+    // Force black point compensation. May help avoid crushed or raised black
+    // points on "improper" profiles containing e.g. colorimetric tables that
+    // do not round-trip. Should not be required on well-behaved profiles,
+    // or when using PL_INTENT_PERCEPTUAL, but YMMV.
+    bool force_bpc;
 
-    // The ICC profile itself. (Optional)
-    struct pl_icc_profile profile;
-};
-
-struct pl_icc_result {
-    // The source color space. This is the color space that the colors should
-    // actually be in at the point in time that they're ingested by the 3DLUT.
-    // This may differ from the `pl_color_space color` specified in the
-    // `pl_icc_color_space`. Users should make sure to apply
-    // `pl_shader_color_map` in order to get the colors into this format before
-    // applying `pl_icc_apply`.
+    // 3DLUT caching API. Providing these functions can help speed up ICC LUT
+    // generation by saving/loading profiles to/from disk. Both of these
+    // callbacks are optional.
+    void *cache_priv;
     //
-    // Note: `pl_shader_color_map` is a no-op when the source and destination
-    // color spaces are the same, so this can safely be used without disturbing
-    // the colors in the event that an ICC profile is actually in use.
-    struct pl_color_space src_color;
-
-    // The destination color space. This is the color space that the colors
-    // will (nominally) be in at the time they exit the 3DLUT.
-    struct pl_color_space dst_color;
+    // This is called to inform users of new cache entries. The user may store
+    // this cache to disk or some other internal caching mechanism.
+    void (*cache_save)(void *priv, uint64_t sig, const uint8_t *cache, size_t size);
+    //
+    // This is called to query for existing cache entries. The user should look
+    // up this cache entry and write its contents to `cache`, ensuring that no
+    // more than `size` bytes are written, and return `true` on success.
+    bool (*cache_load)(void *priv, uint64_t sig, uint8_t *cache, size_t size);
+    //
+    // Note: The `signature` of a cache entry is NOT equal to the `signature`
+    // of the underlying `pl_icc_object` - it is split up into separate entries
+    // for `pl_icc_decode` and `pl_icc_encode`, and also includes a hashed
+    // representation of the encoded parameters.
+    //
+    // Note: These callbacks will only be called from within `pl_icc_decode` /
+    // `pl_icc_encode`, so `cache_priv` should exceed this lifetime.
 };
 
-// Updates/generates a 3DLUT based on ICC profiles. Returns success. If true,
-// `out` will be updated to a struct describing the color space chosen for the
-// input and output of the 3DLUT. (See `pl_icc_color_space`) If `params` is
-// NULL, it defaults to &pl_icc_default_params.
-//
-// Note: This function must always be called before `pl_icc_apply`, on the
-// same `pl_shader` object, The only reason it's separate from `pl_icc_apply`
-// is to give users a chance to adapt the input colors to the color space
-// chosen by the ICC profile before applying it.
-bool pl_icc_update(struct pl_shader *sh,
-                   const struct pl_icc_color_space *src,
-                   const struct pl_icc_color_space *dst,
-                   struct pl_shader_obj **icc,
-                   struct pl_icc_result *out,
-                   const struct pl_icc_params *params);
+#define PL_ICC_DEFAULTS                         \
+    .intent = PL_INTENT_RELATIVE_COLORIMETRIC,  \
+    .max_luma = PL_COLOR_SDR_WHITE,
 
-// Actually applies a 3DLUT as generated by `pl_icc_update`. The reason this is
-// separated from `pl_icc_update` is so that the user has the chance to
-// correctly map the colors into the specified `src_color` space. This should
-// be called only on the `pl_shader_obj` previously updated by `pl_icc_update`,
-// and only when that function returned true.
-void pl_icc_apply(struct pl_shader *sh, struct pl_shader_obj **icc);
+#define pl_icc_params(...) (&(struct pl_icc_params) { PL_ICC_DEFAULTS __VA_ARGS__ })
+PL_API extern const struct pl_icc_params pl_icc_default_params;
 
-// Backwards compatibility aliases
-#define pl_3dlut_params pl_icc_params
-#define pl_3dlut_default_params pl_icc_default_params
-#define pl_3dlut_profile pl_icc_color_space
-#define pl_3dlut_result pl_icc_result
+// This object represents a "parsed" ICC profile.
+typedef const struct pl_icc_object_t {
+    // Provided params, with the `intent` and `size` fields set (as described)
+    struct pl_icc_params params;
 
-static PL_DEPRECATED inline bool pl_3dlut_update(struct pl_shader *sh,
-                                                 const struct pl_icc_color_space *src,
-                                                 const struct pl_icc_color_space *dst,
-                                                 struct pl_shader_obj **lut3d,
-                                                 struct pl_icc_result *out,
-                                                 const struct pl_icc_params *params)
-{
-    return pl_icc_update(sh, src, dst, lut3d, out, params);
-}
+    // Signature of the corresponding ICC profile.
+    uint64_t signature;
 
-static PL_DEPRECATED inline void pl_3dlut_apply(struct pl_shader *sh,
-                                                struct pl_shader_obj **lut3d)
-{
-    return pl_icc_apply(sh, lut3d);
-}
+    // Detected color space (or UNKNOWN for profiles which don't contain an
+    // exact match), with HDR metedata set to the detected gamut and
+    // white/black value ranges.
+    struct pl_color_space csp;
+
+    // Best estimate of profile gamma. This only serves as a rough guideline.
+    float gamma;
+
+    // Smallest containing primary set, always set.
+    enum pl_color_primaries containing_primaries;
+} *pl_icc_object;
+
+// Attempts opening/parsing the contents of an ICC profile. The resulting
+// object is memory managed and may outlive the original profile - access
+// to the underlying profile is no longer needed once this returns.
+PL_API pl_icc_object pl_icc_open(pl_log log, const struct pl_icc_profile *profile,
+                                 const struct pl_icc_params *params);
+PL_API void pl_icc_close(pl_icc_object *icc);
+
+// Decode the input from the colorspace determined by the attached ICC profile
+// to linear light RGB (in the profile's containing primary set). `lut` must be
+// set to a shader object that will store the GPU resources associated with the
+// generated LUT. The resulting color space will be written to `out_csp`.
+PL_API void pl_icc_decode(pl_shader sh, pl_icc_object profile, pl_shader_obj *lut,
+                          struct pl_color_space *out_csp);
+
+// Encode the input from linear light RGB (in the profile's containing primary
+// set) into the colorspace determined by the attached ICC profile. `lut` must
+// be set to a shader object that will store the GPU resources associated with
+// the generated LUT.
+PL_API void pl_icc_encode(pl_shader sh, pl_icc_object profile, pl_shader_obj *lut);
+
+PL_API_END
 
 #endif // LIBPLACEBO_SHADERS_ICC_H_

@@ -23,13 +23,9 @@
 // true, the generated shader will be uniquely namespaced `unique` and may be
 // freely merged with other shaders (`sh_subpass`). Otherwise, all shaders have
 // the same namespace and merging them is an error.
-struct pl_shader *pl_dispatch_begin_ex(struct pl_dispatch *dp, bool unique);
+pl_shader pl_dispatch_begin_ex(pl_dispatch dp, bool unique);
 
-// Reset/increments the internal counters of the pl_dispatch. This should be
-// called whenever the user is going to begin with a new frame, in order to
-// ensure that the "same" calls to pl_dispatch_begin_ex end up creating shaders
-// with the same identifier. Failing to follow this rule means shader caching,
-// as well as features such as temporal dithering, will not work correctly.
+// Set the `dynamic_constants` field for newly created `pl_shader` objects.
 //
-// This is a private API since it's only relevant if using `pl_dispatch_begin_ex`
-void pl_dispatch_reset_frame(struct pl_dispatch *dp);
+// This is a private API because it's sort of clunky/stateful.
+void pl_dispatch_mark_dynamic(pl_dispatch dp, bool dynamic);

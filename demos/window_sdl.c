@@ -4,17 +4,19 @@
 #error Specify exactly one of -DUSE_GL or -DUSE_VK when compiling!
 #endif
 
+#include <SDL.h>
+
 #include "common.h"
 #include "window.h"
 
-#include <SDL.h>
-
 #ifdef USE_VK
+#define VK_NO_PROTOTYPES
 #include <libplacebo/vulkan.h>
 #include <SDL_vulkan.h>
 #define WINFLAG_API SDL_WINDOW_VULKAN
 #define IMPL win_impl_sdl_vk
 #define IMPL_NAME "SDL2 (vulkan)"
+#define IMPL_TAG "sdl2-vk"
 #endif
 
 #ifdef USE_GL
@@ -22,6 +24,7 @@
 #define WINFLAG_API SDL_WINDOW_OPENGL
 #define IMPL win_impl_sdl_gl
 #define IMPL_NAME "SDL2 (opengl)"
+#define IMPL_TAG "sdl2-gl"
 #endif
 
 #ifdef NDEBUG
@@ -38,13 +41,13 @@ struct priv {
 
 #ifdef USE_VK
     VkSurfaceKHR surf;
-    const struct pl_vulkan *vk;
-    const struct pl_vk_inst *vk_inst;
+    pl_vulkan vk;
+    pl_vk_inst vk_inst;
 #endif
 
 #ifdef USE_GL
     SDL_GLContext gl_ctx;
-    const struct pl_opengl *gl;
+    pl_opengl gl;
 #endif
 
     int scroll_dx, scroll_dy;
@@ -54,8 +57,21 @@ struct priv {
     bool file_seen;
 };
 
-static struct window *sdl_create(struct pl_context *ctx, const char *title,
-                                 int width, int height, enum winflags flags)
+#ifdef USE_GL
+static bool make_current(void *priv)
+{
+    struct priv *p = priv;
+    return SDL_GL_MakeCurrent(p->win, p->gl_ctx) == 0;
+}
+
+static void release_current(void *priv)
+{
+    struct priv *p = priv;
+    SDL_GL_MakeCurrent(p->win, NULL);
+}
+#endif
+
+static struct window *sdl_create(pl_log log, const struct window_params *params)
 {
     struct priv *p = calloc(1, sizeof(struct priv));
     if (!p)
@@ -68,16 +84,16 @@ static struct window *sdl_create(struct pl_context *ctx, const char *title,
     }
 
     uint32_t sdl_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | WINFLAG_API;
-    p->win = SDL_CreateWindow(title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-                              width, height, sdl_flags);
+    p->win = SDL_CreateWindow(params->title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+                              params->width, params->height, sdl_flags);
     if (!p->win) {
         fprintf(stderr, "SDL2: Failed creating window: %s\n", SDL_GetError());
         goto error;
     }
 
+    int w, h;
+
 #ifdef USE_VK
-    struct pl_vk_inst_params iparams = pl_vk_inst_default_params;
-    iparams.debug = DEBUG;
 
     unsigned int num = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(p->win, &num, NULL)) {
@@ -87,10 +103,13 @@ static struct window *sdl_create(struct pl_context *ctx, const char *title,
 
     const char **exts = malloc(num * sizeof(const char *));
     SDL_Vulkan_GetInstanceExtensions(p->win, &num, exts);
-    iparams.extensions = exts;
-    iparams.num_extensions = num;
 
-    p->vk_inst = pl_vk_inst_create(ctx, &iparams);
+    p->vk_inst = pl_vk_inst_create(log, pl_vk_inst_params(
+        .get_proc_addr = SDL_Vulkan_GetVkGetInstanceProcAddr(),
+        .debug = DEBUG,
+        .extensions = exts,
+        .num_extensions = num,
+    ));
     free(exts);
     if (!p->vk_inst) {
         fprintf(stderr, "libplacebo: Failed creating vulkan instance!\n");
@@ -102,21 +121,21 @@ static struct window *sdl_create(struct pl_context *ctx, const char *title,
         goto error;
     }
 
-    struct pl_vulkan_params params = pl_vulkan_default_params;
-    params.instance = p->vk_inst->instance;
-    params.surface = p->surf;
-    params.allow_software = true;
-    p->vk = pl_vulkan_create(ctx, &params);
+    p->vk = pl_vulkan_create(log, pl_vulkan_params(
+        .instance = p->vk_inst->instance,
+        .get_proc_addr = p->vk_inst->get_proc_addr,
+        .surface = p->surf,
+        .allow_software = true,
+    ));
     if (!p->vk) {
         fprintf(stderr, "libplacebo: Failed creating vulkan device\n");
         goto error;
     }
 
-    p->w.swapchain = pl_vulkan_create_swapchain(p->vk, &(struct pl_vulkan_swapchain_params) {
+    p->w.swapchain = pl_vulkan_create_swapchain(p->vk, pl_vulkan_swapchain_params(
         .surface = p->surf,
         .present_mode = VK_PRESENT_MODE_FIFO_KHR,
-        .prefer_hdr = (flags & WIN_HDR),
-    });
+    ));
 
     if (!p->w.swapchain) {
         fprintf(stderr, "libplacebo: Failed creating vulkan swapchain\n");
@@ -124,6 +143,8 @@ static struct window *sdl_create(struct pl_context *ctx, const char *title,
     }
 
     p->w.gpu = p->vk->gpu;
+
+    SDL_Vulkan_GetDrawableSize(p->win, &w, &h);
 #endif // USE_VK
 
 #ifdef USE_GL
@@ -133,34 +154,39 @@ static struct window *sdl_create(struct pl_context *ctx, const char *title,
         goto error;
     }
 
-    SDL_GL_MakeCurrent(p->win, p->gl_ctx);
-
-    struct pl_opengl_params params = pl_opengl_default_params;
-    params.allow_software = true;
-    params.debug = DEBUG;
-    p->gl = pl_opengl_create(ctx, &params);
+    p->gl = pl_opengl_create(log, pl_opengl_params(
+        .allow_software = true,
+        .debug = DEBUG,
+        .make_current = make_current,
+        .release_current = release_current,
+        .get_proc_addr = (void *) SDL_GL_GetProcAddress,
+        .priv = p,
+    ));
     if (!p->gl) {
         fprintf(stderr, "libplacebo: Failed creating opengl device\n");
         goto error;
     }
 
-    p->w.swapchain = pl_opengl_create_swapchain(p->gl, &(struct pl_opengl_swapchain_params) {
+    p->w.swapchain = pl_opengl_create_swapchain(p->gl, pl_opengl_swapchain_params(
         .swap_buffers = (void (*)(void *)) SDL_GL_SwapWindow,
         .priv = p->win,
-    });
+    ));
 
     if (!p->w.swapchain) {
         fprintf(stderr, "libplacebo: Failed creating opengl swapchain\n");
         goto error;
     }
 
-    if (!pl_swapchain_resize(p->w.swapchain, &width, &height)) {
+    p->w.gpu = p->gl->gpu;
+
+    SDL_GL_GetDrawableSize(p->win, &w, &h);
+#endif // USE_GL
+
+    pl_swapchain_colorspace_hint(p->w.swapchain, &params->colors);
+    if (!pl_swapchain_resize(p->w.swapchain, &w, &h)) {
         fprintf(stderr, "libplacebo: Failed initializing swapchain\n");
         goto error;
     }
-
-    p->w.gpu = p->gl->gpu;
-#endif // USE_GL
 
     return &p->w;
 
@@ -179,8 +205,11 @@ static void sdl_destroy(struct window **window)
 
 #ifdef USE_VK
     pl_vulkan_destroy(&p->vk);
-    if (p->surf)
+    if (p->surf) {
+        PFN_vkDestroySurfaceKHR vkDestroySurfaceKHR = (PFN_vkDestroySurfaceKHR)
+            p->vk_inst->get_proc_addr(p->vk_inst->instance, "vkDestroySurfaceKHR");
         vkDestroySurfaceKHR(p->vk_inst->instance, p->surf, NULL);
+    }
     pl_vk_inst_destroy(&p->vk_inst);
 #endif
 
@@ -271,6 +300,15 @@ static bool sdl_get_button(const struct window *window, enum button btn)
     return SDL_GetMouseState(NULL, NULL) & button_mask[btn];
 }
 
+static bool sdl_get_key(const struct window *window, enum key key)
+{
+    static const size_t key_map[] = {
+        [KEY_ESC] = SDL_SCANCODE_ESCAPE,
+    };
+
+    return SDL_GetKeyboardState(NULL)[key_map[key]];
+}
+
 static void sdl_get_scroll(const struct window *window, float *dx, float *dy)
 {
     struct priv *p = (struct priv *) window;
@@ -296,13 +334,55 @@ static char *sdl_get_file(const struct window *window)
     return p->files[0];
 }
 
+static bool sdl_is_fullscreen(const struct window *window)
+{
+    const struct priv *p = (const struct priv *) window;
+    return SDL_GetWindowFlags(p->win) & SDL_WINDOW_FULLSCREEN;
+}
+
+static bool sdl_toggle_fullscreen(const struct window *window, bool fullscreen)
+{
+    struct priv *p = (struct priv *) window;
+    bool window_fullscreen = sdl_is_fullscreen(window);
+
+    if (window_fullscreen == fullscreen)
+        return true;
+
+    SDL_DisplayMode mode;
+    if (SDL_GetDesktopDisplayMode(0, &mode))
+    {
+        fprintf(stderr, "SDL2: Failed to get display mode: %s\n", SDL_GetError());
+        SDL_ClearError();
+        return false;
+    }
+
+    if (SDL_SetWindowDisplayMode(p->win, &mode))
+    {
+        fprintf(stderr, "SDL2: Failed to set window display mode: %s\n", SDL_GetError());
+        SDL_ClearError();
+        return false;
+    }
+
+    if (SDL_SetWindowFullscreen(p->win, fullscreen ? SDL_WINDOW_FULLSCREEN : 0)) {
+        fprintf(stderr, "SDL2: SetWindowFullscreen failed: %s\n", SDL_GetError());
+        SDL_ClearError();
+        return false;
+    }
+
+    return true;
+}
+
 const struct window_impl IMPL = {
     .name = IMPL_NAME,
+    .tag = IMPL_TAG,
     .create = sdl_create,
     .destroy = sdl_destroy,
     .poll = sdl_poll,
     .get_cursor = sdl_get_cursor,
     .get_button = sdl_get_button,
+    .get_key = sdl_get_key,
     .get_scroll = sdl_get_scroll,
     .get_file = sdl_get_file,
+    .toggle_fullscreen = sdl_toggle_fullscreen,
+    .is_fullscreen = sdl_is_fullscreen,
 };

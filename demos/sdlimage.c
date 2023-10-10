@@ -18,15 +18,15 @@ static const char *icc_profile = ""; // path to ICC profile
 static const char *lut_file = ""; // path to .cube lut
 
 // Program state
-static struct pl_context *ctx;
+static pl_log logger;
 static struct window *win;
 
 // For rendering
-static const struct pl_tex *img_tex;
-static const struct pl_tex *osd_tex;
+static pl_tex img_tex;
+static pl_tex osd_tex;
 static struct pl_plane img_plane;
 static struct pl_plane osd_plane;
-static struct pl_renderer *renderer;
+static pl_renderer renderer;
 static struct pl_custom_lut *lut;
 
 struct file
@@ -84,7 +84,7 @@ static void close_file(struct file *file)
     *file = (struct file) {0};
 }
 
-static void uninit(int ret)
+SDL_NORETURN static void uninit(int ret)
 {
     pl_renderer_destroy(&renderer);
     pl_tex_destroy(win->gpu, &img_tex);
@@ -93,11 +93,11 @@ static void uninit(int ret)
     pl_lut_free(&lut);
 
     window_destroy(&win);
-    pl_context_destroy(&ctx);
+    pl_log_destroy(&logger);
     exit(ret);
 }
 
-static bool upload_plane(const SDL_Surface *img, const struct pl_tex **tex,
+static bool upload_plane(const SDL_Surface *img, pl_tex *tex,
                          struct pl_plane *plane)
 {
     if (!img)
@@ -133,7 +133,7 @@ static bool upload_plane(const SDL_Surface *img, const struct pl_tex **tex,
 
 static bool render_frame(const struct pl_swapchain_frame *frame)
 {
-    const struct pl_tex *img = img_plane.texture;
+    pl_tex img = img_plane.texture;
     struct pl_frame image = {
         .num_planes = 1,
         .planes     = { img_plane },
@@ -152,24 +152,28 @@ static bool render_frame(const struct pl_swapchain_frame *frame)
         .len = icc_file.size,
     };
 
-    pl_rect2df_aspect_copy(&target.crop, &image.crop, 0.0);
+    image.rotation = PL_ROTATION_0; // for testing
+    pl_rect2df_aspect_copy_rot(&target.crop, &image.crop, 0.0, image.rotation);
 
-    const struct pl_tex *osd = osd_plane.texture;
-    struct pl_overlay target_ol;
-    if (osd) {
-        target_ol = (struct pl_overlay) {
-            .plane      = osd_plane,
-            .rect       = { 0, 0, osd->params.w, osd->params.h },
+    struct pl_overlay osd;
+    struct pl_overlay_part osd_part;
+    if (osd_tex) {
+        osd_part = (struct pl_overlay_part) {
+            .src = { 0, 0, osd_tex->params.w, osd_tex->params.h },
+            .dst = { 0, 0, osd_tex->params.w, osd_tex->params.h },
+        };
+        osd = (struct pl_overlay) {
+            .tex        = osd_tex,
             .mode       = PL_OVERLAY_NORMAL,
             .repr       = image.repr,
             .color      = image.color,
+            .coords     = PL_OVERLAY_COORDS_DST_FRAME,
+            .parts      = &osd_part,
+            .num_parts  = 1,
         };
-        target.overlays = &target_ol;
+        target.overlays = &osd;
         target.num_overlays = 1;
     }
-
-    if (pl_frame_is_cropped(&target))
-        pl_frame_clear(win->gpu, &target, (float[3]) {0} );
 
     // Use the heaviest preset purely for demonstration/testing purposes
     struct pl_render_params params = pl_render_high_quality_params;
@@ -187,10 +191,10 @@ int main(int argc, char **argv)
 
     const char *file = argv[1];
     const char *overlay = argc > 2 ? argv[2] : NULL;
-    ctx = pl_context_create(PL_API_VER, &(struct pl_context_params) {
+    logger = pl_log_create(PL_API_VER, pl_log_params(
         .log_cb = pl_log_color,
         .log_level = PL_LOG_INFO,
-    });
+    ));
 
 
     // Load image, do this first so we can use it for the window size
@@ -202,7 +206,11 @@ int main(int argc, char **argv)
 
     // Create window
     unsigned int start = SDL_GetTicks();
-    win = window_create(ctx, "SDL2_image demo", img->w, img->h, 0);
+    win = window_create(logger, &(struct window_params) {
+        .title = "SDL2_image demo",
+        .width = img->w,
+        .height = img->h,
+    });
     if (!win)
         uninit(1);
 
@@ -225,12 +233,12 @@ int main(int argc, char **argv)
 
     struct file lutf;
     if (open_file(lut_file, &lutf) && lutf.size) {
-        if (!(lut = pl_lut_parse_cube(ctx, lutf.data, lutf.size)))
+        if (!(lut = pl_lut_parse_cube(logger, lutf.data, lutf.size)))
             fprintf(stderr, "Failed parsing LUT.. continuing anyway\n");
         close_file(&lutf);
     }
 
-    renderer = pl_renderer_create(ctx, win->gpu);
+    renderer = pl_renderer_create(logger, win->gpu);
 
     unsigned int last = SDL_GetTicks(), frames = 0;
     printf("Took %u ms for initialization\n", last - start);

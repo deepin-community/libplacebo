@@ -8,6 +8,7 @@
 #define NK_INCLUDE_FONT_BAKING
 #define NK_INCLUDE_DEFAULT_FONT
 #define NK_BUTTON_TRIGGER_ON_RELEASE
+#define NK_UINT_DRAW_INDEX
 #include <nuklear.h>
 
 #include "common.h"
@@ -15,7 +16,7 @@
 
 struct ui;
 
-struct ui *ui_create(const struct pl_gpu *gpu);
+struct ui *ui_create(pl_gpu gpu);
 void ui_destroy(struct ui **ui);
 
 // Update/Logic/Draw cycle

@@ -20,34 +20,9 @@
 
 #include "gpu.h"
 
-const struct pl_gpu_dummy_params pl_gpu_dummy_default_params = {
-    .caps = PL_GPU_CAP_COMPUTE | PL_GPU_CAP_INPUT_VARIABLES | PL_GPU_CAP_MAPPED_BUFFERS,
-    .glsl = {
-        .version    = 450,
-        .gles       = false,
-        .vulkan     = false,
-    },
+#include <libplacebo/dummy.h>
 
-    .limits = {
-        .max_tex_1d_dim     = UINT32_MAX,
-        .max_tex_2d_dim     = UINT32_MAX,
-        .max_tex_3d_dim     = UINT32_MAX,
-        .max_pushc_size     = SIZE_MAX,
-        .max_buf_size       = SIZE_MAX,
-        .max_ubo_size       = SIZE_MAX,
-        .max_ssbo_size      = SIZE_MAX,
-        .max_buffer_texels  = UINT64_MAX,
-        .min_gather_offset  = INT16_MIN,
-        .max_gather_offset  = INT16_MAX,
-        .max_shmem_size     = SIZE_MAX,
-        .max_group_threads  = 1024,
-        .max_group_size     = { 1024, 1024, 1024 },
-        .max_dispatch       = { UINT32_MAX, UINT32_MAX, UINT32_MAX },
-        .align_tex_xfer_stride = 1,
-        .align_tex_xfer_offset = 1,
-    },
-};
-
+const struct pl_gpu_dummy_params pl_gpu_dummy_default_params = { PL_GPU_DUMMY_DEFAULTS };
 static const struct pl_gpu_fns pl_fns_dummy;
 
 struct priv {
@@ -55,14 +30,12 @@ struct priv {
     struct pl_gpu_dummy_params params;
 };
 
-const struct pl_gpu *pl_gpu_dummy_create(struct pl_context *ctx,
-                                         const struct pl_gpu_dummy_params *params)
+pl_gpu pl_gpu_dummy_create(pl_log log, const struct pl_gpu_dummy_params *params)
 {
     params = PL_DEF(params, &pl_gpu_dummy_default_params);
 
-    struct pl_gpu *gpu = pl_zalloc_priv(NULL, struct pl_gpu, struct priv);
-    gpu->ctx = ctx;
-    gpu->caps = params->caps;
+    struct pl_gpu_t *gpu = pl_zalloc_obj(NULL, gpu, struct priv);
+    gpu->log = log;
     gpu->glsl = params->glsl;
     gpu->limits = params->limits;
 
@@ -71,12 +44,13 @@ const struct pl_gpu *pl_gpu_dummy_create(struct pl_context *ctx,
     p->params = *params;
 
     // Forcibly override these, because we know for sure what the values are
-    gpu->limits.align_tex_xfer_stride = 1;
+    gpu->limits.align_tex_xfer_pitch = 1;
     gpu->limits.align_tex_xfer_offset = 1;
+    gpu->limits.align_vertex_stride = 1;
 
     // Set up the dummy formats, add one for each possible format type that we
     // can represent on the host
-    PL_ARRAY(const struct pl_fmt *) formats = {0};
+    PL_ARRAY(pl_fmt) formats = {0};
     for (enum pl_fmt_type type = 1; type < PL_FMT_TYPE_COUNT; type++) {
         for (int comps = 1; comps <= 4; comps++) {
             for (int depth = 8; depth < 128; depth *= 2) {
@@ -102,14 +76,16 @@ const struct pl_gpu *pl_gpu_dummy_create(struct pl_context *ctx,
                 if (type == PL_FMT_FLOAT && depth == 16)
                     tname = "hf";
 
-                struct pl_fmt *fmt = pl_alloc_ptr(gpu, fmt);
-                *fmt = (struct pl_fmt) {
+                struct pl_fmt_t *fmt = pl_alloc_ptr(gpu, fmt);
+                *fmt = (struct pl_fmt_t) {
                     .name = pl_asprintf(fmt, "%s%d%s", cnames[comps], depth, tname),
                     .type = type,
                     .num_components = comps,
                     .opaque = false,
+                    .gatherable = true,
                     .internal_size = comps * depth / 8,
                     .texel_size = comps * depth / 8,
+                    .texel_align = 1,
                     .caps = PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR |
                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_BLENDABLE |
                             PL_FMT_CAP_VERTEX | PL_FMT_CAP_HOST_READABLE,
@@ -121,7 +97,7 @@ const struct pl_gpu *pl_gpu_dummy_create(struct pl_context *ctx,
                     fmt->sample_order[i] = i;
                 }
 
-                if (gpu->caps & PL_GPU_CAP_COMPUTE)
+                if (gpu->glsl.compute)
                     fmt->caps |= PL_FMT_CAP_STORABLE;
                 if (gpu->limits.max_buffer_texels && gpu->limits.max_ubo_size)
                     fmt->caps |= PL_FMT_CAP_TEXEL_UNIFORM;
@@ -140,17 +116,15 @@ const struct pl_gpu *pl_gpu_dummy_create(struct pl_context *ctx,
 
     gpu->formats = formats.elem;
     gpu->num_formats = formats.num;
-    pl_gpu_sort_formats(gpu);
-    pl_gpu_print_info(gpu);
-    return gpu;
+    return pl_gpu_finalize(gpu);
 }
 
-static void dumb_destroy(const struct pl_gpu *gpu)
+static void dumb_destroy(pl_gpu gpu)
 {
     pl_free((void *) gpu);
 }
 
-void pl_gpu_dummy_destroy(const struct pl_gpu **gpu)
+void pl_gpu_dummy_destroy(pl_gpu *gpu)
 {
     pl_gpu_destroy(*gpu);
     *gpu = NULL;
@@ -160,10 +134,9 @@ struct buf_priv {
     uint8_t *data;
 };
 
-static const struct pl_buf *dumb_buf_create(const struct pl_gpu *gpu,
-                                            const struct pl_buf_params *params)
+static pl_buf dumb_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
 {
-    struct pl_buf *buf = pl_zalloc_priv(NULL, struct pl_buf, struct buf_priv);
+    struct pl_buf_t *buf = pl_zalloc_obj(NULL, buf, struct buf_priv);
     buf->params = *params;
     buf->params.initial_data = NULL;
 
@@ -183,38 +156,36 @@ static const struct pl_buf *dumb_buf_create(const struct pl_gpu *gpu,
     return buf;
 }
 
-static void dumb_buf_destroy(const struct pl_gpu *gpu, const struct pl_buf *buf)
+static void dumb_buf_destroy(pl_gpu gpu, pl_buf buf)
 {
     struct buf_priv *p = PL_PRIV(buf);
     free(p->data);
     pl_free((void *) buf);
 }
 
-uint8_t *pl_buf_dummy_data(const struct pl_buf *buf)
+uint8_t *pl_buf_dummy_data(pl_buf buf)
 {
     struct buf_priv *p = PL_PRIV(buf);
     return p->data;
 }
 
-static void dumb_buf_write(const struct pl_gpu *gpu, const struct pl_buf *buf,
-                           size_t buf_offset, const void *data, size_t size)
+static void dumb_buf_write(pl_gpu gpu, pl_buf buf, size_t buf_offset,
+                           const void *data, size_t size)
 {
     struct buf_priv *p = PL_PRIV(buf);
     memcpy(p->data + buf_offset, data, size);
 }
 
-static bool dumb_buf_read(const struct pl_gpu *gpu, const struct pl_buf *buf,
-                          size_t buf_offset, void *dest, size_t size)
+static bool dumb_buf_read(pl_gpu gpu, pl_buf buf, size_t buf_offset,
+                          void *dest, size_t size)
 {
     struct buf_priv *p = PL_PRIV(buf);
     memcpy(dest, p->data + buf_offset, size);
     return true;
 }
 
-static void dumb_buf_copy(const struct pl_gpu *gpu,
-                          const struct pl_buf *dst, size_t dst_offset,
-                          const struct pl_buf *src, size_t src_offset,
-                          size_t size)
+static void dumb_buf_copy(pl_gpu gpu, pl_buf dst, size_t dst_offset,
+                          pl_buf src, size_t src_offset, size_t size)
 {
     struct buf_priv *dstp = PL_PRIV(dst);
     struct buf_priv *srcp = PL_PRIV(src);
@@ -225,7 +196,7 @@ struct tex_priv {
     void *data;
 };
 
-static size_t tex_size(const struct pl_gpu *gpu, const struct pl_tex *tex)
+static size_t tex_size(pl_gpu gpu, pl_tex tex)
 {
     size_t size = tex->params.format->texel_size * tex->params.w;
     size *= PL_DEF(tex->params.h, 1);
@@ -233,10 +204,9 @@ static size_t tex_size(const struct pl_gpu *gpu, const struct pl_tex *tex)
     return size;
 }
 
-static const struct pl_tex *dumb_tex_create(const struct pl_gpu *gpu,
-                                            const struct pl_tex_params *params)
+static pl_tex dumb_tex_create(pl_gpu gpu, const struct pl_tex_params *params)
 {
-    struct pl_tex *tex = pl_zalloc_priv(NULL, struct pl_tex, void *);
+    struct pl_tex_t *tex = pl_zalloc_obj(NULL, tex, void *);
     tex->params = *params;
     tex->params.initial_data = NULL;
 
@@ -254,13 +224,12 @@ static const struct pl_tex *dumb_tex_create(const struct pl_gpu *gpu,
     return tex;
 }
 
-const struct pl_tex *pl_tex_dummy_create(const struct pl_gpu *gpu,
-                                         const struct pl_tex_dummy_params *params)
+pl_tex pl_tex_dummy_create(pl_gpu gpu, const struct pl_tex_dummy_params *params)
 {
     // Only do minimal sanity checking, since this is just a dummy texture
     pl_assert(params->format && params->w >= 0 && params->h >= 0 && params->d >= 0);
 
-    struct pl_tex *tex = pl_zalloc_priv(NULL, struct pl_tex, struct tex_priv);
+    struct pl_tex_t *tex = pl_zalloc_obj(NULL, tex, struct tex_priv);
     tex->sampler_type = params->sampler_type;
     tex->params = (struct pl_tex_params) {
         .w = params->w,
@@ -274,7 +243,7 @@ const struct pl_tex *pl_tex_dummy_create(const struct pl_gpu *gpu,
     return tex;
 }
 
-static void dumb_tex_destroy(const struct pl_gpu *gpu, const struct pl_tex *tex)
+static void dumb_tex_destroy(pl_gpu gpu, pl_tex tex)
 {
     struct tex_priv *p = PL_PRIV(tex);
     if (p->data)
@@ -282,16 +251,15 @@ static void dumb_tex_destroy(const struct pl_gpu *gpu, const struct pl_tex *tex)
     pl_free((void *) tex);
 }
 
-uint8_t *pl_tex_dummy_data(const struct pl_tex *tex)
+uint8_t *pl_tex_dummy_data(pl_tex tex)
 {
     struct tex_priv *p = PL_PRIV(tex);
     return p->data;
 }
 
-static bool dumb_tex_upload(const struct pl_gpu *gpu,
-                            const struct pl_tex_transfer_params *params)
+static bool dumb_tex_upload(pl_gpu gpu, const struct pl_tex_transfer_params *params)
 {
-    const struct pl_tex *tex = params->tex;
+    pl_tex tex = params->tex;
     struct tex_priv *p = PL_PRIV(tex);
     pl_assert(p->data);
 
@@ -305,10 +273,10 @@ static bool dumb_tex_upload(const struct pl_gpu *gpu,
     size_t texel_size = tex->params.format->texel_size;
     size_t row_size = pl_rect_w(params->rc) * texel_size;
     for (int z = params->rc.z0; z < params->rc.z1; z++) {
-        size_t src_plane = z * params->stride_h * params->stride_w * texel_size;
+        size_t src_plane = z * params->depth_pitch;
         size_t dst_plane = z * tex->params.h * tex->params.w * texel_size;
         for (int y = params->rc.y0; y < params->rc.y1; y++) {
-            size_t src_row = src_plane + y * params->stride_w * texel_size;
+            size_t src_row = src_plane + y * params->row_pitch;
             size_t dst_row = dst_plane + y * tex->params.w * texel_size;
             size_t pos = params->rc.x0 * texel_size;
             memcpy(&dst[dst_row + pos], &src[src_row + pos], row_size);
@@ -318,10 +286,9 @@ static bool dumb_tex_upload(const struct pl_gpu *gpu,
     return true;
 }
 
-static bool dumb_tex_download(const struct pl_gpu *gpu,
-                              const struct pl_tex_transfer_params *params)
+static bool dumb_tex_download(pl_gpu gpu, const struct pl_tex_transfer_params *params)
 {
-    const struct pl_tex *tex = params->tex;
+    pl_tex tex = params->tex;
     struct tex_priv *p = PL_PRIV(tex);
     pl_assert(p->data);
 
@@ -336,10 +303,10 @@ static bool dumb_tex_download(const struct pl_gpu *gpu,
     size_t row_size = pl_rect_w(params->rc) * texel_size;
     for (int z = params->rc.z0; z < params->rc.z1; z++) {
         size_t src_plane = z * tex->params.h * tex->params.w * texel_size;
-        size_t dst_plane = z * params->stride_h * params->stride_w * texel_size;
+        size_t dst_plane = z * params->depth_pitch;
         for (int y = params->rc.y0; y < params->rc.y1; y++) {
             size_t src_row = src_plane + y * tex->params.w * texel_size;
-            size_t dst_row = dst_plane + y * params->stride_w * texel_size;
+            size_t dst_row = dst_plane + y * params->row_pitch;
             size_t pos = params->rc.x0 * texel_size;
             memcpy(&dst[dst_row + pos], &src[src_row + pos], row_size);
         }
@@ -348,19 +315,18 @@ static bool dumb_tex_download(const struct pl_gpu *gpu,
     return true;
 }
 
-static int dumb_desc_namespace(const struct pl_gpu *gpu, enum pl_desc_type type)
+static int dumb_desc_namespace(pl_gpu gpu, enum pl_desc_type type)
 {
     return 0; // safest behavior: never alias bindings
 }
 
-static const struct pl_pass *dumb_pass_create(const struct pl_gpu *gpu,
-                                              const struct pl_pass_params *params)
+static pl_pass dumb_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
 {
     PL_ERR(gpu, "Creating render passes is not supported for dummy GPUs");
     return NULL;
 }
 
-static void dumb_gpu_finish(const struct pl_gpu *gpu)
+static void dumb_gpu_finish(pl_gpu gpu)
 {
     // no-op
 }

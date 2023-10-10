@@ -4,52 +4,50 @@
  * License: CC0 / Public Domain
  */
 
-#include <time.h>
+#include <assert.h>
+#include <errno.h>
 #include <math.h>
+#include <string.h>
 
 #include "common.h"
+#include "pl_clock.h"
 #include "window.h"
 
-static struct pl_context *ctx;
+static pl_log logger;
 static struct window *win;
 
 static void uninit(int ret)
 {
     window_destroy(&win);
-    pl_context_destroy(&ctx);
+    pl_log_destroy(&logger);
     exit(ret);
-}
-
-static void evolve_rgba(float rgba[4], int *pos)
-{
-    const int scale = 512;
-    const float circle = 2.0 * M_PI;
-    const float piece  = (float)(*pos % scale) / (scale - 1);
-
-    float alpha = (cosf(circle * (*pos) / scale * 0.5) + 1.0) / 2.0;
-    rgba[0] = alpha * (sinf(circle * piece + 0.0) + 1.0) / 2.0;
-    rgba[1] = alpha * (sinf(circle * piece + 2.0) + 1.0) / 2.0;
-    rgba[2] = alpha * (sinf(circle * piece + 4.0) + 1.0) / 2.0;
-    rgba[3] = alpha;
-
-    *pos += 1;
 }
 
 int main(int argc, char **argv)
 {
-    ctx = pl_context_create(PL_API_VER, &(struct pl_context_params) {
+    logger = pl_log_create(PL_API_VER, pl_log_params(
         .log_cb = pl_log_color,
         .log_level = PL_LOG_DEBUG,
-    });
+    ));
 
-    win = window_create(ctx, "colors demo", 640, 480, WIN_ALPHA);
+    win = window_create(logger, &(struct window_params) {
+        .title = "colors demo",
+        .width = 640,
+        .height = 480,
+        .alpha = true,
+    });
     if (!win)
         uninit(1);
 
-    float rgba[4] = {0.0, 0.0, 0.0, 1.0};
-    int rainbow_pos = 0;
+    pl_clock_t ts_start, ts;
+    if ((ts_start = pl_clock_now()) == 0) {
+        uninit(1);
+    }
 
     while (!win->window_lost) {
+        if (window_get_key(win, KEY_ESC))
+            break;
+
         struct pl_swapchain_frame frame;
         bool ok = pl_swapchain_start_frame(win->swapchain, &frame);
         if (!ok) {
@@ -59,9 +57,22 @@ int main(int argc, char **argv)
             continue;
         }
 
+        if ((ts = pl_clock_now()) == 0)
+            uninit(1);
+
+        const double period = 10.; // in seconds
+        double secs = fmod(pl_clock_diff(ts, ts_start), period);
+
+        double pos = 2 * M_PI * secs / period;
+        float alpha = (cos(pos) + 1.0) / 2.0;
+
         assert(frame.fbo->params.blit_dst);
-        evolve_rgba(rgba, &rainbow_pos);
-        pl_tex_clear(win->gpu, frame.fbo, rgba);
+        pl_tex_clear(win->gpu, frame.fbo, (float[4]) {
+            alpha * (sinf(2 * pos + 0.0) + 1.0) / 2.0,
+            alpha * (sinf(2 * pos + 2.0) + 1.0) / 2.0,
+            alpha * (sinf(2 * pos + 4.0) + 1.0) / 2.0,
+            alpha,
+        });
 
         ok = pl_swapchain_submit_frame(win->swapchain);
         if (!ok) {

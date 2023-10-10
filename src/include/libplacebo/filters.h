@@ -19,7 +19,9 @@
 #define LIBPLACEBO_FILTER_KERNELS_H_
 
 #include <stdbool.h>
-#include <libplacebo/context.h>
+#include <libplacebo/log.h>
+
+PL_API_BEGIN
 
 #define PL_FILTER_MAX_PARAMS 2
 
@@ -49,58 +51,71 @@ struct pl_filter_function {
     // function's preferred defaults. if the relevant setting is not tunable,
     // they are ignored entirely.
     float params[PL_FILTER_MAX_PARAMS];
+
+    // The cosmetic name associated with this filter function. Optional.
+    const char *name;
 };
 
-bool pl_filter_function_eq(const struct pl_filter_function *a,
-                           const struct pl_filter_function *b);
+PL_API bool pl_filter_function_eq(const struct pl_filter_function *a,
+                                  const struct pl_filter_function *b);
 
 // Box filter: Entirely 1.0 within the radius, entirely 0.0 outside of it.
 // This is also sometimes called a Dirichlet window
-extern const struct pl_filter_function pl_filter_function_box;
+PL_API extern const struct pl_filter_function pl_filter_function_box;
 
 // Triangle filter: Linear transitions from 1.0 at x=0 to 0.0 at x=radius.
 // This is also sometimes called a Bartlett window.
-extern const struct pl_filter_function pl_filter_function_triangle;
+PL_API extern const struct pl_filter_function pl_filter_function_triangle;
+
+// Cosine filter: Ordinary cosine function, single lobe.
+PL_API extern const struct pl_filter_function pl_filter_function_cosine;
 
 // Hann function: Cosine filter named after Julius von Hann. Also commonly
-// mislabeled as a "Hanning" function, due to its similary to the Hamming
+// mislabeled as a "Hanning" function, due to its similarly to the Hamming
 // function.
-extern const struct pl_filter_function pl_filter_function_hann;
+PL_API extern const struct pl_filter_function pl_filter_function_hann;
 
 // Hamming function: Cosine filter named after Richard Hamming.
-extern const struct pl_filter_function pl_filter_function_hamming;
+PL_API extern const struct pl_filter_function pl_filter_function_hamming;
 
 // Welch filter: Polynomial function consisting of a single parabolic section.
-extern const struct pl_filter_function pl_filter_function_welch;
+PL_API extern const struct pl_filter_function pl_filter_function_welch;
 
 // Kaiser filter: Approximation of the DPSS window using Bessel functions.
 // Also sometimes called a Kaiser-Bessel window.
 // Parameter [0]: Shape (alpha). Determines the trade-off between the main lobe
 //                and the side lobes.
-extern const struct pl_filter_function pl_filter_function_kaiser;
+PL_API extern const struct pl_filter_function pl_filter_function_kaiser;
 
 // Blackman filter: Cosine filter named after Ralph Beebe Blackman.
 // Parameter [0]: Scale (alpha). Influences the shape. The defaults result in
 //                zeros at the third and fourth sidelobes.
-extern const struct pl_filter_function pl_filter_function_blackman;
+PL_API extern const struct pl_filter_function pl_filter_function_blackman;
+
+// Bohman filter: 2nd order Cosine filter.
+PL_API extern const struct pl_filter_function pl_filter_function_bohman;
 
 // Gaussian function: Similar to the Gaussian distribution, this defines a
 // bell curve function.
 // Parameter [0]: Scale (t), increasing makes the result blurrier.
-extern const struct pl_filter_function pl_filter_function_gaussian;
+PL_API extern const struct pl_filter_function pl_filter_function_gaussian;
+
+// Quadratic function: 2nd order approximation of the gaussian function. Also
+// sometimes called a "quadric" window.
+PL_API extern const struct pl_filter_function pl_filter_function_quadratic;
 
 // Sinc function: Widely used for both kernels and windows, sinc(x) = sin(x)/x.
-extern const struct pl_filter_function pl_filter_function_sinc;
+PL_API extern const struct pl_filter_function pl_filter_function_sinc;
 
 // Jinc function: Similar to sinc, but extended to the 2D domain. Widely
 // used as the kernel of polar (EWA) filters. Also sometimes called a Sombrero
 // function.
-extern const struct pl_filter_function pl_filter_function_jinc;
+PL_API extern const struct pl_filter_function pl_filter_function_jinc;
 
 // Sphinx function: Similar to sinc and jinx, but extended to the 3D domain.
 // The name is derived from "spherical" sinc. Can be used to filter 3D signals
 // in theory.
-extern const struct pl_filter_function pl_filter_function_sphinx;
+PL_API extern const struct pl_filter_function pl_filter_function_sphinx;
 
 // B/C-tunable Spline function: This is a family of commonly used spline
 // functions with two tunable parameters. Does not need to be windowed.
@@ -112,23 +127,23 @@ extern const struct pl_filter_function pl_filter_function_sphinx;
 // B = 1/3,  C = 1/3:  Mitchell-Netravali filter (soft, doesn't ring)
 // B ≈ 0.37, C ≈ 0.31: Robidoux filter (used by ImageMagick)
 // B ≈ 0.26, C ≈ 0.37: RobidouxSharp filter. (sharper variant of Robidoux)
-extern const struct pl_filter_function pl_filter_function_bcspline;
-extern const struct pl_filter_function pl_filter_function_catmull_rom;
-extern const struct pl_filter_function pl_filter_function_mitchell;
-extern const struct pl_filter_function pl_filter_function_robidoux;
-extern const struct pl_filter_function pl_filter_function_robidouxsharp;
+PL_API extern const struct pl_filter_function pl_filter_function_bcspline;
+PL_API extern const struct pl_filter_function pl_filter_function_catmull_rom;
+PL_API extern const struct pl_filter_function pl_filter_function_mitchell;
+PL_API extern const struct pl_filter_function pl_filter_function_robidoux;
+PL_API extern const struct pl_filter_function pl_filter_function_robidouxsharp;
 
 // Bicubic function: Very smooth and free of ringing, but very blurry. Does not
 // need to be windowed.
-extern const struct pl_filter_function pl_filter_function_bicubic;
+PL_API extern const struct pl_filter_function pl_filter_function_bicubic;
 
 // Piecewise approximations of the Lanczos filter function (sinc-windowed
 // sinc). Referred to as "spline16", "spline36" and "spline64" mainly for
 // historical reasons, based on their fixed radii of 2, 3 and 4 (respectively).
 // These do not need to be windowed.
-extern const struct pl_filter_function pl_filter_function_spline16;
-extern const struct pl_filter_function pl_filter_function_spline36;
-extern const struct pl_filter_function pl_filter_function_spline64;
+PL_API extern const struct pl_filter_function pl_filter_function_spline16;
+PL_API extern const struct pl_filter_function pl_filter_function_spline36;
+PL_API extern const struct pl_filter_function pl_filter_function_spline64;
 
 struct pl_filter_function_preset {
     const char *name;
@@ -136,11 +151,11 @@ struct pl_filter_function_preset {
 };
 
 // A list of built-in filter function presets, terminated by {0}
-extern const struct pl_filter_function_preset pl_filter_function_presets[];
-extern const int pl_num_filter_function_presets; // excluding trailing {0}
+PL_API extern const struct pl_filter_function_preset pl_filter_function_presets[];
+PL_API extern const int pl_num_filter_function_presets; // excluding trailing {0}
 
 // Find the filter function preset with the given name, or NULL on failure.
-const struct pl_filter_function_preset *pl_find_filter_function_preset(const char *name);
+PL_API const struct pl_filter_function_preset *pl_find_filter_function_preset(const char *name);
 
 // Backwards compatibility
 #define pl_named_filter_function        pl_filter_function_preset
@@ -176,41 +191,44 @@ struct pl_filter_config {
     // instead of a separable/1D filter. Does not affect the actual sampling,
     // but provides information about how the results are to be interpreted.
     bool polar;
+
+    // The cosmetic name associated with this filter config. Optional.
+    const char *name;
 };
 
-bool pl_filter_config_eq(const struct pl_filter_config *a,
-                         const struct pl_filter_config *b);
+PL_API bool pl_filter_config_eq(const struct pl_filter_config *a,
+                                const struct pl_filter_config *b);
 
 // Samples a given filter configuration at a given x coordinate, while
 // respecting all parameters of the configuration.
-double pl_filter_sample(const struct pl_filter_config *c, double x);
+PL_API double pl_filter_sample(const struct pl_filter_config *c, double x);
 
 // A list of built-in filter configurations. Since they are just combinations
 // of the above filter functions, they are not described in much further
 // detail.
-extern const struct pl_filter_config pl_filter_spline16;    // 2 taps
-extern const struct pl_filter_config pl_filter_spline36;    // 3 taps
-extern const struct pl_filter_config pl_filter_spline64;    // 4 taps
-extern const struct pl_filter_config pl_filter_nearest;     // AKA box
-extern const struct pl_filter_config pl_filter_bilinear;    // AKA triangle
-extern const struct pl_filter_config pl_filter_gaussian;
+PL_API extern const struct pl_filter_config pl_filter_spline16;    // 2 taps
+PL_API extern const struct pl_filter_config pl_filter_spline36;    // 3 taps
+PL_API extern const struct pl_filter_config pl_filter_spline64;    // 4 taps
+PL_API extern const struct pl_filter_config pl_filter_nearest;     // AKA box
+PL_API extern const struct pl_filter_config pl_filter_bilinear;    // AKA triangle
+PL_API extern const struct pl_filter_config pl_filter_gaussian;
 // Sinc family (all configured to 3 taps):
-extern const struct pl_filter_config pl_filter_sinc;        // unwindowed,
-extern const struct pl_filter_config pl_filter_lanczos;     // sinc-sinc
-extern const struct pl_filter_config pl_filter_ginseng;     // sinc-jinc
-extern const struct pl_filter_config pl_filter_ewa_jinc;    // unwindowed
-extern const struct pl_filter_config pl_filter_ewa_lanczos; // jinc-jinc
-extern const struct pl_filter_config pl_filter_ewa_ginseng; // jinc-sinc
-extern const struct pl_filter_config pl_filter_ewa_hann;    // jinc-hann
+PL_API extern const struct pl_filter_config pl_filter_sinc;        // unwindowed,
+PL_API extern const struct pl_filter_config pl_filter_lanczos;     // sinc-sinc
+PL_API extern const struct pl_filter_config pl_filter_ginseng;     // sinc-jinc
+PL_API extern const struct pl_filter_config pl_filter_ewa_jinc;    // unwindowed
+PL_API extern const struct pl_filter_config pl_filter_ewa_lanczos; // jinc-jinc
+PL_API extern const struct pl_filter_config pl_filter_ewa_ginseng; // jinc-sinc
+PL_API extern const struct pl_filter_config pl_filter_ewa_hann;    // jinc-hann
 // Spline family
-extern const struct pl_filter_config pl_filter_bicubic;
-extern const struct pl_filter_config pl_filter_catmull_rom;
-extern const struct pl_filter_config pl_filter_mitchell;
-extern const struct pl_filter_config pl_filter_mitchell_clamp; // clamp = 1.0
-extern const struct pl_filter_config pl_filter_robidoux;
-extern const struct pl_filter_config pl_filter_robidouxsharp;
-extern const struct pl_filter_config pl_filter_ewa_robidoux;
-extern const struct pl_filter_config pl_filter_ewa_robidouxsharp;
+PL_API extern const struct pl_filter_config pl_filter_bicubic;
+PL_API extern const struct pl_filter_config pl_filter_catmull_rom;
+PL_API extern const struct pl_filter_config pl_filter_mitchell;
+PL_API extern const struct pl_filter_config pl_filter_mitchell_clamp; // clamp = 1.0
+PL_API extern const struct pl_filter_config pl_filter_robidoux;
+PL_API extern const struct pl_filter_config pl_filter_robidouxsharp;
+PL_API extern const struct pl_filter_config pl_filter_ewa_robidoux;
+PL_API extern const struct pl_filter_config pl_filter_ewa_robidouxsharp;
 
 // Backwards compatibility
 #define pl_filter_box       pl_filter_nearest
@@ -225,11 +243,11 @@ struct pl_filter_preset {
 };
 
 // A list of built-in filter presets, terminated by {0}
-extern const struct pl_filter_preset pl_filter_presets[];
-extern const int pl_num_filter_presets; // excluding trailing {0}
+PL_API extern const struct pl_filter_preset pl_filter_presets[];
+PL_API extern const int pl_num_filter_presets; // excluding trailing {0}
 
 // Find the filter preset with the given name, or NULL on failure.
-const struct pl_filter_preset *pl_find_filter_preset(const char *name);
+PL_API const struct pl_filter_preset *pl_find_filter_preset(const char *name);
 
 // Backwards compatibility
 #define pl_named_filter_config  pl_filter_preset
@@ -273,10 +291,12 @@ struct pl_filter_params {
     int row_stride_align;
 };
 
+#define pl_filter_params(...) (&(struct pl_filter_params) { __VA_ARGS__ })
+
 // Represents an initialized instance of a particular filter, with a
 // precomputed LUT. The interpretation of the LUT depends on the type of the
 // filter (polar or separable).
-struct pl_filter {
+typedef const struct pl_filter_t {
     // Deep copy of the parameters, for convenience.
     struct pl_filter_params params;
 
@@ -319,17 +339,15 @@ struct pl_filter {
     // The separation (in *weights) between each row of the filter. Always
     // a multiple of params.row_stride_align.
     int row_stride;
-};
+} *pl_filter;
 
 // Generate (compute) a filter instance based on a given filter configuration.
 // The resulting pl_filter must be freed with `pl_filter_free` when no longer
 // needed. Returns NULL if filter generation fails due to invalid parameters
 // (i.e. missing a required parameter).
-// The resulting pl_filter is implicitly destroyed when the pl_context is
-// destroyed.
-const struct pl_filter *pl_filter_generate(struct pl_context *ctx,
-                                       const struct pl_filter_params *params);
+PL_API pl_filter pl_filter_generate(pl_log log, const struct pl_filter_params *params);
+PL_API void pl_filter_free(pl_filter *filter);
 
-void pl_filter_free(const struct pl_filter **filter);
+PL_API_END
 
 #endif // LIBPLACEBO_FILTER_KERNELS_H_

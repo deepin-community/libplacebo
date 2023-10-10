@@ -17,11 +17,7 @@
 
 #pragma once
 
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <string.h>
+#include "common.h"
 
 typedef struct pl_str {
     uint8_t *buf;
@@ -56,7 +52,11 @@ static inline char *pl_strdup0(void *alloc, pl_str str)
     return pl_strndup0(alloc, str.len ? (char *) str.buf : "", str.len);
 }
 
+// Adds a trailing \0 for convenience, even if `append` is an empty string
 void pl_str_append(void *alloc, pl_str *str, pl_str append);
+
+// Like `pl_str_append` but for raw memory, omits trailing \0
+void pl_str_append_raw(void *alloc, pl_str *str, const void *ptr, size_t size);
 
 // Locale-sensitive string functions
 char *pl_asprintf(void *parent, const char *fmt, ...)
@@ -78,9 +78,25 @@ void pl_str_append_asprintf_c(void *alloc, pl_str *str, const char *fmt, ...)
 void pl_str_append_vasprintf_c(void *alloc, pl_str *str, const char *fmt, va_list va)
     PL_PRINTF(3, 0);
 
+// Variant of the above which takes arguments directly from a pointer in memory,
+// reading them incrementally (tightly packed). Returns the amount of bytes
+// read from `args`, as determined by the following table:
+//
+// %c: sizeof(char)
+// %d, %u: sizeof(int)
+// %f: sizeof(double)
+// %lld, %llu: sizeof(long long int)
+// %zu: sizeof(size_t)
+// %s: \0 terminated string
+// %.*s: sizeof(int) + that many bytes (no \0 terminator)
+size_t pl_str_append_memprintf_c(void *alloc, pl_str *str, const char *fmt,
+                                 const void *args)
+    PL_PRINTF(3, 0);
+
 // Locale-invariant number parsing
 bool pl_str_parse_double(pl_str str, double *out);
 bool pl_str_parse_int64(pl_str str, int64_t *out);
+bool pl_str_parse_uint64(pl_str str, uint64_t *out);
 
 static inline bool pl_str_parse_float(pl_str str, float *out)
 {
@@ -95,6 +111,14 @@ static inline bool pl_str_parse_int(pl_str str, int *out)
     int64_t i64;
     bool ret = pl_str_parse_int64(str, &i64);
     *out = (int) i64;
+    return ret;
+}
+
+static inline bool pl_str_parse_uint(pl_str str, unsigned int *out)
+{
+    uint64_t u64;
+    bool ret = pl_str_parse_uint64(str, &u64);
+    *out = (unsigned int) u64;
     return ret;
 }
 
@@ -152,6 +176,11 @@ static inline void pl_hash_merge(uint64_t *accum, uint64_t hash) {
 static inline uint64_t pl_str_hash(pl_str str)
 {
     return pl_mem_hash(str.buf, str.len);
+}
+
+static inline uint64_t pl_str0_hash(const char *str)
+{
+    return pl_mem_hash(str, str ? strlen(str) : 0);
 }
 
 static inline bool pl_str_equals(pl_str str1, pl_str str2)
@@ -230,3 +259,80 @@ static inline bool pl_str_eatend0(pl_str *str, const char *prefix)
 {
     return pl_str_eatend(str, pl_str0(prefix));
 }
+
+// String building helpers, used to lazily construct a string by appending a
+// series of string templates which can be executed on-demand into a final
+// output buffer.
+typedef struct pl_str_builder_t *pl_str_builder;
+
+// Returns the number of bytes consumed from `args`. Be warned that the pointer
+// given will not necessarily be aligned to the type you need it as, so make
+// sure to use `memcpy` or some other method of safely loading arbitrary data
+// from memory.
+typedef size_t (*pl_str_template)(void *alloc, pl_str *buf, const uint8_t *args);
+
+pl_str_builder pl_str_builder_alloc(void *alloc);
+void pl_str_builder_free(pl_str_builder *builder);
+
+// Resets string builder without destroying buffer
+void pl_str_builder_reset(pl_str_builder builder);
+
+// Returns a representative hash of the string builder's output, without
+// actually executing it. Note that this is *not* the same as a pl_str_hash of
+// the string builder's output.
+//
+// Note also that the output of this may not survive a process restart because
+// of position-independent code and address randomization moving around the
+// locatons of template functions, so special care must be taken not to
+// compare such hashes across process invocations.
+uint64_t pl_str_builder_hash(const pl_str_builder builder);
+
+// Executes a string builder, dispatching all templates. The resulting string
+// is guaranteed to be \0-terminated, as a minor convenience.
+//
+// Calling any other `pl_str_builder_*` function on this builder causes the
+// contents of the returned string to become undefined.
+pl_str pl_str_builder_exec(pl_str_builder builder);
+
+// Append a template and its arguments to a string builder
+void pl_str_builder_append(pl_str_builder builder, pl_str_template tmpl,
+                           const void *args, size_t args_size);
+
+// Append an entire other `pl_str_builder` onto `builder`
+void pl_str_builder_concat(pl_str_builder builder, const pl_str_builder append);
+
+// Append a constant string. This will only record &str into the buffer, which
+// may have a number of unwanted consequences if the memory pointed at by
+// `str` mutates at any point in time in the future, or if `str` is not
+// at a stable location in memory.
+//
+// This is intended for strings which are compile-time constants.
+void pl_str_builder_const_str(pl_str_builder builder, const char *str);
+
+// Append a string. This will make a full copy of `str`
+void pl_str_builder_str(pl_str_builder builder, const pl_str str);
+#define pl_str_builder_str0(b, str) pl_str_builder_str(b, pl_str0(str))
+
+// Append a string printf-style. This will preprocess `fmt` to determine the
+// number and type of arguments. Supports the same format conversion characters
+// as `pl_str_append_asprintf_c`.
+void pl_str_builder_printf_c(pl_str_builder builder, const char *fmt, ...)
+    PL_PRINTF(2, 3);
+
+void pl_str_builder_vprintf_c(pl_str_builder builder, const char *fmt, va_list ap)
+    PL_PRINTF(2, 0);
+
+// Helper macro to specialize `pl_str_builder_printf_c` to
+// `pl_str_builder_const_str` if it contains no format characters.
+#define pl_str_builder_addf(builder, ...) do                                    \
+{                                                                               \
+    if (_contains_fmt_chars(__VA_ARGS__)) {                                     \
+        pl_str_builder_printf_c(builder, __VA_ARGS__);                          \
+    } else {                                                                    \
+        pl_str_builder_const_str(builder, _get_fmt(__VA_ARGS__));               \
+    }                                                                           \
+} while (0)
+
+// Helper macros to deal with the non-portability of __VA_OPT__(,)
+#define _contains_fmt_chars(fmt, ...)   (strchr(fmt, '%'))
+#define _get_fmt(fmt, ...)              fmt

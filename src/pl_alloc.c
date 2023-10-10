@@ -15,7 +15,6 @@
  * License along with libplacebo. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <pthread.h>
 #include "common.h"
 
 struct header {
@@ -28,7 +27,7 @@ struct header {
     struct ext *ext;
 
     // Pointer to actual data, for alignment purposes
-    intmax_t data[1];
+    max_align_t data[];
 };
 
 // Lazily allocated, to save space for leaf allocations and allocations which
@@ -56,7 +55,7 @@ static inline struct header *get_header(void *ptr)
     return hdr;
 }
 
-static inline void *oom()
+static inline void *oom(void)
 {
     fprintf(stderr, "out of memory\n");
     abort();
@@ -222,15 +221,16 @@ void pl_free_children(void *ptr)
         h->ext->children[i]->parent = NULL; // prevent recursive access
         pl_free(h->ext->children[i]->data);
     }
+    h->ext->num_children = 0;
 
 #ifndef NDEBUG
     h->magic = MAGIC;
 #endif
 }
 
-size_t pl_get_size(void *ptr)
+size_t pl_get_size(const void *ptr)
 {
-    struct header *h = get_header(ptr);
+    const struct header *h = get_header((void *) ptr);
     return h ? h->size : 0;
 }
 
@@ -251,15 +251,14 @@ void *pl_steal(void *parent, void *ptr)
 
 void *pl_memdup(void *parent, const void *ptr, size_t size)
 {
-    if (!ptr) {
-        assert(!size);
+    if (!size)
         return NULL;
-    }
 
     void *new = pl_alloc(parent, size);
     if (!new)
         return oom();
 
+    assert(ptr);
     memcpy(new, ptr, size);
     return new;
 }
@@ -284,54 +283,6 @@ char *pl_strndup0(void *parent, const char *str, size_t size)
     memcpy(new, str, str_size);
     new[str_size] = '\0';
     return new;
-}
-
-struct pl_ref {
-    pthread_mutex_t lock;
-    int refcount;
-};
-
-struct pl_ref *pl_ref_new(void *parent)
-{
-    struct pl_ref *ref = pl_alloc_ptr(parent, ref);
-    if (!ref)
-        return oom();
-
-    *ref = (struct pl_ref) {
-        .lock = PTHREAD_MUTEX_INITIALIZER,
-        .refcount = 1,
-    };
-
-    return ref;
-}
-
-struct pl_ref *pl_ref_dup(struct pl_ref *ref)
-{
-    if (!ref)
-        return NULL;
-
-    pthread_mutex_lock(&ref->lock);
-    ref->refcount++;
-    pthread_mutex_unlock(&ref->lock);
-    return ref;
-}
-
-void pl_ref_deref(struct pl_ref **refp)
-{
-    struct pl_ref *ref = *refp;
-    if (!ref)
-        return;
-
-    pthread_mutex_lock(&ref->lock);
-    if (--ref->refcount > 0) {
-        pthread_mutex_unlock(&ref->lock);
-        return;
-    }
-
-    pthread_mutex_unlock(&ref->lock);
-    pthread_mutex_destroy(&ref->lock);
-    pl_free(ref);
-    *refp = NULL;
 }
 
 char *pl_asprintf(void *parent, const char *fmt, ...)

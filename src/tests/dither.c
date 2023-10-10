@@ -1,5 +1,8 @@
 #include "tests.h"
 
+#include <libplacebo/dither.h>
+#include <libplacebo/shaders/dithering.h>
+
 #define SHIFT 4
 #define SIZE (1 << SHIFT)
 float data[SIZE][SIZE];
@@ -23,9 +26,9 @@ int main()
     }
 
     // Generate an example of a dither shader
-    struct pl_context *ctx = pl_test_context();
-    struct pl_shader *sh = pl_shader_alloc(ctx, NULL);
-    struct pl_shader_obj *obj = NULL;
+    pl_log log = pl_test_logger();
+    pl_shader sh = pl_shader_alloc(log, NULL);
+    pl_shader_obj obj = NULL;
 
     pl_shader_dither(sh, 8, &obj, NULL);
     const struct pl_shader_res *res = pl_shader_finalize(sh);
@@ -34,5 +37,5 @@ int main()
 
     pl_shader_obj_destroy(&obj);
     pl_shader_free(&sh);
-    pl_context_destroy(&ctx);
+    pl_log_destroy(&log);
 }

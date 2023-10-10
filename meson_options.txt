@@ -2,14 +2,20 @@
 option('vulkan', type: 'feature', value: 'auto',
        description: 'Vulkan-based renderer')
 
-option('vulkan-link', type: 'boolean', value: true,
-       description: 'Link directly againt vkGetInstanceProcAddr from libvulkan.so')
+option('vk-proc-addr', type: 'feature', value: 'auto',
+       description: 'Link directly against vkGetInstanceProcAddr from libvulkan.so')
 
 option('vulkan-registry', type: 'string', value: '',
        description: 'Path to vulkan XML registry (for code generation)')
 
 option('opengl', type: 'feature', value: 'auto',
        description: 'OpenGL-based renderer')
+
+option('gl-proc-addr', type: 'feature', value: 'auto',
+       description: 'Enable built-in OpenGL loader (uses dlopen, dlsym...)')
+
+option('d3d11', type: 'feature', value: 'auto',
+       description: 'Direct3D 11 based renderer')
 
 option('glslang', type: 'feature', value: 'auto',
        description: 'glslang SPIR-V compiler')
@@ -19,6 +25,12 @@ option('shaderc', type: 'feature', value: 'auto',
 
 option('lcms', type: 'feature', value: 'auto',
        description: 'LittleCMS 2 support')
+
+option('dovi', type: 'feature', value: 'auto',
+       description: 'Dolby Vision reshaping support')
+
+option('libdovi', type: 'feature', value: 'auto',
+       description: 'libdovi support')
 
 # Miscellaneous
 option('demos', type: 'boolean', value: true,
@@ -32,3 +44,9 @@ option('bench', type: 'boolean', value: false,
 
 option('fuzz', type: 'boolean', value: false,
        description: 'Enable building fuzzer binaries (`CC=afl-cc`)')
+
+option('unwind', type: 'feature', value: 'auto',
+       description: 'Enable linking against libunwind for printing stack traces caused by runtime errors')
+
+option('debug-abort', type: 'boolean', value: false,
+       description: 'abort() on most runtime errors (only for debugging purposes)')

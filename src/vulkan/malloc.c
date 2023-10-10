@@ -18,109 +18,238 @@
 #include "malloc.h"
 #include "command.h"
 #include "utils.h"
+#include "pl_thread.h"
 
 #ifdef PL_HAVE_UNIX
 #include <errno.h>
-#include <strings.h>
 #include <unistd.h>
 #endif
 
-// Controls the multiplication factor for new slab allocations. The new slab
-// will always be allocated such that the size of the slab is this factor times
-// the previous slab. Higher values make it grow faster.
-#define PL_VK_HEAP_SLAB_GROWTH_RATE 4
+// Controls the page size alignment, to help coalesce allocations into the same
+// slab. Pages are rounded up to multiples of this value. (Default: 4 KB)
+#define PAGE_SIZE_ALIGN (1LLU << 12)
 
-// Controls the minimum slab size, to reduce the frequency at which very small
-// slabs would need to get allocated when allocating the first few buffers.
-// (Default: 1 MB)
-#define PL_VK_HEAP_MINIMUM_SLAB_SIZE (1LLU << 20)
+// Controls the minimum/maximum number of pages for new slabs. As slabs are
+// exhausted of memory, the number of pages per new slab grows exponentially,
+// starting with the minimum until the maximum is reached.
+//
+// Note: The maximum must never exceed the size of `vk_slab.spacemap`.
+#define MINIMUM_PAGE_COUNT 4
+#define MAXIMUM_PAGE_COUNT (sizeof(uint64_t) * 8)
 
-// Controls the maximum slab size, to reduce the effect of unbounded slab
-// growth exhausting memory. If the application needs a single allocation
-// that's bigger than this value, it will be allocated directly from the
-// device. (Default: 256 MB)
-#define PL_VK_HEAP_MAXIMUM_SLAB_SIZE (1LLU << 28)
+// Controls the maximum page size. Any allocations above this threshold
+// (absolute size or fraction of VRAM, whichever is higher) will be served by
+// dedicated allocations. (Default: 64 MB or 1/16 of VRAM)
+#define MAXIMUM_PAGE_SIZE_ABSOLUTE (1LLU << 26)
+#define MAXIMUM_PAGE_SIZE_RELATIVE 16
 
-// Controls the minimum free region size, to reduce thrashing the free space
-// map with lots of small buffers during uninit. (Default: 1 KB)
-#define PL_VK_HEAP_MINIMUM_REGION_SIZE (1LLU << 10)
+// Controls the minimum slab size, to avoid excessive re-allocation of very
+// small slabs. (Default: 256 KB)
+#define MINIMUM_SLAB_SIZE (1LLU << 18)
 
-// Represents a region of available memory
-struct vk_region {
-    size_t start; // first offset in region
-    size_t end;   // first offset *not* in region
-};
+// Controls the maximum slab size, to avoid ballooning memory requirements
+// due to overzealous allocation of extra pages. (Default: 256 MB)
+#define MAXIMUM_SLAB_SIZE (1LLU << 28)
 
-static inline size_t region_len(struct vk_region r)
-{
-    return r.end - r.start;
-}
+// How long to wait before garbage collecting empty slabs. Slabs older than
+// this many invocations of `vk_malloc_garbage_collect` will be released.
+#define MAXIMUM_SLAB_AGE 8
 
 // A single slab represents a contiguous region of allocated memory. Actual
-// allocations are served as slices of this. Slabs are organized into linked
-// lists, which represent individual heaps.
+// allocations are served as pages of this. Slabs are organized into pools,
+// each of which contains a list of slabs of differing page sizes.
 struct vk_slab {
-    VkDeviceMemory mem;   // underlying device allocation
-    size_t size;          // total size of `slab`
-    size_t used;          // number of bytes actually in use (for GC accounting)
-    bool dedicated;       // slab is allocated specifically for one object
-    bool imported;        // slab represents an imported memory allocation
-    // free space map: a sorted list of memory regions that are available
-    PL_ARRAY(struct vk_region) regions;
+    pl_mutex lock;
+    pl_debug_tag debug_tag; // debug tag of the triggering allocation
+    VkDeviceMemory mem;     // underlying device allocation
+    VkDeviceSize size;      // total allocated size of `mem`
+    VkMemoryType mtype;     // underlying memory type
+    bool dedicated;         // slab is allocated specifically for one object
+    bool imported;          // slab represents an imported memory allocation
+
+    // free space accounting (only for non-dedicated slabs)
+    uint64_t spacemap;      // bitset of available pages
+    size_t pagesize;        // size in bytes per page
+    size_t used;            // number of bytes actually in use
+    uint64_t age;           // timestamp of last use
+
     // optional, depends on the memory type:
     VkBuffer buffer;        // buffer spanning the entire slab
     void *data;             // mapped memory corresponding to `mem`
     bool coherent;          // mapped memory is coherent
     union pl_handle handle; // handle associated with this device memory
     enum pl_handle_type handle_type;
-    // cached flags for convenience
-    VkMemoryPropertyFlags flags;
 };
 
-// Represents a single memory heap. We keep track of a vk_heap for each
+// Represents a single memory pool. We keep track of a vk_pool for each
 // combination of malloc parameters. This shouldn't actually be that many in
 // practice, because some combinations simply never occur, and others will
 // generally be the same for the same objects.
 //
-// Note: `vk_heap` addresses are not immutable, so we musn't expose any dangling
-// references to a `vk_heap` from e.g. `vk_memslice.priv = vk_slab`.
-struct vk_heap {
+// Note: `vk_pool` addresses are not immutable, so we mustn't expose any
+// dangling references to a `vk_pool` from e.g. `vk_memslice.priv = vk_slab`.
+struct vk_pool {
     struct vk_malloc_params params;   // allocation params (with some fields nulled)
-    PL_ARRAY(struct vk_slab *) slabs; // array of slabs sorted by size
+    PL_ARRAY(struct vk_slab *) slabs; // array of slabs, unsorted
+    int index;                        // running index in `vk_malloc.pools`
 };
 
-// The overall state of the allocator, which keeps track of a vk_heap for each
+// The overall state of the allocator, which keeps track of a vk_pool for each
 // memory type.
 struct vk_malloc {
     struct vk_ctx *vk;
+    pl_mutex lock;
     VkPhysicalDeviceMemoryProperties props;
-    PL_ARRAY(struct vk_heap) heaps;
+    size_t maximum_page_size;
+    PL_ARRAY(struct vk_pool) pools;
+    uint64_t age;
 };
+
+static inline float efficiency(size_t used, size_t total)
+{
+    if (!total)
+        return 100.0;
+
+    return 100.0f * used / total;
+}
+
+static const char *print_size(char buf[8], size_t size)
+{
+    const char *suffixes = "\0KMG";
+    while (suffixes[1] && size > 9999) {
+        size >>= 10;
+        suffixes++;
+    }
+
+    int ret = *suffixes ? snprintf(buf, 8, "%4zu%c", size, *suffixes)
+                        : snprintf(buf, 8, "%5zu", size);
+
+    return ret >= 0 ? buf : "(error)";
+}
+
+#define PRINT_SIZE(x) (print_size((char[8]){0}, (size_t) (x)))
+
+void vk_malloc_print_stats(struct vk_malloc *ma, enum pl_log_level lev)
+{
+    struct vk_ctx *vk = ma->vk;
+    size_t total_size = 0;
+    size_t total_used = 0;
+    size_t total_res = 0;
+
+    PL_MSG(vk, lev, "Memory heaps supported by device:");
+    for (int i = 0; i < ma->props.memoryHeapCount; i++) {
+        VkMemoryHeap heap = ma->props.memoryHeaps[i];
+        PL_MSG(vk, lev, "    %d: flags 0x%x size %s",
+                i, (unsigned) heap.flags, PRINT_SIZE(heap.size));
+    }
+
+    PL_DEBUG(vk, "Memory types supported by device:");
+    for (int i = 0; i < ma->props.memoryTypeCount; i++) {
+        VkMemoryType type = ma->props.memoryTypes[i];
+        PL_DEBUG(vk, "    %d: flags 0x%x heap %d",
+                 i, (unsigned) type.propertyFlags, (int) type.heapIndex);
+    }
+
+    pl_mutex_lock(&ma->lock);
+    for (int i = 0; i < ma->pools.num; i++) {
+        struct vk_pool *pool = &ma->pools.elem[i];
+        const struct vk_malloc_params *par = &pool->params;
+
+        PL_MSG(vk, lev, "Memory pool %d:", i);
+        PL_MSG(vk, lev, "    Compatible types: 0x%"PRIx32, par->reqs.memoryTypeBits);
+        if (par->required)
+            PL_MSG(vk, lev, "    Required flags: 0x%"PRIx32, par->required);
+        if (par->optimal)
+            PL_MSG(vk, lev, "    Optimal flags: 0x%"PRIx32, par->optimal);
+        if (par->buf_usage)
+            PL_MSG(vk, lev, "    Buffer flags: 0x%"PRIx32, par->buf_usage);
+        if (par->export_handle)
+            PL_MSG(vk, lev, "    Export handle: 0x%x", par->export_handle);
+
+        size_t pool_size = 0;
+        size_t pool_used = 0;
+        size_t pool_res = 0;
+
+        for (int j = 0; j < pool->slabs.num; j++) {
+            struct vk_slab *slab = pool->slabs.elem[j];
+            pl_mutex_lock(&slab->lock);
+
+            size_t avail = __builtin_popcountll(slab->spacemap) * slab->pagesize;
+            size_t slab_res = slab->size - avail;
+
+            PL_MSG(vk, lev, "    Slab %2d: %8"PRIx64" x %s: "
+                   "%s used %s res %s alloc from heap %d, efficiency %.2f%%  [%s]",
+                   j, slab->spacemap, PRINT_SIZE(slab->pagesize),
+                   PRINT_SIZE(slab->used), PRINT_SIZE(slab_res),
+                   PRINT_SIZE(slab->size), (int) slab->mtype.heapIndex,
+                   efficiency(slab->used, slab_res),
+                   PL_DEF(slab->debug_tag, "unknown"));
+
+            pool_size += slab->size;
+            pool_used += slab->used;
+            pool_res += slab_res;
+            pl_mutex_unlock(&slab->lock);
+        }
+
+        PL_MSG(vk, lev, "    Pool summary: %s used %s res %s alloc, "
+               "efficiency %.2f%%, utilization %.2f%%",
+               PRINT_SIZE(pool_used), PRINT_SIZE(pool_res),
+               PRINT_SIZE(pool_size), efficiency(pool_used, pool_res),
+               efficiency(pool_res, pool_size));
+
+        total_size += pool_size;
+        total_used += pool_used;
+        total_res += pool_res;
+    }
+    pl_mutex_unlock(&ma->lock);
+
+    PL_MSG(vk, lev, "Memory summary: %s used %s res %s alloc, "
+           "efficiency %.2f%%, utilization %.2f%%, max page: %s",
+           PRINT_SIZE(total_used), PRINT_SIZE(total_res),
+           PRINT_SIZE(total_size), efficiency(total_used, total_res),
+           efficiency(total_res, total_size),
+           PRINT_SIZE(ma->maximum_page_size));
+}
 
 static void slab_free(struct vk_ctx *vk, struct vk_slab *slab)
 {
     if (!slab)
         return;
 
-    pl_assert(slab->dedicated || slab->used == 0);
+#ifndef NDEBUG
+    if (!slab->dedicated && slab->used > 0) {
+        PL_WARN(vk, "Leaked %zu bytes of vulkan memory!", slab->used);
+        PL_WARN(vk, "slab total size: %zu bytes, heap: %d, flags: 0x%"PRIX64,
+                (size_t) slab->size, (int) slab->mtype.heapIndex,
+                (uint64_t) slab->mtype.propertyFlags);
+        if (slab->debug_tag)
+            PL_WARN(vk, "last used for: %s", slab->debug_tag);
+        pl_log_stack_trace(vk->log, PL_LOG_WARN);
+        pl_debug_abort();
+    }
+#endif
+
     if (slab->imported) {
         switch (slab->handle_type) {
         case PL_HANDLE_FD:
         case PL_HANDLE_DMA_BUF:
-            PL_TRACE(vk, "Unimporting slab of size %zu from fd: %d",
-                     (size_t) slab->size, slab->handle.fd);
+            PL_TRACE(vk, "Unimporting slab of size %s from fd: %d",
+                     PRINT_SIZE(slab->size), slab->handle.fd);
             break;
         case PL_HANDLE_WIN32:
         case PL_HANDLE_WIN32_KMT:
 #ifdef PL_HAVE_WIN32
-            PL_TRACE(vk, "Unimporting slab of size %zu from handle: %p",
-                     (size_t) slab->size, (void *) slab->handle.handle);
+            PL_TRACE(vk, "Unimporting slab of size %s from handle: %p",
+                     PRINT_SIZE(slab->size), (void *) slab->handle.handle);
 #endif
             break;
         case PL_HANDLE_HOST_PTR:
-            PL_TRACE(vk, "Unimporting slab of size %zu from ptr: %p",
-                     (size_t) slab->size, (void *) slab->handle.ptr);
+            PL_TRACE(vk, "Unimporting slab of size %s from ptr: %p",
+                     PRINT_SIZE(slab->size), (void *) slab->handle.ptr);
             break;
+        case PL_HANDLE_IOSURFACE:
+        case PL_HANDLE_MTL_TEX:
+            pl_unreachable();
         }
     } else {
         switch (slab->handle_type) {
@@ -143,20 +272,25 @@ static void slab_free(struct vk_ctx *vk, struct vk_slab *slab)
         case PL_HANDLE_HOST_PTR:
             // Implicitly unmapped
             break;
+        case PL_HANDLE_IOSURFACE:
+        case PL_HANDLE_MTL_TEX:
+            pl_unreachable();
         }
 
-        PL_DEBUG(vk, "Freeing slab of size %zu", (size_t) slab->size);
+        PL_DEBUG(vk, "Freeing slab of size %s", PRINT_SIZE(slab->size));
     }
 
     vk->DestroyBuffer(vk->dev, slab->buffer, PL_VK_ALLOC);
     // also implicitly unmaps the memory if needed
     vk->FreeMemory(vk->dev, slab->mem, PL_VK_ALLOC);
 
+    pl_mutex_destroy(&slab->lock);
     pl_free(slab);
 }
 
 // type_mask: optional
-static bool find_best_memtype(struct vk_malloc *ma, uint32_t type_mask,
+// thread-safety: safe
+static bool find_best_memtype(const struct vk_malloc *ma, uint32_t type_mask,
                               const struct vk_malloc_params *params,
                               uint32_t *out_index)
 {
@@ -209,34 +343,37 @@ static bool buf_external_check(struct vk_ctx *vk, VkBufferUsageFlags usage,
     if (!handle_type)
         return true;
 
-    if (!vk->GetPhysicalDeviceExternalBufferPropertiesKHR)
-        return false;
-
-    VkPhysicalDeviceExternalBufferInfoKHR info = {
+    VkPhysicalDeviceExternalBufferInfo info = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO_KHR,
         .usage = usage,
         .handleType = vk_mem_handle_type(handle_type),
     };
 
-    VkExternalBufferPropertiesKHR props = {
+    VkExternalBufferProperties props = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES_KHR,
     };
 
-    pl_assert(info.handleType);
-    vk->GetPhysicalDeviceExternalBufferPropertiesKHR(vk->physd, &info, &props);
+    if (!info.handleType)
+        return false;
+
+    vk->GetPhysicalDeviceExternalBufferProperties(vk->physd, &info, &props);
     return vk_external_mem_check(vk, &props.externalMemoryProperties,
                                  handle_type, import);
 }
 
+// thread-safety: safe
 static struct vk_slab *slab_alloc(struct vk_malloc *ma,
                                   const struct vk_malloc_params *params)
 {
     struct vk_ctx *vk = ma->vk;
     struct vk_slab *slab = pl_alloc_ptr(NULL, slab);
     *slab = (struct vk_slab) {
+        .age = ma->age,
         .size = params->reqs.size,
         .handle_type = params->export_handle,
+        .debug_tag = params->debug_tag,
     };
+    pl_mutex_init(&slab->lock);
 
     switch (slab->handle_type) {
     case PL_HANDLE_FD:
@@ -245,6 +382,8 @@ static struct vk_slab *slab_alloc(struct vk_malloc *ma,
         break;
     case PL_HANDLE_WIN32:
     case PL_HANDLE_WIN32_KMT:
+    case PL_HANDLE_MTL_TEX:
+    case PL_HANDLE_IOSURFACE:
         slab->handle.handle = NULL;
         break;
     case PL_HANDLE_HOST_PTR:
@@ -262,6 +401,7 @@ static struct vk_slab *slab_alloc(struct vk_malloc *ma,
         // Queue family sharing modes don't matter for buffers, so we just
         // set them as concurrent and stop worrying about it.
         uint32_t qfs[3] = {0};
+        pl_assert(vk->pools.num <= PL_ARRAY_SIZE(qfs));
         for (int i = 0; i < vk->pools.num; i++)
             qfs[i] = vk->pools.elem[i]->qf;
 
@@ -319,16 +459,29 @@ static struct vk_slab *slab_alloc(struct vk_malloc *ma,
         goto error;
 
     const VkMemoryType *mtype = &ma->props.memoryTypes[minfo.memoryTypeIndex];
-    PL_DEBUG(vk, "Allocating %zu memory of type 0x%x (id %d) in heap %d",
+    PL_DEBUG(vk, "Allocating %zu memory of type 0x%x (id %d) in heap %d: %s",
              (size_t) slab->size, (unsigned) mtype->propertyFlags,
-             (int) minfo.memoryTypeIndex, (int) mtype->heapIndex);
+             (int) minfo.memoryTypeIndex, (int) mtype->heapIndex,
+             PL_DEF(params->debug_tag, "unknown"));
 
-    VK(vk->AllocateMemory(vk->dev, &minfo, PL_VK_ALLOC, &slab->mem));
+    VkResult res = vk->AllocateMemory(vk->dev, &minfo, PL_VK_ALLOC, &slab->mem);
+    switch (res) {
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+    case VK_ERROR_OUT_OF_HOST_MEMORY:
+        PL_ERR(vk, "Allocation of size %s failed: %s!",
+               PRINT_SIZE(slab->size), vk_res_str(res));
+        vk_malloc_print_stats(ma, PL_LOG_ERR);
+        pl_log_stack_trace(vk->log, PL_LOG_ERR);
+        goto error;
 
-    slab->flags = ma->props.memoryTypes[minfo.memoryTypeIndex].propertyFlags;
-    if (slab->flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+    default:
+        PL_VK_ASSERT(res, "vkAllocateMemory");
+    }
+
+    slab->mtype = *mtype;
+    if (mtype->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
         VK(vk->MapMemory(vk->dev, slab->mem, 0, VK_WHOLE_SIZE, 0, &slab->data));
-        slab->coherent = slab->flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        slab->coherent = mtype->propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     }
 
     if (slab->buffer)
@@ -363,98 +516,43 @@ static struct vk_slab *slab_alloc(struct vk_malloc *ma,
     }
 #endif
 
-    PL_ARRAY_APPEND(slab, slab->regions, (struct vk_region) {
-        .start = 0,
-        .end   = slab->size,
-    });
-
+    // free space accounting is done by the caller
     return slab;
 
 error:
+    if (params->debug_tag)
+        PL_ERR(vk, "  for malloc: %s", params->debug_tag);
     slab_free(vk, slab);
     return NULL;
 }
 
-static void insert_region(struct vk_slab *slab, struct vk_region region)
+static void pool_uninit(struct vk_ctx *vk, struct vk_pool *pool)
 {
-    if (region.start == region.end)
-        return;
+    for (int i = 0; i < pool->slabs.num; i++)
+        slab_free(vk, pool->slabs.elem[i]);
 
-    pl_assert(!slab->dedicated);
-    bool big_enough = region_len(region) >= PL_VK_HEAP_MINIMUM_REGION_SIZE;
-
-    // Find the index of the first region that comes after this
-    for (int i = 0; i < slab->regions.num; i++) {
-        struct vk_region *r = &slab->regions.elem[i];
-
-        // Check for a few special cases which can be coalesced
-        if (r->end == region.start) {
-            // The new region is at the tail of this region. In addition to
-            // modifying this region, we also need to coalesce all the following
-            // regions for as long as possible
-            r->end = region.end;
-
-            struct vk_region *next = &slab->regions.elem[i+1];
-            while (i+1 < slab->regions.num && r->end == next->start) {
-                r->end = next->end;
-                PL_ARRAY_REMOVE_AT(slab->regions, i+1);
-            }
-            return;
-        }
-
-        if (r->start == region.end) {
-            // The new region is at the head of this region. We don't need to
-            // do anything special here - because if this could be further
-            // coalesced backwards, the previous loop iteration would already
-            // have caught it.
-            r->start = region.start;
-            return;
-        }
-
-        if (r->start > region.start) {
-            // The new region comes somewhere before this region, so insert
-            // it into this index in the array.
-            if (big_enough)
-                PL_ARRAY_INSERT_AT(slab, slab->regions, i, region);
-            return;
-        }
-    }
-
-    // If we've reached the end of this loop, then all of the regions
-    // come before the new region, and are disconnected - so append it
-    if (big_enough)
-        PL_ARRAY_APPEND(slab, slab->regions, region);
-}
-
-static void heap_uninit(struct vk_ctx *vk, struct vk_heap *heap)
-{
-    for (int i = 0; i < heap->slabs.num; i++)
-        slab_free(vk, heap->slabs.elem[i]);
-
-    pl_free(heap->slabs.elem);
-    *heap = (struct vk_heap) {0};
+    pl_free(pool->slabs.elem);
+    *pool = (struct vk_pool) {0};
 }
 
 struct vk_malloc *vk_malloc_create(struct vk_ctx *vk)
 {
     struct vk_malloc *ma = pl_zalloc_ptr(NULL, ma);
+    pl_mutex_init(&ma->lock);
     vk->GetPhysicalDeviceMemoryProperties(vk->physd, &ma->props);
     ma->vk = vk;
 
-    PL_INFO(vk, "Memory heaps supported by device:");
+    // Determine maximum page size
+    ma->maximum_page_size = MAXIMUM_PAGE_SIZE_ABSOLUTE;
     for (int i = 0; i < ma->props.memoryHeapCount; i++) {
         VkMemoryHeap heap = ma->props.memoryHeaps[i];
-        PL_INFO(vk, "    %d: flags 0x%x size %zu",
-                i, (unsigned) heap.flags, (size_t) heap.size);
+        if (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            size_t size_max = heap.size / MAXIMUM_PAGE_SIZE_RELATIVE;
+            ma->maximum_page_size = PL_MAX(ma->maximum_page_size, size_max);
+        }
     }
 
-    PL_DEBUG(vk, "Memory types supported by device:");
-    for (int i = 0; i < ma->props.memoryTypeCount; i++) {
-        VkMemoryType type = ma->props.memoryTypes[i];
-        PL_DEBUG(vk, "    %d: flags 0x%x heap %d",
-                 i, (unsigned) type.propertyFlags, (int) type.heapIndex);
-    }
-
+    vk_malloc_print_stats(ma, PL_LOG_INFO);
     return ma;
 }
 
@@ -464,13 +562,44 @@ void vk_malloc_destroy(struct vk_malloc **ma_ptr)
     if (!ma)
         return;
 
-    for (int i = 0; i < ma->heaps.num; i++)
-        heap_uninit(ma->vk, &ma->heaps.elem[i]);
+    vk_malloc_print_stats(ma, PL_LOG_DEBUG);
+    for (int i = 0; i < ma->pools.num; i++)
+        pool_uninit(ma->vk, &ma->pools.elem[i]);
 
+    pl_mutex_destroy(&ma->lock);
     pl_free_ptr(ma_ptr);
 }
 
-pl_handle_caps vk_malloc_handle_caps(struct vk_malloc *ma, bool import)
+void vk_malloc_garbage_collect(struct vk_malloc *ma)
+{
+    struct vk_ctx *vk = ma->vk;
+
+    pl_mutex_lock(&ma->lock);
+    ma->age++;
+
+    for (int i = 0; i < ma->pools.num; i++) {
+        struct vk_pool *pool = &ma->pools.elem[i];
+        for (int n = 0; n < pool->slabs.num; n++) {
+            struct vk_slab *slab = pool->slabs.elem[n];
+            pl_mutex_lock(&slab->lock);
+            if (slab->used || (ma->age - slab->age) <= MAXIMUM_SLAB_AGE) {
+                pl_mutex_unlock(&slab->lock);
+                continue;
+            }
+
+            PL_DEBUG(vk, "Garbage collected slab of size %s from pool %d",
+                     PRINT_SIZE(slab->size), pool->index);
+
+            pl_mutex_unlock(&slab->lock);
+            slab_free(ma->vk, slab);
+            PL_ARRAY_REMOVE_AT(pool->slabs, n--);
+        }
+    }
+
+    pl_mutex_unlock(&ma->lock);
+}
+
+pl_handle_caps vk_malloc_handle_caps(const struct vk_malloc *ma, bool import)
 {
     struct vk_ctx *vk = ma->vk;
     pl_handle_caps caps = 0;
@@ -492,33 +621,26 @@ void vk_malloc_free(struct vk_malloc *ma, struct vk_memslice *slice)
 {
     struct vk_ctx *vk = ma->vk;
     struct vk_slab *slab = slice->priv;
-    if (!slab)
-        goto done;
-
-    pl_assert(slab->used >= slice->size);
-    slab->used -= slice->size;
-
-    if (slab->dedicated) {
-        // If the slab was purpose-allocated for this memslice, we can just
-        // free it here
+    if (!slab || slab->dedicated) {
         slab_free(vk, slab);
-    } else {
-        PL_TRACE(vk, "Freeing slice %zu + %zu from slab with size %zu",
-                 (size_t) slice->offset, (size_t) slice->size,
-                 (size_t) slab->size);
-
-        // Return the allocation to the free space map
-        insert_region(slab, (struct vk_region) {
-            .start = slice->offset,
-            .end   = slice->offset + slice->size,
-        });
+        goto done;
     }
+
+    pl_mutex_lock(&slab->lock);
+
+    int page_idx = slice->offset / slab->pagesize;
+    slab->spacemap |= 0x1LLU << page_idx;
+    slab->used -= slice->size;
+    slab->age = ma->age;
+    pl_assert(slab->used >= 0);
+
+    pl_mutex_unlock(&slab->lock);
 
 done:
     *slice = (struct vk_memslice) {0};
 }
 
-static inline bool heap_params_eq(const struct vk_malloc_params *a,
+static inline bool pool_params_eq(const struct vk_malloc_params *a,
                                   const struct vk_malloc_params *b)
 {
     return a->reqs.size == b->reqs.size &&
@@ -530,7 +652,7 @@ static inline bool heap_params_eq(const struct vk_malloc_params *a,
            a->export_handle == b->export_handle;
 }
 
-static struct vk_heap *find_heap(struct vk_malloc *ma,
+static struct vk_pool *find_pool(struct vk_malloc *ma,
                                  const struct vk_malloc_params *params)
 {
     pl_assert(!params->import_handle);
@@ -541,76 +663,84 @@ static struct vk_heap *find_heap(struct vk_malloc *ma,
     fixed.reqs.size = 0;
     fixed.shared_mem = (struct pl_shared_mem) {0};
 
-    for (int i = 0; i < ma->heaps.num; i++) {
-        if (heap_params_eq(&ma->heaps.elem[i].params, &fixed))
-            return &ma->heaps.elem[i];
+    for (int i = 0; i < ma->pools.num; i++) {
+        if (pool_params_eq(&ma->pools.elem[i].params, &fixed))
+            return &ma->pools.elem[i];
     }
 
     // Not found => add it
-    PL_ARRAY_GROW(ma, ma->heaps);
-    struct vk_heap *heap = &ma->heaps.elem[ma->heaps.num++];
-    *heap = (struct vk_heap) {
+    PL_ARRAY_GROW(ma, ma->pools);
+    size_t idx = ma->pools.num++;
+    ma->pools.elem[idx] = (struct vk_pool) {
         .params = fixed,
+        .index = idx,
     };
-    return heap;
+    return &ma->pools.elem[idx];
 }
 
-static inline bool region_fits(struct vk_region r, size_t size, size_t align)
-{
-    return PL_ALIGN(r.start, align) + size <= r.end;
-}
-
-// Finds the best-fitting region in a heap. If the heap is too small or too
-// fragmented, a new slab will be allocated under the hood.
-static bool heap_get_region(struct vk_malloc *ma, struct vk_heap *heap,
-                            size_t size, size_t align,
-                            struct vk_slab **out_slab, int *out_index)
+// Returns a suitable memory page from the pool. A new slab will be allocated
+// under the hood, if necessary.
+//
+// Note: This locks the slab it returns
+static struct vk_slab *pool_get_page(struct vk_malloc *ma, struct vk_pool *pool,
+                                     size_t size, size_t align,
+                                     VkDeviceSize *offset)
 {
     struct vk_slab *slab = NULL;
+    int slab_pages = MINIMUM_PAGE_COUNT;
+    size = PL_ALIGN2(size, PAGE_SIZE_ALIGN);
+    const size_t pagesize = PL_ALIGN(size, align);
 
-    for (int i = 0; i < heap->slabs.num; i++) {
-        slab = heap->slabs.elem[i];
-        if (slab->size < size)
+    for (int i = 0; i < pool->slabs.num; i++) {
+        slab = pool->slabs.elem[i];
+        if (slab->pagesize < size)
+            continue;
+        if (slab->pagesize > pagesize * MINIMUM_PAGE_COUNT) // rough heuristic
+            continue;
+        if (slab->pagesize % align)
             continue;
 
-        // Attempt a best fit search
-        int best = -1;
-        for (int n = 0; n < slab->regions.num; n++) {
-            struct vk_region r = slab->regions.elem[n];
-            if (!region_fits(r, size, align))
-                continue;
-            if (best >= 0 && region_len(r) > region_len(slab->regions.elem[best]))
-                continue;
-            best = n;
+        pl_mutex_lock(&slab->lock);
+        int page_idx = __builtin_ffsll(slab->spacemap);
+        if (!page_idx--) {
+            pl_mutex_unlock(&slab->lock);
+            // Increase the number of slabs to allocate for new slabs the
+            // more existing full slabs exist for this size range
+            slab_pages = PL_MIN(slab_pages << 1, MAXIMUM_PAGE_COUNT);
+            continue;
         }
 
-        if (best >= 0) {
-            *out_slab = slab;
-            *out_index = best;
-            return true;
-        }
+        slab->spacemap ^= 0x1LLU << page_idx;
+        *offset = page_idx * slab->pagesize;
+        return slab;
     }
 
     // Otherwise, allocate a new vk_slab and append it to the list.
-    size_t cur_size = PL_MAX(size, slab ? slab->size : 0);
-    size_t slab_size = PL_VK_HEAP_SLAB_GROWTH_RATE * cur_size;
-    slab_size = PL_MAX(PL_VK_HEAP_MINIMUM_SLAB_SIZE, slab_size);
-    slab_size = PL_MIN(PL_VK_HEAP_MAXIMUM_SLAB_SIZE, slab_size);
-    pl_assert(slab_size >= size);
+    VkDeviceSize slab_size = slab_pages * pagesize;
+    pl_static_assert(MINIMUM_SLAB_SIZE <= PAGE_SIZE_ALIGN * MAXIMUM_PAGE_COUNT);
+    slab_size = PL_CLAMP(slab_size, MINIMUM_SLAB_SIZE, MAXIMUM_SLAB_SIZE);
+    slab_pages = slab_size / pagesize;
 
-    struct vk_malloc_params params = heap->params;
+    struct vk_malloc_params params = pool->params;
     params.reqs.size = slab_size;
-    slab = slab_alloc(ma, &params);
-    if (!slab)
-        return false;
-    pl_assert(!slab->dedicated);
-    PL_ARRAY_APPEND(NULL, heap->slabs, slab);
 
-    // Return the only region there is in a newly allocated slab
-    pl_assert(slab->regions.num == 1);
-    *out_slab = slab;
-    *out_index = 0;
-    return true;
+    // Don't hold the lock while allocating the slab, because it can be a
+    // potentially very costly operation.
+    pl_mutex_unlock(&ma->lock);
+    slab = slab_alloc(ma, &params);
+    pl_mutex_lock(&ma->lock);
+    if (!slab)
+        return NULL;
+    pl_mutex_lock(&slab->lock);
+
+    slab->spacemap = (slab_pages == sizeof(uint64_t) * 8) ? ~0LLU : ~(~0LLU << slab_pages);
+    slab->pagesize = pagesize;
+    PL_ARRAY_APPEND(NULL, pool->slabs, slab);
+
+    // Return the first page in this newly allocated slab
+    slab->spacemap ^= 0x1;
+    *offset = 0;
+    return slab;
 }
 
 static bool vk_malloc_import(struct vk_malloc *ma, struct vk_memslice *out,
@@ -652,6 +782,7 @@ static bool vk_malloc_import(struct vk_malloc *ma, struct vk_memslice *out,
 
     if (params->buf_usage) {
         uint32_t qfs[3] = {0};
+        pl_assert(vk->pools.num <= PL_ARRAY_SIZE(qfs));
         for (int i = 0; i < vk->pools.num; i++)
             qfs[i] = vk->pools.elem[i]->qf;
 
@@ -745,19 +876,19 @@ static bool vk_malloc_import(struct vk_malloc *ma, struct vk_memslice *out,
     case PL_HANDLE_FD:
     case PL_HANDLE_WIN32:
     case PL_HANDLE_WIN32_KMT:
+    case PL_HANDLE_IOSURFACE:
+    case PL_HANDLE_MTL_TEX:
         PL_ERR(vk, "vk_malloc_import: unsupported handle type %d",
                params->import_handle);
         goto error;
     }
-
-    pl_assert(ainfo.pNext);
 
     if (!find_best_memtype(ma, reqs.memoryTypeBits, params, &ainfo.memoryTypeIndex)) {
         PL_ERR(vk, "No compatible memory types offered for imported memory!");
         goto error;
     }
 
-    VkDeviceMemory vkmem = NULL;
+    VkDeviceMemory vkmem = VK_NULL_HANDLE;
     VK(vk->AllocateMemory(vk->dev, &ainfo, PL_VK_ALLOC, &vkmem));
 
     slab = pl_alloc_ptr(NULL, slab);
@@ -767,9 +898,9 @@ static bool vk_malloc_import(struct vk_malloc *ma, struct vk_memslice *out,
         .imported = true,
         .buffer = buffer,
         .size = shmem->size,
-        .used = shmem->size,
         .handle_type = params->import_handle,
     };
+    pl_mutex_init(&slab->lock);
 
     *out = (struct vk_memslice) {
         .vkmem = vkmem,
@@ -783,21 +914,23 @@ static bool vk_malloc_import(struct vk_malloc *ma, struct vk_memslice *out,
     switch (params->import_handle) {
     case PL_HANDLE_DMA_BUF:
     case PL_HANDLE_FD:
-        PL_TRACE(vk, "Imported %zu of memory from fd: %d%s",
-                 (size_t) slab->size, shmem->handle.fd,
+        PL_TRACE(vk, "Imported %s bytes from fd: %d%s",
+                 PRINT_SIZE(slab->size), shmem->handle.fd,
                  params->ded_image ? " (dedicated)" : "");
         // fd ownership is transferred at this point.
         slab->handle.fd = fdinfo.fd;
         fdinfo.fd = -1;
         break;
     case PL_HANDLE_HOST_PTR:
-        PL_TRACE(vk, "Imported %zu of memory from ptr: %p%s",
-                 (size_t) slab->size, shmem->handle.ptr,
+        PL_TRACE(vk, "Imported %s bytes from ptr: %p%s",
+                 PRINT_SIZE(slab->size), shmem->handle.ptr,
                  params->ded_image ? " (dedicated" : "");
         slab->handle.ptr = ptrinfo.pHostPointer;
         break;
     case PL_HANDLE_WIN32:
     case PL_HANDLE_WIN32_KMT:
+    case PL_HANDLE_IOSURFACE:
+    case PL_HANDLE_MTL_TEX:
         break;
     }
 
@@ -808,11 +941,17 @@ static bool vk_malloc_import(struct vk_malloc *ma, struct vk_memslice *out,
         out->data = (uint8_t *) slab->data + out->offset;
         out->coherent = slab->coherent;
         if (!slab->coherent) {
+            // Use entire buffer range, since this is a dedicated memory
+            // allocation. This avoids issues with noncoherent atomicity
+            out->map_offset = 0;
+            out->map_size = VK_WHOLE_SIZE;
+
             // Mapping does not implicitly invalidate mapped memory
             VK(vk->InvalidateMappedMemoryRanges(vk->dev, 1, &(VkMappedMemoryRange) {
                 .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                 .memory = slab->mem,
-                .size = VK_WHOLE_SIZE,
+                .offset = out->map_offset,
+                .size = out->map_size,
             }));
         }
     }
@@ -823,6 +962,8 @@ static bool vk_malloc_import(struct vk_malloc *ma, struct vk_memslice *out,
     return true;
 
 error:
+    if (params->debug_tag)
+        PL_ERR(vk, "  for malloc: %s", params->debug_tag);
     vk->DestroyBuffer(vk->dev, buffer, PL_VK_ALLOC);
 #ifdef PL_HAVE_UNIX
     if (fdinfo.fd > -1)
@@ -833,6 +974,19 @@ error:
     return false;
 }
 
+size_t vk_malloc_avail(struct vk_malloc *ma, VkMemoryPropertyFlags flags)
+{
+    size_t avail = 0;
+    for (int i = 0; i < ma->props.memoryTypeCount; i++) {
+        const VkMemoryType *mtype = &ma->props.memoryTypes[i];
+        if ((mtype->propertyFlags & flags) != flags)
+            continue;
+        avail = PL_MAX(avail, ma->props.memoryHeaps[mtype->heapIndex].size);
+    }
+
+    return avail;
+}
+
 bool vk_malloc_slice(struct vk_malloc *ma, struct vk_memslice *out,
                      const struct vk_malloc_params *params)
 {
@@ -841,43 +995,45 @@ bool vk_malloc_slice(struct vk_malloc *ma, struct vk_memslice *out,
     if (params->import_handle)
         return vk_malloc_import(ma, out, params);
 
+    pl_assert(params->reqs.size);
     size_t size = params->reqs.size;
     size_t align = params->reqs.alignment;
-    align = pl_lcm(align, vk->limits.bufferImageGranularity);
+    align = pl_lcm(align, vk->props.limits.bufferImageGranularity);
+    align = pl_lcm(align, vk->props.limits.nonCoherentAtomSize);
 
     struct vk_slab *slab;
     VkDeviceSize offset;
-    if (params->ded_image || size >= PL_VK_HEAP_MAXIMUM_SLAB_SIZE) {
+
+    if (params->ded_image || size > ma->maximum_page_size) {
         slab = slab_alloc(ma, params);
         if (!slab)
             return false;
         slab->dedicated = true;
         offset = 0;
     } else {
-        struct vk_heap *heap = find_heap(ma, params);
-
-        int index_region;
-        if (!heap_get_region(ma, heap, size, align, &slab, &index_region))
+        pl_mutex_lock(&ma->lock);
+        struct vk_pool *pool = find_pool(ma, params);
+        slab = pool_get_page(ma, pool, size, align, &offset);
+        pl_mutex_unlock(&ma->lock);
+        if (!slab) {
+            PL_ERR(ma->vk, "No slab to serve request for %s bytes (with "
+                   "alignment 0x%zx) in pool %d!",
+                   PRINT_SIZE(size), align, pool->index);
             return false;
-
-        bool noncoherent = (slab->flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-                          !(slab->flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (noncoherent) {
-            size = PL_ALIGN(size, vk->limits.nonCoherentAtomSize);
-            align = pl_lcm(align, vk->limits.nonCoherentAtomSize);
         }
 
-        struct vk_region region = slab->regions.elem[index_region];
-        PL_ARRAY_REMOVE_AT(slab->regions, index_region);
-        offset = PL_ALIGN(region.start, align);
-        size_t out_end = offset + size;
-        insert_region(slab, (struct vk_region) { region.start, offset });
-        insert_region(slab, (struct vk_region) { out_end, region.end });
-
-        PL_TRACE(vk, "Sub-allocating slice %zu + %zu from slab with size %zu",
-                 (size_t) offset,  size, (size_t) slab->size);
+        // For accounting, just treat the alignment as part of the used size.
+        // Doing it this way makes sure that the sizes reported to vk_memslice
+        // consumers are always aligned properly.
+        size = PL_ALIGN(size, align);
+        slab->used += size;
+        slab->age = ma->age;
+        if (params->debug_tag)
+            slab->debug_tag = params->debug_tag;
+        pl_mutex_unlock(&slab->lock);
     }
 
+    pl_assert(offset % align == 0);
     *out = (struct vk_memslice) {
         .vkmem = slab->mem,
         .offset = offset,
@@ -885,6 +1041,8 @@ bool vk_malloc_slice(struct vk_malloc *ma, struct vk_memslice *out,
         .buf = slab->buffer,
         .data = slab->data ? (uint8_t *) slab->data + offset : 0x0,
         .coherent = slab->coherent,
+        .map_offset = slab->data ? offset : 0,
+        .map_size = slab->data ? size : 0,
         .priv = slab,
         .shared_mem = {
             .handle = slab->handle,
@@ -892,7 +1050,5 @@ bool vk_malloc_slice(struct vk_malloc *ma, struct vk_memslice *out,
             .size = slab->size,
         },
     };
-
-    slab->used += size;
     return true;
 }

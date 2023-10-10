@@ -1,5 +1,8 @@
 #include "tests.h"
 
+#include <libplacebo/dummy.h>
+#include <libplacebo/shaders/lut.h>
+
 static const char *luts[] = {
 
     "TITLE \"1D LUT example\"   \n"
@@ -58,17 +61,17 @@ static const char *luts[] = {
 
 int main()
 {
-    struct pl_context *ctx = pl_test_context();
-    const struct pl_gpu *gpu = pl_gpu_dummy_create(ctx, NULL);
-    struct pl_shader *sh = pl_shader_alloc(ctx, NULL);
-    struct pl_shader_obj *obj = NULL;
+    pl_log log = pl_test_logger();
+    pl_gpu gpu = pl_gpu_dummy_create(log, NULL);
+    pl_shader sh = pl_shader_alloc(log, NULL);
+    pl_shader_obj obj = NULL;
 
     for (int i = 0; i < PL_ARRAY_SIZE(luts); i++) {
         struct pl_custom_lut *lut;
-        lut = pl_lut_parse_cube(ctx, luts[i], strlen(luts[i]));
+        lut = pl_lut_parse_cube(log, luts[i], strlen(luts[i]));
         REQUIRE(lut);
 
-        pl_shader_reset(sh, &(struct pl_shader_params) { .gpu = gpu});
+        pl_shader_reset(sh, pl_shader_params( .gpu = gpu ));
         pl_shader_custom_lut(sh, lut, &obj);
         const struct pl_shader_res *res = pl_shader_finalize(sh);
         REQUIRE(res);
@@ -78,5 +81,6 @@ int main()
 
     pl_shader_obj_destroy(&obj);
     pl_shader_free(&sh);
-    pl_context_destroy(&ctx);
+    pl_gpu_dummy_destroy(&gpu);
+    pl_log_destroy(&log);
 }

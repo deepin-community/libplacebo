@@ -18,14 +18,37 @@
 #pragma once
 
 #include "../common.h"
-#include "../context.h"
+#include "../log.h"
 #include "../gpu.h"
+#include "pl_thread.h"
 
-#include <epoxy/gl.h>
+#include <libplacebo/opengl.h>
 
-#ifdef EPOXY_HAS_EGL
-#include <epoxy/egl.h>
-#endif
+// Collision with llvm-mingw <winnt.h>
+#undef MemoryBarrier
+
+#define GLAD_GL
+#define GLAD_GLES2
+#include <glad/gl.h>
+#include <glad/egl.h>
+
+typedef GladGLContext gl_funcs;
+
+// PL_PRIV(pl_opengl)
+struct gl_ctx {
+    pl_log log;
+    struct pl_opengl_params params;
+    bool is_debug;
+    bool is_debug_egl;
+    bool is_gles;
+
+    // For context locking
+    pl_mutex lock;
+    int count;
+
+    // Dispatch table
+    gl_funcs func;
+};
 
 struct gl_cb {
     void (*callback)(void *priv);
@@ -34,39 +57,10 @@ struct gl_cb {
 };
 
 struct fbo_format {
-    const struct pl_fmt *fmt;
+    pl_fmt fmt;
     const struct gl_format *glfmt;
 };
 
-// For gpu.priv
-struct pl_gl {
-    struct pl_gpu_fns impl;
-    bool failed;
-
-#ifdef EPOXY_HAS_EGL
-    // For import/export
-    EGLDisplay egl_dpy;
-    EGLContext egl_ctx;
-#endif
-
-    // Dynamic array of FBO formats, to ensure format uniqueness
-    PL_ARRAY(struct fbo_format) fbo_formats;
-
-    // Sync objects and associated callbacks
-    PL_ARRAY(struct gl_cb) callbacks;
-
-    // Incrementing counters to keep track of object uniqueness
-    int buf_id;
-
-    // Cached capabilities
-    int gl_ver;
-    int gles_ver;
-    bool has_fbos;
-    bool has_storage;
-    bool has_stride;
-    bool has_invalidate_fb;
-    bool has_invalidate_tex;
-    bool has_vao;
-    bool has_queries;
-    bool has_modifiers;
-};
+// For locking/unlocking
+bool gl_make_current(pl_opengl gl);
+void gl_release_current(pl_opengl gl);

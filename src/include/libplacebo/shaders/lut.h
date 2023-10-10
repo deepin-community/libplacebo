@@ -23,10 +23,16 @@
 #include <libplacebo/colorspace.h>
 #include <libplacebo/shaders.h>
 
+PL_API_BEGIN
+
+// Struct defining custom LUTs
+//
+// Note: Users may freely create their own instances of this struct, there is
+// nothing particularly special about `pl_lut_parse_cube`.
 struct pl_custom_lut {
     // Some unique signature identifying this LUT, needed to detect state
-    // changes (for cache invalidation). This could be anything that uniquely
-    // identifies the LUT, such as an incrementing counter or hash of the file.
+    // changes (for cache invalidation). This should ideally be a hash of the
+    // file contents. (Which is what `pl_lut_parse_*` will set it to.)
     uint64_t signature;
 
     // Size of each dimension, in the order R, G, B. For 1D LUTs, only the R
@@ -42,7 +48,7 @@ struct pl_custom_lut {
     // Extra input/output shaper matrices. Ignored if equal to {0}. This is
     // mostly useful for 1D LUTs, since 3D LUTs can bake the shaper matrix into
     // the LUT itself - but it can still help optimize LUT precision.
-    struct pl_matrix3x3 shaper_in, shaper_out;
+    pl_matrix3x3 shaper_in, shaper_out;
 
     // Nominal metadata for the input/output of a LUT. Left as {0} if unknown.
     // Note: This is purely informative, `pl_shader_custom_lut` ignores it.
@@ -51,11 +57,10 @@ struct pl_custom_lut {
 };
 
 // Parse a 3DLUT in .cube format. Returns NULL if the file fails parsing.
-struct pl_custom_lut *pl_lut_parse_cube(struct pl_context *ctx,
-                                        const char *str, size_t str_len);
+PL_API struct pl_custom_lut *pl_lut_parse_cube(pl_log log, const char *str, size_t str_len);
 
 // Frees a LUT created by `pl_lut_parse_*`.
-void pl_lut_free(struct pl_custom_lut **lut);
+PL_API void pl_lut_free(struct pl_custom_lut **lut);
 
 // Apply a `pl_custom_lut`. The user is responsible for ensuring colors going
 // into the LUT are in the expected format as informed by the LUT metadata.
@@ -65,7 +70,9 @@ void pl_lut_free(struct pl_custom_lut **lut);
 //
 // Note: `lut` does not have to be allocated by `pl_lut_parse_*`. It can be a
 // struct filled out by the user.
-void pl_shader_custom_lut(struct pl_shader *sh, const struct pl_custom_lut *lut,
-                          struct pl_shader_obj **lut_state);
+PL_API void pl_shader_custom_lut(pl_shader sh, const struct pl_custom_lut *lut,
+                                 pl_shader_obj *lut_state);
+
+PL_API_END
 
 #endif // LIBPLACEBO_SHADERS_LUT_H_

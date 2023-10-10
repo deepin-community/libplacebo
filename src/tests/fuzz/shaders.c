@@ -7,8 +7,7 @@ __AFL_FUZZ_INIT();
 
 int main()
 {
-    struct pl_context *ctx = pl_context_create(PL_API_VER, NULL);
-    const struct pl_gpu *gpu = pl_gpu_dummy_create(ctx, NULL);
+    pl_gpu gpu = pl_gpu_dummy_create(NULL, NULL);
 
 #define WIDTH 64
 #define HEIGHT 64
@@ -17,13 +16,13 @@ int main()
     static const float empty[HEIGHT][WIDTH][COMPS] = {0};
 
     struct pl_sample_src src = {
-        .tex = pl_tex_create(gpu, &(struct pl_tex_params) {
+        .tex = pl_tex_create(gpu, pl_tex_params(
             .format = pl_find_fmt(gpu, PL_FMT_FLOAT, COMPS, 0, 32, PL_FMT_CAP_SAMPLEABLE),
             .initial_data = empty,
             .sampleable = true,
             .w = WIDTH,
             .h = HEIGHT,
-        }),
+        )),
         .new_w = WIDTH * 2,
         .new_h = HEIGHT * 2,
     };
@@ -39,15 +38,15 @@ int main()
     while (__AFL_LOOP(10000)) {
 
 #define STACK_SIZE 16
-        struct pl_shader *stack[STACK_SIZE] = {0};
+        pl_shader stack[STACK_SIZE] = {0};
         int idx = 0;
 
-        stack[0] = pl_shader_alloc(ctx, &(struct pl_shader_params) {
+        stack[0] = pl_shader_alloc(NULL, pl_shader_params(
             .gpu = gpu,
-        });
+        ));
 
-        struct pl_shader *sh = stack[idx];
-        struct pl_shader_obj *polar = NULL, *ortho = NULL, *peak = NULL, *dither = NULL;
+        pl_shader sh = stack[idx];
+        pl_shader_obj polar = NULL, ortho = NULL, peak = NULL, dither = NULL;
 
         size_t len = __AFL_FUZZ_TESTCASE_LEN;
         for (size_t pos = 0; pos < len; pos++) {
@@ -60,15 +59,17 @@ int main()
                 pl_shader_deband(sh, &src, NULL);
                 break;
             case 'P':
-                pl_shader_sample_polar(sh, &src, &(struct pl_sample_filter_params) {
+                pl_shader_sample_polar(sh, &src, pl_sample_filter_params(
                     .filter = pl_filter_ewa_lanczos,
                     .lut = &polar,
-                });
-            case 'O':
-                pl_shader_sample_ortho(sh, PL_SEP_VERT, &src, &(struct pl_sample_filter_params) {
+                ));
+            case 'O': ;
+                struct pl_sample_src srcfix = src;
+                srcfix.new_w = WIDTH;
+                pl_shader_sample_ortho2(sh, &srcfix, pl_sample_filter_params(
                     .filter = pl_filter_spline36,
                     .lut = &ortho,
-                });
+                ));
                 break;
             case 'X':
                 pl_shader_custom(sh, &(struct pl_custom_shader) {
@@ -96,11 +97,11 @@ int main()
                                     pl_color_space_monitor, &peak, false);
                 break;
             case 'd':
-                pl_shader_dither(sh, 8, &dither, &(struct pl_dither_params) {
+                pl_shader_dither(sh, 8, &dither, pl_dither_params(
                     // Picked to speed up calculation
                     .method = PL_DITHER_ORDERED_LUT,
                     .lut_size = 2,
-                });
+                ));
                 break;
 
             // Push and pop subshader commands
@@ -110,10 +111,10 @@ int main()
 
                 idx++;
                 if (!stack[idx]) {
-                    stack[idx] = pl_shader_alloc(ctx, &(struct pl_shader_params) {
+                    stack[idx] = pl_shader_alloc(NULL, pl_shader_params(
                         .gpu = gpu,
                         .id = idx,
-                    });
+                    ));
                 }
                 sh = stack[idx];
                 break;
@@ -124,10 +125,10 @@ int main()
 
                 idx--;
                 sh_subpass(stack[idx], stack[idx + 1]);
-                pl_shader_reset(stack[idx + 1], &(struct pl_shader_params) {
+                pl_shader_reset(stack[idx + 1], pl_shader_params(
                     .gpu = gpu,
                     .id = idx + 1,
-                });
+                ));
                 sh = stack[idx];
                 break;
 
@@ -156,5 +157,4 @@ invalid:
 
     pl_tex_destroy(gpu, &src.tex);
     pl_gpu_dummy_destroy(&gpu);
-    pl_context_destroy(&ctx);
 }

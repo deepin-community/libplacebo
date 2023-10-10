@@ -22,29 +22,73 @@
 #include <libplacebo/colorspace.h>
 #include <libplacebo/filters.h>
 #include <libplacebo/gpu.h>
-#include <libplacebo/shaders/av1.h>
 #include <libplacebo/shaders/colorspace.h>
+#include <libplacebo/shaders/deinterlacing.h>
+#include <libplacebo/shaders/dithering.h>
+#include <libplacebo/shaders/film_grain.h>
+#include <libplacebo/shaders/icc.h>
+#include <libplacebo/shaders/lut.h>
 #include <libplacebo/shaders/sampling.h>
 #include <libplacebo/shaders/custom.h>
 #include <libplacebo/swapchain.h>
 
-struct pl_renderer;
+PL_API_BEGIN
+
+// Thread-safety: Unsafe
+typedef struct pl_renderer_t *pl_renderer;
+
+// Enum values used in pl_renderer_errors_t as a bit positions for error flags
+enum pl_render_error {
+    PL_RENDER_ERR_NONE              = 0,
+    PL_RENDER_ERR_FBO               = 1 << 0,
+    PL_RENDER_ERR_SAMPLING          = 1 << 1,
+    PL_RENDER_ERR_DEBANDING         = 1 << 2,
+    PL_RENDER_ERR_BLENDING          = 1 << 3,
+    PL_RENDER_ERR_OVERLAY           = 1 << 4,
+    PL_RENDER_ERR_PEAK_DETECT       = 1 << 5,
+    PL_RENDER_ERR_FILM_GRAIN        = 1 << 6,
+    PL_RENDER_ERR_FRAME_MIXING      = 1 << 7,
+    PL_RENDER_ERR_DEINTERLACING     = 1 << 8,
+    PL_RENDER_ERR_ERROR_DIFFUSION   = 1 << 9,
+    PL_RENDER_ERR_HOOKS             = 1 << 10,
+    PL_RENDER_ERR_CONTRAST_RECOVERY = 1 << 11,
+};
+
+// Struct describing current renderer state, including internal processing errors,
+// as well as list of signatures of disabled hooks.
+struct pl_render_errors {
+    enum pl_render_error errors;
+    // List containing signatures of disabled hooks
+    const uint64_t *disabled_hooks;
+    int num_disabled_hooks;
+};
 
 // Creates a new renderer object, which is backed by a GPU context. This is a
 // high-level object that takes care of the rendering chain as a whole, from
 // the source textures to the finished frame.
-struct pl_renderer *pl_renderer_create(struct pl_context *ctx,
-                                       const struct pl_gpu *gpu);
-void pl_renderer_destroy(struct pl_renderer **rr);
+PL_API pl_renderer pl_renderer_create(pl_log log, pl_gpu gpu);
+PL_API void pl_renderer_destroy(pl_renderer *rr);
 
 // Saves the internal shader cache of this renderer into an abstract cache
 // object that can be saved to disk and later re-loaded to speed up
 // recompilation of shaders. See `pl_dispatch_save` for more information.
-size_t pl_renderer_save(struct pl_renderer *rr, uint8_t *out_cache);
+PL_API size_t pl_renderer_save(pl_renderer rr, uint8_t *out_cache);
 
 // Load the result of a previous `pl_renderer_save` call. See
 // `pl_dispatch_load` for more information.
-void pl_renderer_load(struct pl_renderer *rr, const uint8_t *cache);
+//
+// Note: See the security warnings on `pl_pass_params.cached_program`.
+PL_API void pl_renderer_load(pl_renderer rr, const uint8_t *cache);
+
+// Returns current renderer state, see pl_render_errors.
+PL_API struct pl_render_errors pl_renderer_get_errors(pl_renderer rr);
+
+// Clears errors state of renderer. If `errors` is NULL, all render errors will
+// be cleared. Otherwise only selected errors/hooks will be cleared.
+// If `PL_RENDER_ERR_HOOKS` is set and `num_disabled_hooks` is 0, clear all hooks.
+// Otherwise only selected hooks will be cleard based on `disabled_hooks` array.
+PL_API void pl_renderer_reset_errors(pl_renderer rr,
+                                     const struct pl_render_errors *errors);
 
 enum pl_lut_type {
     PL_LUT_UNKNOWN = 0,
@@ -64,6 +108,25 @@ enum pl_lut_type {
     // LUT's tagged metadata, and otherwise falls back to PL_LUT_NATIVE.
 };
 
+enum pl_render_stage {
+    PL_RENDER_STAGE_FRAME,  // full frame redraws, for fresh/uncached frames
+    PL_RENDER_STAGE_BLEND,  // the output blend pass (only for pl_render_image_mix)
+    PL_RENDER_STAGE_COUNT,
+};
+
+struct pl_render_info {
+    const struct pl_dispatch_info *pass;    // information about the shader
+    enum pl_render_stage stage;             // the associated render stage
+
+    // This specifies the chronological index of this pass within the frame and
+    // stage (starting at `index == 0`).
+    int index;
+
+    // For PL_RENDER_STAGE_BLEND, this specifies the number of frames
+    // being blended (since that results in a different shader).
+    int count;
+};
+
 // Represents the options used for rendering. These affect the quality of
 // the result.
 struct pl_render_params {
@@ -81,6 +144,15 @@ struct pl_render_params {
     const struct pl_filter_config *upscaler;
     const struct pl_filter_config *downscaler;
 
+    // If set, this overrides the value of `upscaler`/`downscaling` for
+    // subsampled (chroma) planes. These scalers are used whenever the size of
+    // multiple different `pl_plane`s in a single `pl_frame` differ, requiring
+    // adaptation when converting to/from RGB. Note that a value of NULL simply
+    // means "no override". To force built-in scaling explicitly, set this to
+    // `&pl_filter_bilinear`.
+    const struct pl_filter_config *plane_upscaler;
+    const struct pl_filter_config *plane_downscaler;
+
     // The number of entries for the scaler LUTs. Defaults to 64 if left unset.
     int lut_entries;
 
@@ -93,13 +165,10 @@ struct pl_render_params {
     // this must be a filter config with `polar` set to false, since it's only
     // used for 1D mixing and thus only 1D filters are compatible.
     //
-    // As a special case, if `frame_mixer->kernel` is NULL, then libplacebo
-    // will use a built-in, inexpensive and relatively unobtrusive oversampling
-    // frame mixing algorithm. (See `pl_oversample_frame_mixer`)
-    //
     // If set to NULL, frame mixing is disabled, in which case
-    // `pl_render_image_mix` behaves as `pl_render_image`, also completely
-    // bypassing the mixing cache.
+    // `pl_render_image_mix` will use nearest-neighbour semantics. (Note that
+    // this still goes through the redraw cache, unless you also enable
+    // `skip_caching_single_frame`)
     const struct pl_filter_config *frame_mixer;
 
     // Configures the settings used to deband source textures. Leaving this as
@@ -132,6 +201,11 @@ struct pl_render_params {
     // as NULL disables dithering.
     const struct pl_dither_params *dither_params;
 
+    // Configures the error diffusion kernel to use for error diffusion
+    // dithering. If set, this will be used instead of `dither_params` whenever
+    // possible. Leaving this as NULL disables error diffusion.
+    const struct pl_error_diffusion_kernel *error_diffusion;
+
     // Configures the settings used to handle ICC profiles, if required. If
     // NULL, defaults to `&pl_icc_default_params`.
     const struct pl_icc_params *icc_params;
@@ -144,6 +218,26 @@ struct pl_render_params {
     // framebuffer contents will be blended using this blend mode. Requires
     // that the target format has PL_FMT_CAP_BLENDABLE. NULL disables blending.
     const struct pl_blend_params *blend_params;
+
+    // Configures the settings used to deinterlace frames (see
+    // `pl_frame.field`), if required.. If NULL, deinterlacing is "disabled",
+    // meaning interlaced frames are rendered as weaved frames instead.
+    //
+    // Note: As a consequence of how `pl_frame` represents individual fields,
+    // and especially when using the `pl_queue`, this will still result in
+    // frames being redundantly rendered twice. As such, it's highly
+    // recommended to, instead, fully disable deinterlacing by not marking
+    // source frames as interlaced in the first place.
+    const struct pl_deinterlace_params *deinterlace_params;
+
+    // If set, applies an extra distortion matrix to the image, after
+    // scaling and before presenting it to the screen. Can be used for e.g.
+    // fractional rotation.
+    //
+    // Note: The distortion canvas will be set to the size of `target->crop`,
+    // so this cannot effectively draw outside the specified target area,
+    // nor change the aspect ratio of the image.
+    const struct pl_distort_params *distort_params;
 
     // List of custom user shaders / hooks.
     // See <libplacebo/shaders/custom.h> for more information.
@@ -158,11 +252,31 @@ struct pl_render_params {
     // are scaled so 1.0 corresponds to the `pl_color_transfer_nominal_peak`.
     //
     // Note: A PL_LUT_CONVERSION fully replaces the color adaptation from
-    // `image` to `target`, including any tone-mapping (if necessary). It has
-    // the same representation as PL_LUT_NATIVE, so in this case the input
-    // and output are (respectively) non-linear light RGB.
+    // `image` to `target`, including any tone-mapping (if necessary) and ICC
+    // profiles. It has the same representation as PL_LUT_NATIVE, so in this
+    // case the input and output are (respectively) non-linear light RGB.
     const struct pl_custom_lut *lut;
     enum pl_lut_type lut_type;
+
+    // If the image being rendered does not span the entire size of the target,
+    // it will be cleared explicitly using this background color (RGB). To
+    // disable this logic, set `skip_target_clearing`.
+    float background_color[3];
+    float background_transparency; // 0.0 for opaque, 1.0 for fully transparent
+    bool skip_target_clearing;
+
+    // If set to a value above 0.0, the output will be rendered with rounded
+    // corners, as if an alpha transparency mask had been applied. The value
+    // indicates the relative fraction of the side length to round - a value
+    // of 1.0 rounds the corners as much as possible.
+    float corner_rounding;
+
+    // If true, then transparent images will made opaque by painting them
+    // against a checkerboard pattern consisting of alternating colors. If both
+    // colors are left as {0}, they default respectively to 93% and 87% gray.
+    bool blend_against_tiles;
+    float tile_colors[2][3];
+    int tile_size;
 
     // --- Performance / quality trade-off options:
     // These should generally be left off where quality is desired, as they can
@@ -182,17 +296,6 @@ struct pl_render_params {
     // `pl_sample_filter_params` for more information.
     float polar_cutoff;
 
-    // Skips dispatching the high-quality scalers for overlay textures, and
-    // always falls back to built-in GPU samplers. Note: The scalers are
-    // already disabled if the overlay texture does not need to be scaled.
-    bool disable_overlay_sampling;
-
-    // Allows the peak detection result to be delayed by up to a single frame,
-    // which can sometimes (not always) allow skipping some otherwise redundant
-    // sampling work. Only relevant when peak detection is active (i.e.
-    // params->peak_detect_params is set and the source is HDR).
-    bool allow_delayed_peak_detect;
-
     // Normally, when the size of the `target` used with `pl_render_image_mix`
     // changes, or the render parameters are updated, the internal cache of
     // mixed frames must be discarded in order to re-render all required
@@ -206,6 +309,12 @@ struct pl_render_params {
     // These may affect performance or may make debugging problems easier,
     // but shouldn't have any effect on the quality.
 
+    // Normally, `pl_render_image_mix` will also push single frames through the
+    // mixer cache, in order to speed up re-draws. Enabling this option
+    // disables that logic, causing single frames to bypass the cache. (Though
+    // it will still read from, if they happen to already be cached)
+    bool skip_caching_single_frame;
+
     // Disables linearization / sigmoidization before scaling. This might be
     // useful when tracking down unexpected image artifacts or excessing
     // ringing, but it shouldn't normally be necessary.
@@ -217,10 +326,8 @@ struct pl_render_params {
     // general-purpose ones.
     bool disable_builtin_scalers;
 
-    // Forces the use of an ICC 3DLUT, even in cases where the use of one is
-    // unnecessary. This is slower, but may improve the quality of the gamut
-    // reduction step, if one is performed.
-    bool force_icc_lut;
+    // Ignore ICC profiles attached to either `image` or `target`.
+    bool ignore_icc_profiles;
 
     // Forces the use of dithering, even when rendering to 16-bit FBOs. This is
     // generally pretty pointless because most 16-bit FBOs have high enough
@@ -228,39 +335,89 @@ struct pl_render_params {
     // but this can be used to test the dither code.
     bool force_dither;
 
+    // Disables the gamma-correct dithering logic which normally applies when
+    // dithering to low bit depths. No real use, outside of testing.
+    bool disable_dither_gamma_correction;
+
     // Completely overrides the use of FBOs, as if there were no renderable
     // texture format available. This disables most features.
     bool disable_fbos;
 
-    // --- Deprecated aliases
-    const struct pl_icc_params *lut3d_params PL_DEPRECATED; // fallback for `icc_params`
-    bool force_3dlut PL_DEPRECATED; // fallback for `force_icc_lut`
+    // Use only low-bit-depth FBOs (8 bits). Note that this also implies
+    // disabling linear scaling and sigmoidization.
+    bool force_low_bit_depth_fbos;
+
+    // If this is true, all shaders will be generated as "dynamic" shaders,
+    // with any compile-time constants being replaced by runtime-adjustable
+    // values. This is generally a performance loss, but has the advantage of
+    // being able to freely change parameters without triggering shader
+    // recompilations.
+    //
+    // It's a good idea to enable while presenting configurable settings to the
+    // user, but it should be set to false once those values are "dialed in".
+    bool dynamic_constants;
+
+    // This callback is invoked for every pass successfully executed in the
+    // process of rendering a frame. Optional.
+    //
+    // Note: `info` is only valid until this function returns.
+    void (*info_callback)(void *priv, const struct pl_render_info *info);
+    void *info_priv;
+
+    // --- Deprecated/removed fields
+    bool allow_delayed_peak_detect PL_DEPRECATED; // moved to pl_peak_detect_params
 };
+
+// Bare minimum parameters, with no features enabled. This is the fastest
+// possible configuration, and should therefore be fine on any system.
+#define PL_RENDER_DEFAULTS                              \
+    /* set a frame mixer for pl_render_image_mix */     \
+    .frame_mixer        = &pl_filter_oversample,        \
+    .color_map_params   = &pl_color_map_default_params, \
+    .lut_entries        = 64,                           \
+    .tile_colors        = {{0.93, 0.93, 0.93},          \
+                           {0.87, 0.87, 0.87}},         \
+    .tile_size          = 32,                           \
+    .polar_cutoff       = 0.001,
+
+#define pl_render_params(...) (&(struct pl_render_params) { PL_RENDER_DEFAULTS __VA_ARGS__ })
+PL_API extern const struct pl_render_params pl_render_fast_params;
 
 // This contains the default/recommended options for reasonable image quality,
 // while also not being too terribly slow. All of the *_params structs are
 // defaulted to the corresponding *_default_params, except for deband_params,
 // which is disabled by default.
 //
-// This should be fine on most integrated GPUs, but if it's too slow, consider
-// setting the params to {0} instead, or alternatively setting
-// `pl_render_params.disable_fbos` to true.
-extern const struct pl_render_params pl_render_default_params;
+// This should be fine on most integrated GPUs, but if it's too slow,
+// consider using `pl_render_fast_params` instead.
+PL_API extern const struct pl_render_params pl_render_default_params;
 
 // This contains a higher quality preset for better image quality at the cost
 // of quite a bit of performance. In addition to the settings implied by
 // `pl_render_default_params`, it sets the upscaler to `pl_filter_ewa_lanczos`,
-// and enables debanding. This should only really be used with a discrete GPU
-// and where maximum image quality is desired.
-extern const struct pl_render_params pl_render_high_quality_params;
+// enables debanding, and uses pl_*_high_quality_params structs where available.
+// This should only really be used with a discrete GPU and where maximum image
+// quality is desired.
+PL_API extern const struct pl_render_params pl_render_high_quality_params;
 
-// Special filter config for the built-in oversampling frame mixing algorithm.
-// This is equivalent to (struct pl_filter_config) {0}.
-extern const struct pl_filter_config pl_oversample_frame_mixer;
+// Special filter config for the built-in oversampling algorithm. This is an
+// opaque filter with no meaningful representation. though it has one tunable
+// parameter controlling the threshold at which to switch back to ordinary
+// nearest neighbour sampling. (See `pl_shader_sample_oversample`)
+PL_API extern const struct pl_filter_config pl_filter_oversample;
+
+// Backwards compatibility
+#define pl_oversample_frame_mixer pl_filter_oversample
 
 // A list of recommended frame mixer presets, terminated by {0}
-extern const struct pl_filter_preset pl_frame_mixers[];
-extern const int pl_num_frame_mixers; // excluding trailing {0}
+PL_API extern const struct pl_filter_preset pl_frame_mixers[];
+PL_API extern const int pl_num_frame_mixers; // excluding trailing {0}
+
+// A list of recommended scaler presets, terminated by {0}. This is almost
+// equivalent to `pl_filter_presets` with the exception of including extra
+// built-in filters that don't map to the `pl_filter` architecture.
+PL_API extern const struct pl_filter_preset pl_scale_filters[];
+PL_API extern const int pl_num_scale_filters; // excluding trailing {0}
 
 #define PL_MAX_PLANES 4
 
@@ -270,11 +427,25 @@ struct pl_plane {
     // The texture underlying this plane. The texture must be 2D, and must
     // have specific parameters set depending on what the plane is being used
     // for (see `pl_render_image`).
-    const struct pl_tex *texture;
+    pl_tex texture;
 
     // The preferred behaviour when sampling outside of this texture. Optional,
     // since the default (PL_TEX_ADDRESS_CLAMP) is very reasonable.
     enum pl_tex_address_mode address_mode;
+
+    // Controls whether or not the `texture` will be considered flipped
+    // vertically with respect to the overall image dimensions. It's generally
+    // preferable to flip planes using this setting instead of the crop in
+    // cases where the flipping is the result of e.g. negative plane strides or
+    // flipped framebuffers (OpenGL).
+    //
+    // Note that any planar padding (due to e.g. size mismatch or misalignment
+    // of subsampled planes) is always at the physical end of the texture
+    // (highest y coordinate) - even if this bool is true. However, any
+    // subsampling shift (`shift_y`) is applied with respect to the flipped
+    // direction. This ensures the correct interpretation when e.g. vertically
+    // flipping 4:2:0 sources by flipping all planes.
+    bool flipped;
 
     // Describes the number and interpretation of the components in this plane.
     // This defines the mapping from component index to the canonical component
@@ -328,34 +499,51 @@ enum pl_overlay_mode {
     PL_OVERLAY_MODE_COUNT,
 };
 
+enum pl_overlay_coords {
+    PL_OVERLAY_COORDS_AUTO = 0,  // equal to SRC/DST_FRAME, respectively
+    PL_OVERLAY_COORDS_SRC_FRAME, // relative to the raw src frame
+    PL_OVERLAY_COORDS_SRC_CROP,  // relative to the src frame crop
+    PL_OVERLAY_COORDS_DST_FRAME, // relative to the raw dst frame
+    PL_OVERLAY_COORDS_DST_CROP,  // relative to the dst frame crop
+    PL_OVERLAY_COORDS_COUNT,
+
+    // Note on rotations: If there is an end-to-end rotation between `src` and
+    // `dst`, then any overlays relative to SRC_FRAME or SRC_CROP will be
+    // rotated alongside the image, while overlays relative to DST_FRAME or
+    // DST_CROP will not.
+};
+
+struct pl_overlay_part {
+    pl_rect2df src; // source coordinate with respect to `pl_overlay.tex`
+    pl_rect2df dst; // target coordinates with respect to `pl_overlay.coords`
+
+    // If `mode` is PL_OVERLAY_MONOCHROME, then this specifies the color of
+    // this overlay part. The color is multiplied into the sampled texture's
+    // first channel.
+    float color[4];
+};
+
 // A struct representing an image overlay (e.g. for subtitles or on-screen
 // status messages, controls, ...)
 struct pl_overlay {
-    // The plane to overlay. Multi-plane overlays are not supported. If
-    // necessary, multiple planes can be combined by treating them as separate
-    // overlays with different base colors.
-    //
-    // Must have `params.sampleable` set, and it's recommended to also have the
-    // sample mode set to `PL_TEX_SAMPLE_LINEAR`.
-    //
-    // Note: shift_x/y are simply treated as a uniform sampling offset.
-    struct pl_plane plane;
-
-    // The (absolute) coordinates at which to render this overlay texture. May
-    // be flipped, and partially or wholly outside the image. If the size does
-    // not exactly match the texture, it will be scaled/stretched to fit.
-    struct pl_rect2d rect;
+    // The texture containing the backing data for overlay parts. Must have
+    // `params.sampleable` set.
+    pl_tex tex;
 
     // This controls the coloring mode of this overlay.
     enum pl_overlay_mode mode;
-    // If `mode` is PL_OVERLAY_MONOCHROME, then the texture is treated as an
-    // alpha map and multiplied by this base color. Ignored for the other modes.
-    float base_color[3];
+
+    // Controls which coordinates this overlay is addressed relative to.
+    enum pl_overlay_coords coords;
 
     // This controls the colorspace information for this overlay. The contents
     // of the texture / the value of `color` are interpreted according to this.
     struct pl_color_repr repr;
     struct pl_color_space color;
+
+    // The number of parts for this overlay.
+    const struct pl_overlay_part *parts;
+    int num_parts;
 };
 
 // High-level description of a complete frame, including metadata and planes
@@ -364,6 +552,43 @@ struct pl_frame {
     // carry several components and be of any size / offset.
     int num_planes;
     struct pl_plane planes[PL_MAX_PLANES];
+
+    // For interlaced frames. If set, this `pl_frame` corresponds to a single
+    // field of the underlying source textures. `first_field` indicates which
+    // of these fields is ordered first in time. `prev` and `next` should point
+    // to the previous/next frames in the file, or NULL if there are none.
+    //
+    // Note: Setting these fields on the render target has no meaning and will
+    // be ignored.
+    enum pl_field field;
+    enum pl_field first_field;
+    const struct pl_frame *prev, *next;
+
+    // If set, will be called immediately before GPU access to this frame. This
+    // function *may* be used to, for example, perform synchronization with
+    // external APIs (e.g. `pl_vulkan_hold/release`). If your mapping requires
+    // a memcpy of some sort (e.g. pl_tex_transfer), users *should* instead do
+    // the memcpy up-front and avoid the use of these callbacks - because they
+    // might be called multiple times on the same frame.
+    //
+    // This function *may* arbitrarily mutate the `pl_frame`, but it *should*
+    // ideally only update `planes` - in particular, color metadata and so
+    // forth should be provided up-front as best as possible. Note that changes
+    // here will not be reflected back to the structs provided in the original
+    // `pl_render_*` call (e.g. via `pl_frame_mix`).
+    //
+    // Note: Unless dealing with interlaced frames, only one frame will ever be
+    // acquired at a time per `pl_render_*` call. So users *can* safely use
+    // this with, for example, hwdec mappers that can only map a single frame
+    // at a time. When using this with, for example, `pl_render_image_mix`,
+    // each frame to be blended is acquired and release in succession, before
+    // moving on to the next frame. For interlaced frames, the previous and
+    // next frames must also be acquired simultaneously.
+    bool (*acquire)(pl_gpu gpu, struct pl_frame *frame);
+
+    // If set, will be called after a plane is done being used by the GPU,
+    // *including* after any errors (e.g. `acquire` returning false).
+    void (*release)(pl_gpu gpu, struct pl_frame *frame);
 
     // Color representation / encoding / semantics of this frame.
     struct pl_color_repr repr;
@@ -386,16 +611,34 @@ struct pl_frame {
     // Note that `pl_render_image` will map the input crop directly to the
     // output crop, stretching and scaling as needed. If you wish to preserve
     // the aspect ratio, use a dedicated function like pl_rect2df_aspect_copy.
-    struct pl_rect2df crop;
+    pl_rect2df crop;
 
-    // A list of additional overlays to render directly on top of this frame.
-    // These overlays will be treated as though they were part of the frame
-    // data, and can be used for things like subtitles or on-screen displays.
+    // Logical rotation of the image, with respect to the underlying planes.
+    // For example, if this is PL_ROTATION_90, then the image will be rotated
+    // to the right by 90° when mapping to `crop`. The actual position on-screen
+    // is unaffected, so users should ensure that the (rotated) aspect ratio
+    // matches the source. (Or use a helper like `pl_rect2df_aspect_set_rot`)
+    //
+    // Note: For `target` frames, this corresponds to a rotation of the
+    // display, for `image` frames, this corresponds to a rotation of the
+    // camera.
+    //
+    // So, as an example, target->rotation = PL_ROTATE_90 means the end user
+    // has rotated the display to the right by 90° (meaning rendering will be
+    // rotated 90° to the *left* to compensate), and image->rotation =
+    // PL_ROTATE_90 means the video provider has rotated the camera to the
+    // right by 90° (so rendering will be rotated 90° to the *right* to
+    // compensate).
+    pl_rotation rotation;
+
+    // A list of additional overlays associated with this frame. Note that will
+    // be rendered directly onto intermediate/cache frames, so changing any of
+    // these overlays may require flushing the renderer cache.
     const struct pl_overlay *overlays;
     int num_overlays;
 
     // Note on subsampling and plane correspondence: All planes belonging to
-    // the same frame will only be streched by an integer multiple (or inverse
+    // the same frame will only be stretched by an integer multiple (or inverse
     // thereof) in order to match the reference dimensions of this image. For
     // example, suppose you have an 8x4 image. A valid plane scaling would be
     // 4x2 -> 8x4 or 4x4 -> 4x4, but not 6x4 -> 8x4. So if a 6x4 plane is
@@ -410,73 +653,43 @@ struct pl_frame {
     // treated by libplacebo as an oversized chroma plane - i.e. the plane
     // would get sampled as if it was 17.5 pixels wide and 11.5 pixels large.
 
-    // Associated AV1 grain params (see <libplacebo/shaders/av1.h>). This is
-    // entirely optional, the default of {0} corresponds to no extra grain.
+    // Associated film grain data (see <libplacebo/shaders/film_grain.h>).
     //
     // Note: This is ignored for the `target` of `pl_render_image`, since
     // un-applying grain makes little sense.
-    struct pl_av1_grain_data av1_grain;
+    struct pl_film_grain_data film_grain;
 
-    // Deprecated fields provided merely for backwards compatibility. The
-    // use of these should be discontinued as soon as possible.
-    int width PL_DEPRECATED; // ignored
-    int height PL_DEPRECATED;
-    uint64_t signature PL_DEPRECATED; // ignored
-    const struct pl_tex *fbo PL_DEPRECATED; // fallback for `target.planes`
-    struct pl_rect2df src_rect PL_DEPRECATED; // fallback for `image.crop`
-    struct pl_rect2df dst_rect PL_DEPRECATED; // fallback for `target.crop`
+    // Ignored by libplacebo. May be useful for users.
+    void *user_data;
 };
 
 // Helper function to infer the chroma location offset for each plane in a
 // frame. This is equivalent to calling `pl_chroma_location_offset` on all
 // subsampled planes' shift_x/shift_y variables.
-void pl_frame_set_chroma_location(struct pl_frame *frame,
-                                  enum pl_chroma_location chroma_loc);
+PL_API void pl_frame_set_chroma_location(struct pl_frame *frame,
+                                         enum pl_chroma_location chroma_loc);
 
 // Fills in a `pl_frame` based on a swapchain frame's FBO and metadata.
-void pl_frame_from_swapchain(struct pl_frame *out_frame,
-                             const struct pl_swapchain_frame *frame);
+PL_API void pl_frame_from_swapchain(struct pl_frame *out_frame,
+                                    const struct pl_swapchain_frame *frame);
 
 // Helper function to determine if a frame is logically cropped or not. In
 // particular, this is useful in determining whether or not an output frame
 // needs to be cleared before rendering or not.
-bool pl_frame_is_cropped(const struct pl_frame *frame);
+PL_API bool pl_frame_is_cropped(const struct pl_frame *frame);
 
 // Helper function to reset a frame to a given RGB color. If the frame's
 // color representation is something other than RGB, the clear color will
-// be adjusted accordingly.
-//
-// Note: For sake of simplicity, this function only works with opaque clears,
-// i.e. A=1. If you need to clear to transparent colors, use `pl_tex_clear`.
-void pl_frame_clear(const struct pl_gpu *gpu, const struct pl_frame *frame,
-                    const float clear_color[3]);
+// be adjusted accordingly. `clear_color` should be non-premultiplied.
+PL_API void pl_frame_clear_rgba(pl_gpu gpu, const struct pl_frame *frame,
+                                const float clear_color[4]);
 
-// Deprecated aliases, provided for backwards compatibility
-#define pl_image pl_frame
-#define pl_render_target pl_frame
-
-static PL_DEPRECATED inline void pl_image_set_chroma_location(
-        struct pl_frame *frame, enum pl_chroma_location chroma_loc)
+// Like `pl_frame_clear_rgba` but without an alpha channel.
+static inline void pl_frame_clear(pl_gpu gpu, const struct pl_frame *frame,
+                                  const float clear_color[3])
 {
-    return pl_frame_set_chroma_location(frame, chroma_loc);
-}
-
-static PL_DEPRECATED inline void pl_render_target_set_chroma_location(
-        struct pl_frame *frame, enum pl_chroma_location chroma_loc)
-{
-    return pl_frame_set_chroma_location(frame, chroma_loc);
-}
-
-static PL_DEPRECATED inline void pl_render_target_from_swapchain(
-        struct pl_frame *out_frame, const struct pl_swapchain_frame *frame)
-{
-    return pl_frame_from_swapchain(out_frame, frame);
-}
-
-static PL_DEPRECATED inline bool pl_render_target_partial(
-        const struct pl_frame *frame)
-{
-    return pl_frame_is_cropped(frame);
+    const float clear_color_rgba[4] = { clear_color[0], clear_color[1], clear_color[2], 1.0 };
+    pl_frame_clear_rgba(gpu, frame, clear_color_rgba);
 }
 
 // Render a single image to a target using the given parameters. This is
@@ -501,9 +714,12 @@ static PL_DEPRECATED inline bool pl_render_target_partial(
 // which means they get affected by things like scaling and frame mixing.
 // `target.overlays` will also be rendered, but directly onto the target. They
 // don't even need to be inside `target.crop`.
-bool pl_render_image(struct pl_renderer *rr, const struct pl_frame *image,
-                     const struct pl_frame *target,
-                     const struct pl_render_params *params);
+//
+// Note: `image` may be NULL, in which case `target.overlays` will still be
+// rendered, but nothing else.
+PL_API bool pl_render_image(pl_renderer rr, const struct pl_frame *image,
+                            const struct pl_frame *target,
+                            const struct pl_render_params *params);
 
 // Flushes the internal state of this renderer. This is normally not needed,
 // even if the image parameters, colorspace or target configuration change,
@@ -512,7 +728,7 @@ bool pl_render_image(struct pl_renderer *rr, const struct pl_frame *image,
 // purge some state related to things like HDR peak detection or frame mixing,
 // so calling it is a good idea if the content source is expected to change
 // dramatically (e.g. when switching to a different file).
-void pl_renderer_flush_cache(struct pl_renderer *rr);
+PL_API void pl_renderer_flush_cache(pl_renderer rr);
 
 // Represents a mixture of input frames, distributed temporally.
 //
@@ -523,7 +739,8 @@ struct pl_frame_mix {
     // sufficient to meet the needs of the configured frame mixer. See the
     // section below for more information.
     //
-    // At least one frame is always required, i.e. `num_frames > 0`.
+    // If the number of frames is 0, this call will be equivalent to
+    // `pl_render_image` with `image == NULL`.
     int num_frames;
 
     // A list of the frames themselves. The frames can have different
@@ -584,9 +801,11 @@ struct pl_frame_mix {
 // Helper function to calculate the frame mixing radius.
 static inline float pl_frame_mix_radius(const struct pl_render_params *params)
 {
-    return (params->frame_mixer && params->frame_mixer->kernel)
-        ? params->frame_mixer->kernel->radius
-        : 0.0;
+    // For backwards compatibility, allow !frame_mixer->kernel
+    if (!params->frame_mixer || !params->frame_mixer->kernel)
+        return 0.0;
+
+    return params->frame_mixer->kernel->radius;
 }
 
 // Render a mixture of images to the target using the given parameters. This
@@ -597,8 +816,10 @@ static inline float pl_frame_mix_radius(const struct pl_render_params *params)
 // This allows libplacebo to perform rudimentary frame mixing / interpolation,
 // in order to eliminate judder artifacts typically associated with
 // source/display frame rate mismatch.
-bool pl_render_image_mix(struct pl_renderer *rr, const struct pl_frame_mix *images,
-                         const struct pl_frame *target,
-                         const struct pl_render_params *params);
+PL_API bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
+                                const struct pl_frame *target,
+                                const struct pl_render_params *params);
+
+PL_API_END
 
 #endif // LIBPLACEBO_RENDERER_H_

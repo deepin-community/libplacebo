@@ -5,19 +5,23 @@
 
 struct window {
     const struct window_impl *impl;
-    const struct pl_swapchain *swapchain;
-    const struct pl_gpu *gpu;
+    pl_swapchain swapchain;
+    pl_gpu gpu;
     bool window_lost;
 };
 
-enum winflags {
-    WIN_ALPHA,
-    WIN_HDR,
+struct window_params {
+    const char *title;
+    int width;
+    int height;
+    const char *forced_impl;
+
+    // initial color space
+    struct pl_swapchain_colors colors;
+    bool alpha;
 };
 
-struct window *window_create(struct pl_context *ctx, const char *title,
-                             int width, int height, enum winflags flags);
-
+struct window *window_create(pl_log log, const struct window_params *params);
 void window_destroy(struct window **win);
 
 // Poll/wait for window events
@@ -30,19 +34,30 @@ enum button {
     BTN_MIDDLE,
 };
 
+enum key {
+    KEY_ESC,
+};
+
 void window_get_cursor(const struct window *win, int *x, int *y);
 void window_get_scroll(const struct window *win, float *dx, float *dy);
 bool window_get_button(const struct window *win, enum button);
+bool window_get_key(const struct window *win, enum key);
 char *window_get_file(const struct window *win);
+bool window_toggle_fullscreen(const struct window *win, bool fullscreen);
+bool window_is_fullscreen(const struct window *win);
 
 // For implementations
 struct window_impl {
     const char *name;
+    const char *tag;
     __typeof__(window_create) *create;
     __typeof__(window_destroy) *destroy;
     __typeof__(window_poll) *poll;
     __typeof__(window_get_cursor) *get_cursor;
     __typeof__(window_get_scroll) *get_scroll;
     __typeof__(window_get_button) *get_button;
+    __typeof__(window_get_key) *get_key;
     __typeof__(window_get_file) *get_file;
+    __typeof__(window_toggle_fullscreen) *toggle_fullscreen;
+    __typeof__(window_is_fullscreen) *is_fullscreen;
 };

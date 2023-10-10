@@ -13,18 +13,18 @@ struct ui_vertex {
 #define NUM_VERTEX_ATTRIBS 3
 
 struct ui {
-    const struct pl_gpu *gpu;
-    struct pl_dispatch *dp;
+    pl_gpu gpu;
+    pl_dispatch dp;
     struct nk_context nk;
     struct nk_font_atlas atlas;
     struct nk_buffer cmds, verts, idx;
-    const struct pl_tex *font_tex;
+    pl_tex font_tex;
     struct pl_vertex_attrib attribs_pl[NUM_VERTEX_ATTRIBS];
     struct nk_draw_vertex_layout_element attribs_nk[NUM_VERTEX_ATTRIBS+1];
     struct nk_convert_config convert_cfg;
 };
 
-struct ui *ui_create(const struct pl_gpu *gpu)
+struct ui *ui_create(pl_gpu gpu)
 {
     struct ui *ui = malloc(sizeof(struct ui));
     if (!ui)
@@ -32,7 +32,7 @@ struct ui *ui_create(const struct pl_gpu *gpu)
 
     *ui = (struct ui) {
         .gpu = gpu,
-        .dp = pl_dispatch_create(gpu->ctx, gpu),
+        .dp = pl_dispatch_create(gpu->log, gpu),
         .attribs_pl = {
             {
                 .name = "pos",
@@ -76,10 +76,11 @@ struct ui *ui_create(const struct pl_gpu *gpu)
         .sampleable = true,
         .initial_data = nk_font_atlas_bake(&ui->atlas, &tparams.w, &tparams.h,
                                            NK_FONT_ATLAS_ALPHA8),
+        .debug_tag = PL_DEBUG_TAG,
     };
     ui->font_tex = pl_tex_create(gpu, &tparams);
     nk_font_atlas_end(&ui->atlas, nk_handle_ptr((void *) ui->font_tex),
-                      &ui->convert_cfg.null);
+                      &ui->convert_cfg.tex_null);
     nk_font_atlas_cleanup(&ui->atlas);
 
     if (!ui->font_tex)
@@ -154,9 +155,10 @@ bool ui_draw(struct ui *ui, const struct pl_swapchain_frame *frame)
         if (!cmd->elem_count)
             continue;
 
-        struct pl_shader *sh = pl_dispatch_begin(ui->dp);
+        pl_shader sh = pl_dispatch_begin(ui->dp);
         pl_shader_custom(sh, &(struct pl_custom_shader) {
-            .body = "color = texture(ui_tex, coord).r * vcolor;",
+            .description = "nuklear UI",
+            .body = "color = textureLod(ui_tex, coord, 0.0).r * vcolor;",
             .output = PL_SHADER_SIG_COLOR,
             .num_descriptors = 1,
             .descriptors = &(struct pl_shader_desc) {
@@ -171,7 +173,14 @@ bool ui_draw(struct ui *ui, const struct pl_swapchain_frame *frame)
             },
         });
 
-        bool ok = pl_dispatch_vertex(ui->dp, &(struct pl_dispatch_vertex_params) {
+        struct pl_color_repr repr = frame->color_repr;
+        pl_shader_color_map_ex(sh, NULL, pl_color_map_args(
+            .src = pl_color_space_srgb,
+            .dst = frame->color_space,
+        ));
+        pl_shader_encode_color(sh, &repr);
+
+        bool ok = pl_dispatch_vertex(ui->dp, pl_dispatch_vertex_params(
             .shader = &sh,
             .target = frame->fbo,
             .blend_params = &pl_alpha_overlay,
@@ -191,7 +200,8 @@ bool ui_draw(struct ui *ui, const struct pl_swapchain_frame *frame)
             .vertex_count = cmd->elem_count,
             .vertex_data = vertices,
             .index_data = indices,
-        });
+            .index_fmt = PL_INDEX_UINT32,
+        ));
 
         if (!ok) {
             fprintf(stderr, "placebo: failed rendering UI!\n");

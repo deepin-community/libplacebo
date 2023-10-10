@@ -1,3 +1,113 @@
+libplacebo (6.292.1-1) unstable; urgency=medium
+
+  * New upstream version 6.292.1
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Wed, 23 Aug 2023 00:09:09 +0200
+
+libplacebo (6.292.0-2) unstable; urgency=medium
+
+  * Upload to unstable
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Tue, 01 Aug 2023 00:13:50 +0200
+
+libplacebo (6.292.0-1) experimental; urgency=medium
+
+  * New upstream version 6.292.0
+    - Fix build with recent vulkan (Closes: #1042190)
+  * SONAME bump: libplacebo229 -> libplacebo292
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Thu, 27 Jul 2023 00:57:02 +0200
+
+libplacebo (5.229.2-1) experimental; urgency=medium
+
+  * New upstream version 5.229.2
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Sun, 05 Feb 2023 20:57:27 +0100
+
+libplacebo (5.229.1-1) experimental; urgency=medium
+
+  * New upstream version 5.229.1
+  * SONAME bump: libplacebo208 -> libplacebo229
+  * debian/control:
+    - Bump Standards-Version
+    - Update build dependencies
+  * debian/patches: Remove patches included upstream
+  * debian/copyright: Update for 5.229
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Thu, 29 Dec 2022 15:20:45 +0100
+
+libplacebo (4.208.0-3) unstable; urgency=medium
+
+  * debian/patches: Apply upstream fix for FTBFS with latest glslang (Closes:
+    #1025363)
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Sat, 03 Dec 2022 12:49:05 +0100
+
+libplacebo (4.208.0-2) unstable; urgency=medium
+
+  * Upload to unstable
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Tue, 20 Sep 2022 00:50:00 +0200
+
+libplacebo (4.208.0-1) experimental; urgency=medium
+
+  * New upstream version 4.208.0
+  * SONAME bump: libplacebo19 -> libplacebo208
+  * debian/control: Bump Standards-Version
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Wed, 17 Aug 2022 21:45:37 +0200
+
+libplacebo (4.192.1-1) unstable; urgency=medium
+
+  [ Debian Janitor ]
+  * Set upstream metadata fields: Repository.
+  * Remove constraints unnecessary since buster
+
+  [ Sebastian Ramacher ]
+  * New upstream version 4.192.1
+  * debian/rules: Revert "Link libatomic on armel and mipsel"
+    The new upstream release now links libatomic if necessary.
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Mon, 07 Feb 2022 22:04:14 +0100
+
+libplacebo (4.192.0-2) unstable; urgency=medium
+
+  * Upload to unstable
+  * debian/control: Fix build-dependencies on libav* and mark them as
+    <!nocheck>
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Wed, 02 Feb 2022 16:24:50 +0100
+
+libplacebo (4.192.0-1) experimental; urgency=medium
+
+  * New upstream version 4.192.0
+  * SONAME bump: libplacebo157 -> libplacebo192
+  * debian/rules: Disable build of demos
+  * debian/copyright: Update paths after upstream file renaming
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Sat, 22 Jan 2022 00:10:07 +0100
+
+libplacebo (4.157.0-3) unstable; urgency=medium
+
+  * debian/rules: Link libatomic on armel and mipsel
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Sun, 16 Jan 2022 00:07:56 +0100
+
+libplacebo (4.157.0-2) unstable; urgency=medium
+
+  * Upload to unstable
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Sat, 15 Jan 2022 19:00:33 +0100
+
+libplacebo (4.157.0-1) experimental; urgency=medium
+
+  * New upstream release
+  * Bump SONAME: libplacebo120 -> libplacebo157
+  * debian/control: Bump Standards-Version
+  * debian/patches: Removed, included upstream
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Fri, 10 Sep 2021 22:30:31 +0200
+
 libplacebo (3.120.3-2) unstable; urgency=medium
 
   * Upload to unstable

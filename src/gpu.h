@@ -18,7 +18,10 @@
 #pragma once
 
 #include "common.h"
-#include "context.h"
+#include "log.h"
+
+#include <libplacebo/gpu.h>
+#include <libplacebo/dispatch.h>
 
 // To avoid having to include drm_fourcc.h
 #ifndef DRM_FORMAT_MOD_LINEAR
@@ -31,19 +34,26 @@
 
 #define GPU_PFN(name) __typeof__(pl_##name) *name
 struct pl_gpu_fns {
+    // This is a pl_dispatch used (on the pl_gpu itself!) for the purposes of
+    // dispatching compute shaders for performing various emulation tasks (e.g.
+    // partial clears, blits or emulated texture transfers, see below).
+    //
+    // Warning: Care must be taken to avoid recursive calls.
+    pl_dispatch dp;
+
     // Destructors: These also free the corresponding objects, but they
     // must not be called on NULL. (The NULL checks are done by the pl_*_destroy
     // wrappers)
-    void (*destroy)(const struct pl_gpu *gpu);
-    void (*tex_destroy)(const struct pl_gpu *, const struct pl_tex *);
-    void (*buf_destroy)(const struct pl_gpu *, const struct pl_buf *);
-    void (*pass_destroy)(const struct pl_gpu *, const struct pl_pass *);
-    void (*sync_destroy)(const struct pl_gpu *, const struct pl_sync *);
-    void (*timer_destroy)(const struct pl_gpu *, struct pl_timer *);
+    void (*destroy)(pl_gpu gpu);
+    void (*tex_destroy)(pl_gpu, pl_tex);
+    void (*buf_destroy)(pl_gpu, pl_buf);
+    void (*pass_destroy)(pl_gpu, pl_pass);
+    void (*sync_destroy)(pl_gpu, pl_sync);
+    void (*timer_destroy)(pl_gpu, pl_timer);
 
     GPU_PFN(tex_create);
     GPU_PFN(tex_invalidate); // optional
-    GPU_PFN(tex_clear); // optional if no blittable formats
+    GPU_PFN(tex_clear_ex); // optional if no blittable formats
     GPU_PFN(tex_blit); // optional if no blittable formats
     GPU_PFN(tex_upload);
     GPU_PFN(tex_download);
@@ -69,11 +79,11 @@ struct pl_gpu_fns {
 
 // All resources such as textures and buffers allocated from the GPU must be
 // destroyed before calling pl_destroy.
-void pl_gpu_destroy(const struct pl_gpu *gpu);
+void pl_gpu_destroy(pl_gpu gpu);
 
 // Returns true if the device supports interop. This is considered to be
 // the case if at least one of `gpu->export/import_caps` is nonzero.
-static inline bool pl_gpu_supports_interop(const struct pl_gpu *gpu)
+static inline bool pl_gpu_supports_interop(pl_gpu gpu)
 {
     return gpu->export_caps.tex ||
            gpu->import_caps.tex ||
@@ -83,49 +93,87 @@ static inline bool pl_gpu_supports_interop(const struct pl_gpu *gpu)
            gpu->import_caps.sync;
 }
 
+// Returns the GPU-internal `pl_dispatch` object.
+pl_dispatch pl_gpu_dispatch(pl_gpu gpu);
+
 // GPU-internal helpers: these should not be used outside of GPU implementations
 
-// Log some metadata about the created GPU, and perform verification
-void pl_gpu_print_info(const struct pl_gpu *gpu);
-
-// Sort the pl_fmt list into an optimal order. This tries to prefer formats
-// supporting more capabilities, while also trying to maintain a sane order in
-// terms of bit depth / component index.
-void pl_gpu_sort_formats(struct pl_gpu *gpu);
+// This performs several tasks. It sorts the format list, logs GPU metadata,
+// performs verification and fixes up backwards compatibility fields. This
+// should be returned as the last step when creating a `pl_gpu`.
+pl_gpu pl_gpu_finalize(struct pl_gpu_t *gpu);
 
 // Look up the right GLSL image format qualifier from a partially filled-in
 // pl_fmt, or NULL if the format does not have a legal matching GLSL name.
 //
 // `components` may differ from fmt->num_components (for emulated formats)
-const char *pl_fmt_glsl_format(const struct pl_fmt *fmt, int components);
+const char *pl_fmt_glsl_format(pl_fmt fmt, int components);
 
 // Look up the right fourcc from a partially filled-in pl_fmt, or 0 if the
 // format does not have a legal matching fourcc format.
-uint32_t pl_fmt_fourcc(const struct pl_fmt *fmt);
+uint32_t pl_fmt_fourcc(pl_fmt fmt);
 
 // Compute the total size (in bytes) of a texture transfer operation
 size_t pl_tex_transfer_size(const struct pl_tex_transfer_params *par);
 
 // Helper that wraps pl_tex_upload/download using texture upload buffers to
 // ensure that params->buf is always set.
-bool pl_tex_upload_pbo(const struct pl_gpu *gpu,
-                       const struct pl_tex_transfer_params *params);
-bool pl_tex_download_pbo(const struct pl_gpu *gpu,
-                         const struct pl_tex_transfer_params *params);
+bool pl_tex_upload_pbo(pl_gpu gpu, const struct pl_tex_transfer_params *params);
+bool pl_tex_download_pbo(pl_gpu gpu, const struct pl_tex_transfer_params *params);
 
 // This requires that params.buf has been set and is of type PL_BUF_TEXEL_*
-bool pl_tex_upload_texel(const struct pl_gpu *gpu, struct pl_dispatch *dp,
-                         const struct pl_tex_transfer_params *params);
-bool pl_tex_download_texel(const struct pl_gpu *gpu, struct pl_dispatch *dp,
-                           const struct pl_tex_transfer_params *params);
+bool pl_tex_upload_texel(pl_gpu gpu, const struct pl_tex_transfer_params *params);
+bool pl_tex_download_texel(pl_gpu gpu, const struct pl_tex_transfer_params *params);
 
-void pl_pass_run_vbo(const struct pl_gpu *gpu,
-                     const struct pl_pass_run_params *params);
+// Both `src` and `dst must be storable. `src` must also be sampleable, if the
+// blit requires linear sampling. Returns false if these conditions are unmet.
+bool pl_tex_blit_compute(pl_gpu gpu, const struct pl_tex_blit_params *params);
+
+// Helper to do a 2D blit with stretch and scale using a raster pass
+void pl_tex_blit_raster(pl_gpu gpu, const struct pl_tex_blit_params *params);
+
+// Helper for GPU-accelerated endian swapping
+//
+// Note: `src` and `dst` can be the same buffer, for an in-place operation. In
+// this case, `src_offset` and `dst_offset` must be the same.
+struct pl_buf_copy_swap_params {
+    // Source of the copy operation. Must be `storable`.
+    pl_buf src;
+    size_t src_offset;
+
+    // Destination of the copy operation. Must be `storable`.
+    pl_buf dst;
+    size_t dst_offset;
+
+    // Number of bytes to copy. Must be a multiple of 4.
+    size_t size;
+
+    // Underlying word size. Must be 2 (for 16-bit swap) or 4 (for 32-bit swap)
+    int wordsize;
+};
+
+bool pl_buf_copy_swap(pl_gpu gpu, const struct pl_buf_copy_swap_params *params);
+
+void pl_pass_run_vbo(pl_gpu gpu, const struct pl_pass_run_params *params);
 
 // Make a deep-copy of the pass params. Note: cached_program etc. are not
 // copied, but cleared explicitly.
-struct pl_pass_params pl_pass_params_copy(void *alloc,
-                                          const struct pl_pass_params *params);
+struct pl_pass_params pl_pass_params_copy(void *alloc, const struct pl_pass_params *params);
+
+// Helper to compute the size of an index buffer
+static inline size_t pl_index_buf_size(const struct pl_pass_run_params *params)
+{
+    switch (params->index_fmt) {
+    case PL_INDEX_UINT16: return params->vertex_count * sizeof(uint16_t);
+    case PL_INDEX_UINT32: return params->vertex_count * sizeof(uint32_t);
+    case PL_INDEX_FORMAT_COUNT: break;
+    }
+
+    pl_unreachable();
+}
+
+// Helper to compute the size of a vertex buffer required to fit all indices
+size_t pl_vertex_buf_size(const struct pl_pass_run_params *params);
 
 // Utility function for pretty-printing UUIDs
 #define UUID_SIZE 16

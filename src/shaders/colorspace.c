@@ -17,236 +17,9 @@
 
 #include <math.h>
 #include "shaders.h"
+#include "colorspace.h"
 
-void pl_shader_decode_color(struct pl_shader *sh, struct pl_color_repr *repr,
-                            const struct pl_color_adjustment *params)
-{
-    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
-        return;
-
-    GLSL("// pl_shader_decode_color \n"
-         "{ \n");
-
-    // For the non-linear color systems we need some special input handling
-    // to make sure we don't accidentally screw everything up because of the
-    // alpha multiplication, which only commutes with linear operations.
-    bool is_nonlinear = !pl_color_system_is_linear(repr->sys);
-    if (is_nonlinear && repr->alpha == PL_ALPHA_PREMULTIPLIED) {
-        GLSL("color.rgb /= vec3(max(color.a, 1e-6));\n");
-        repr->alpha = PL_ALPHA_INDEPENDENT;
-    }
-
-    // XYZ needs special handling due to the input gamma logic
-    if (repr->sys == PL_COLOR_SYSTEM_XYZ) {
-        float scale = pl_color_repr_normalize(repr);
-        GLSL("color.rgb = pow(vec3(%f) * color.rgb, vec3(2.6));\n", scale);
-    }
-
-    enum pl_color_system orig_sys = repr->sys;
-    struct pl_transform3x3 tr = pl_color_repr_decode(repr, params);
-
-    if (memcmp(&tr, &pl_transform3x3_identity, sizeof(tr))) {
-        ident_t cmat = sh_var(sh, (struct pl_shader_var) {
-            .var  = pl_var_mat3("cmat"),
-            .data = PL_TRANSPOSE_3X3(tr.mat.m),
-        });
-
-        ident_t cmat_c = sh_var(sh, (struct pl_shader_var) {
-            .var  = pl_var_vec3("cmat_c"),
-            .data = tr.c,
-        });
-
-        GLSL("color.rgb = %s * color.rgb + %s;\n", cmat, cmat_c);
-    }
-
-    switch (orig_sys) {
-    case PL_COLOR_SYSTEM_BT_2020_C:
-        // Conversion for C'rcY'cC'bc via the BT.2020 CL system:
-        // C'bc = (B'-Y'c) / 1.9404  | C'bc <= 0
-        //      = (B'-Y'c) / 1.5816  | C'bc >  0
-        //
-        // C'rc = (R'-Y'c) / 1.7184  | C'rc <= 0
-        //      = (R'-Y'c) / 0.9936  | C'rc >  0
-        //
-        // as per the BT.2020 specification, table 4. This is a non-linear
-        // transformation because (constant) luminance receives non-equal
-        // contributions from the three different channels.
-        GLSL("// constant luminance conversion                                  \n"
-             "color.br = color.br * mix(vec2(1.5816, 0.9936),                   \n"
-             "                          vec2(1.9404, 1.7184),                   \n"
-             "                          %s(lessThanEqual(color.br, vec2(0.0)))) \n"
-             "           + color.gg;                                            \n",
-             sh_bvec(sh, 2));
-        // Expand channels to camera-linear light. This shader currently just
-        // assumes everything uses the BT.2020 12-bit gamma function, since the
-        // difference between 10 and 12-bit is negligible for anything other
-        // than 12-bit content.
-        GLSL("vec3 lin = mix(color.rgb * vec3(1.0/4.5),                        \n"
-             "                pow((color.rgb + vec3(0.0993))*vec3(1.0/1.0993), \n"
-             "                    vec3(1.0/0.45)),                             \n"
-             "                %s(lessThanEqual(vec3(0.08145), color.rgb)));    \n",
-             sh_bvec(sh, 3));
-        // Calculate the green channel from the expanded RYcB, and recompress to G'
-        // The BT.2020 specification says Yc = 0.2627*R + 0.6780*G + 0.0593*B
-        GLSL("color.g = (lin.g - 0.2627*lin.r - 0.0593*lin.b)*1.0/0.6780;   \n"
-             "color.g = mix(color.g * 4.5,                                  \n"
-             "              1.0993 * pow(color.g, 0.45) - 0.0993,           \n"
-             "              %s(0.0181 <= color.g));                         \n",
-             sh_bvec(sh, 1));
-        break;
-
-    case PL_COLOR_SYSTEM_BT_2100_PQ:
-    case PL_COLOR_SYSTEM_BT_2100_HLG: {
-        // Conversion process from the spec:
-        //
-        // 1. L'M'S' = cmat * ICtCp
-        // 2. LMS = linearize(L'M'S')  (EOTF for PQ, inverse OETF for HLG)
-        // 3. RGB = lms2rgb * LMS
-        //
-        // After this we need to invert step 2 to arrive at non-linear RGB.
-        // (It's important we keep the transfer function conversion separate
-        // from the color system decoding, so we have to partially undo our
-        // work here even though we will end up linearizing later on anyway)
-        enum pl_color_transfer trc = orig_sys == PL_COLOR_SYSTEM_BT_2100_PQ
-                                        ? PL_COLOR_TRC_PQ
-                                        : PL_COLOR_TRC_HLG;
-
-        // Inverted from the matrix in the spec, transposed to column major
-        static const char *bt2100_lms2rgb = "mat3("
-            "  3.43661,  -0.79133, -0.0259499, "
-            " -2.50645,    1.9836, -0.0989137, "
-            "0.0698454, -0.192271,    1.12486) ";
-
-        pl_shader_linearize(sh, trc);
-        GLSL("color.rgb = %s * color.rgb; \n", bt2100_lms2rgb);
-        pl_shader_delinearize(sh, trc);
-        break;
-    }
-
-    case PL_COLOR_SYSTEM_XYZ:
-        break; // no special post-processing needed
-
-    default:
-        assert(pl_color_system_is_linear(orig_sys));
-        break;
-    }
-
-    if (repr->alpha == PL_ALPHA_INDEPENDENT) {
-        GLSL("color.rgb *= vec3(color.a);\n");
-        repr->alpha = PL_ALPHA_PREMULTIPLIED;
-    }
-
-    // Gamma adjustment. Doing this here (in non-linear light) is technically
-    // somewhat wrong, but this is just an aesthetic parameter and not really
-    // meant for colorimetric precision, so we don't care too much.
-    if (params && params->gamma != 1.0) {
-        ident_t gamma = sh_var(sh, (struct pl_shader_var) {
-            .var = pl_var_float("gamma"),
-            .data = &params->gamma,
-        });
-        GLSL("color.rgb = pow(color.rgb, vec3(%s)); \n", gamma);
-    }
-
-    GLSL("}\n");
-}
-
-void pl_shader_encode_color(struct pl_shader *sh,
-                            const struct pl_color_repr *repr)
-{
-    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
-        return;
-
-    GLSL("// pl_shader_encode_color \n"
-         "{ \n");
-
-    switch (repr->sys) {
-    case PL_COLOR_SYSTEM_BT_2020_C:
-        // Expand R'G'B' to RGB
-        GLSL("vec3 lin = mix(color.rgb * vec3(1.0/4.5),                        \n"
-             "                pow((color.rgb + vec3(0.0993))*vec3(1.0/1.0993), \n"
-             "                    vec3(1.0/0.45)),                             \n"
-             "                %s(lessThanEqual(vec3(0.08145), color.rgb)));    \n",
-             sh_bvec(sh, 3));
-
-        // Compute Yc from RGB and compress to R'Y'cB'
-        GLSL("color.g = dot(vec3(0.2627, 0.6780, 0.0593), lin);     \n"
-             "color.g = mix(color.g * 4.5,                          \n"
-             "              1.0993 * pow(color.g, 0.45) - 0.0993,   \n"
-             "              %s(0.0181 <= color.g));                 \n",
-             sh_bvec(sh, 1));
-
-        // Compute C'bc and C'rc into color.br
-        GLSL("color.br = color.br - color.gg;                           \n"
-             "color.br *= mix(vec2(1.0/1.5816, 1.0/0.9936),             \n"
-             "                vec2(1.0/1.9404, 1.0/1.7184),             \n"
-             "                %s(lessThanEqual(color.br, vec2(0.0))));  \n",
-             sh_bvec(sh, 2));
-        break;
-
-    case PL_COLOR_SYSTEM_BT_2100_PQ:
-    case PL_COLOR_SYSTEM_BT_2100_HLG: {
-        enum pl_color_transfer trc = repr->sys == PL_COLOR_SYSTEM_BT_2100_PQ
-                                        ? PL_COLOR_TRC_PQ
-                                        : PL_COLOR_TRC_HLG;
-
-        // Inverse of the matrix above
-        static const char *bt2100_rgb2lms = "mat3("
-            "0.412109, 0.166748, 0.024170, "
-            "0.523925, 0.720459, 0.075440, "
-            "0.063965, 0.112793, 0.900394) ";
-
-        pl_shader_linearize(sh, trc);
-        GLSL("color.rgb = %s * color.rgb; \n", bt2100_rgb2lms);
-        pl_shader_delinearize(sh, trc);
-        break;
-    }
-
-    case PL_COLOR_SYSTEM_XYZ:
-        break; // no special pre-processing needed
-
-    default:
-        assert(pl_color_system_is_linear(repr->sys));
-        break;
-    }
-
-    // Since this is a relatively rare operation, bypass it as much as possible
-    bool skip = true;
-    skip &= PL_DEF(repr->sys, PL_COLOR_SYSTEM_RGB) == PL_COLOR_SYSTEM_RGB;
-    skip &= PL_DEF(repr->levels, PL_COLOR_LEVELS_FULL) == PL_COLOR_LEVELS_FULL;
-    skip &= !repr->bits.sample_depth || !repr->bits.color_depth ||
-             repr->bits.sample_depth == repr->bits.color_depth;
-    skip &= !repr->bits.bit_shift;
-
-    if (!skip) {
-        struct pl_color_repr copy = *repr;
-        float xyzscale = (repr->sys == PL_COLOR_SYSTEM_XYZ)
-                            ? pl_color_repr_normalize(&copy)
-                            : 0.0;
-
-        struct pl_transform3x3 tr = pl_color_repr_decode(&copy, NULL);
-        pl_transform3x3_invert(&tr);
-
-        ident_t cmat = sh_var(sh, (struct pl_shader_var) {
-            .var  = pl_var_mat3("cmat"),
-            .data = PL_TRANSPOSE_3X3(tr.mat.m),
-        });
-
-        ident_t cmat_c = sh_var(sh, (struct pl_shader_var) {
-            .var  = pl_var_vec3("cmat_c"),
-            .data = tr.c,
-        });
-
-        GLSL("color.rgb = %s * color.rgb + %s;\n", cmat, cmat_c);
-
-        if (repr->sys == PL_COLOR_SYSTEM_XYZ)
-            GLSL("color.rgb = pow(color.rgb, vec3(1.0/2.6)) * vec3(1.0/%f); \n", xyzscale);
-    }
-
-    if (repr->alpha == PL_ALPHA_INDEPENDENT)
-        GLSL("color.rgb /= vec3(max(color.a, 1e-6));\n");
-
-    GLSL("}\n");
-}
+#include <libplacebo/shaders/colorspace.h>
 
 // Common constants for SMPTE ST.2084 (PQ)
 static const float PQ_M1 = 2610./4096 * 1./4,
@@ -258,7 +31,8 @@ static const float PQ_M1 = 2610./4096 * 1./4,
 // Common constants for ARIB STD-B67 (HLG)
 static const float HLG_A = 0.17883277,
                    HLG_B = 0.28466892,
-                   HLG_C = 0.55991073;
+                   HLG_C = 0.55991073,
+                   HLG_REF = 1000.0 / PL_COLOR_SDR_WHITE;
 
 // Common constants for Panasonic V-Log
 static const float VLOG_B = 0.00873,
@@ -273,13 +47,591 @@ static const float SLOG_A = 0.432699,
                    SLOG_Q = 0.030001,
                    SLOG_K2 = 155.0 / 219.0;
 
-void pl_shader_linearize(struct pl_shader *sh, enum pl_color_transfer trc)
+void pl_shader_set_alpha(pl_shader sh, struct pl_color_repr *repr,
+                         enum pl_alpha_mode mode)
+{
+    if (repr->alpha == PL_ALPHA_PREMULTIPLIED && mode == PL_ALPHA_INDEPENDENT) {
+        GLSL("if (color.a > 1e-6)               \n"
+             "    color.rgb /= vec3(color.a);   \n");
+        repr->alpha = PL_ALPHA_INDEPENDENT;
+    }
+
+    if (repr->alpha == PL_ALPHA_INDEPENDENT && mode == PL_ALPHA_PREMULTIPLIED) {
+        GLSL("color.rgb *= vec3(color.a); \n");
+        repr->alpha = PL_ALPHA_PREMULTIPLIED;
+    }
+}
+
+#ifdef PL_HAVE_DOVI
+static inline void reshape_mmr(pl_shader sh, ident_t mmr, bool single,
+                               int min_order, int max_order)
+{
+    if (single) {
+        GLSL("const uint mmr_idx = 0u; \n");
+    } else {
+        GLSL("uint mmr_idx = uint(coeffs.y); \n");
+    }
+
+    assert(min_order <= max_order);
+    if (min_order < max_order)
+        GLSL("uint order = uint(coeffs.w); \n");
+
+    GLSL("vec4 sigX;                            \n"
+         "s = coeffs.x;                         \n"
+         "sigX.xyz = sig.xxy * sig.yzz;         \n"
+         "sigX.w = sigX.x * sig.z;              \n"
+         "s += dot("$"[mmr_idx + 0].xyz, sig);  \n"
+         "s += dot("$"[mmr_idx + 1], sigX);     \n",
+         mmr, mmr);
+
+    if (max_order >= 2) {
+        if (min_order < 2)
+            GLSL("if (order >= 2) { \n");
+
+        GLSL("vec3 sig2 = sig * sig;                \n"
+             "vec4 sigX2 = sigX * sigX;             \n"
+             "s += dot("$"[mmr_idx + 2].xyz, sig2); \n"
+             "s += dot("$"[mmr_idx + 3], sigX2);    \n",
+             mmr, mmr);
+
+        if (max_order == 3) {
+            if (min_order < 3)
+                GLSL("if (order >= 3 { \n");
+
+            GLSL("s += dot("$"[mmr_idx + 4].xyz, sig2 * sig);   \n"
+                 "s += dot("$"[mmr_idx + 5], sigX2 * sigX);     \n",
+                 mmr, mmr);
+
+            if (min_order < 3)
+                GLSL("} \n");
+        }
+
+        if (min_order < 2)
+            GLSL("} \n");
+    }
+}
+
+static inline void reshape_poly(pl_shader sh)
+{
+    GLSL("s = (coeffs.z * s + coeffs.y) * s + coeffs.x; \n");
+}
+#endif
+
+void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
+{
+#ifdef PL_HAVE_DOVI
+    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0) || !data)
+        return;
+
+    sh_describe(sh, "reshaping");
+    GLSL("// pl_shader_reshape                  \n"
+         "{                                     \n"
+         "vec3 sig;                             \n"
+         "vec4 coeffs;                          \n"
+         "float s;                              \n"
+         "sig = clamp(color.rgb, 0.0, 1.0);     \n");
+
+    float coeffs_data[8][4];
+    float mmr_packed_data[8*6][4];
+
+    for (int c = 0; c < 3; c++) {
+        const struct pl_reshape_data *comp = &data->comp[c];
+        if (!comp->num_pivots)
+            continue;
+
+        pl_assert(comp->num_pivots >= 2 && comp->num_pivots <= 9);
+        GLSL("s = sig[%d]; \n", c);
+
+        // Prepare coefficients for GPU
+        bool has_poly = false, has_mmr = false, mmr_single = true;
+        int mmr_idx = 0, min_order = 3, max_order = 1;
+        memset(coeffs_data, 0, sizeof(coeffs_data));
+        for (int i = 0; i < comp->num_pivots - 1; i++) {
+            switch (comp->method[i]) {
+            case 0: // polynomial
+                has_poly = true;
+                coeffs_data[i][3] = 0.0; // order=0 signals polynomial
+                for (int k = 0; k < 3; k++)
+                    coeffs_data[i][k] = comp->poly_coeffs[i][k];
+                break;
+
+            case 1:
+                min_order = PL_MIN(min_order, comp->mmr_order[i]);
+                max_order = PL_MAX(max_order, comp->mmr_order[i]);
+                mmr_single = !has_mmr;
+                has_mmr = true;
+                coeffs_data[i][3] = (float) comp->mmr_order[i];
+                coeffs_data[i][0] = comp->mmr_constant[i];
+                coeffs_data[i][1] = (float) mmr_idx;
+                for (int j = 0; j < comp->mmr_order[i]; j++) {
+                    // store weights per order as two packed vec4s
+                    float *mmr = &mmr_packed_data[mmr_idx][0];
+                    mmr[0] = comp->mmr_coeffs[i][j][0];
+                    mmr[1] = comp->mmr_coeffs[i][j][1];
+                    mmr[2] = comp->mmr_coeffs[i][j][2];
+                    mmr[3] = 0.0; // unused
+                    mmr[4] = comp->mmr_coeffs[i][j][3];
+                    mmr[5] = comp->mmr_coeffs[i][j][4];
+                    mmr[6] = comp->mmr_coeffs[i][j][5];
+                    mmr[7] = comp->mmr_coeffs[i][j][6];
+                    mmr_idx += 2;
+                }
+                break;
+
+            default:
+                pl_unreachable();
+            }
+        }
+
+        if (comp->num_pivots > 2) {
+
+            // Skip the (irrelevant) lower and upper bounds
+            float pivots_data[7];
+            memcpy(pivots_data, comp->pivots + 1,
+                   (comp->num_pivots - 2) * sizeof(pivots_data[0]));
+
+            // Fill the remainder with a quasi-infinite sentinel pivot
+            for (int i = comp->num_pivots - 2; i < PL_ARRAY_SIZE(pivots_data); i++)
+                pivots_data[i] = 1e9f;
+
+            ident_t pivots = sh_var(sh, (struct pl_shader_var) {
+                .data = pivots_data,
+                .var = {
+                    .name = "pivots",
+                    .type = PL_VAR_FLOAT,
+                    .dim_v = 1,
+                    .dim_m = 1,
+                    .dim_a = PL_ARRAY_SIZE(pivots_data),
+                },
+            });
+
+            ident_t coeffs = sh_var(sh, (struct pl_shader_var) {
+                .data = coeffs_data,
+                .var = {
+                    .name = "coeffs",
+                    .type = PL_VAR_FLOAT,
+                    .dim_v = 4,
+                    .dim_m = 1,
+                    .dim_a = PL_ARRAY_SIZE(coeffs_data),
+                },
+            });
+
+            // Efficiently branch into the correct set of coefficients
+            GLSL("#define test(i) bvec4(s >= "$"[i])                \n"
+                 "#define coef(i) "$"[i]                            \n"
+                 "coeffs = mix(mix(mix(coef(0), coef(1), test(0)),  \n"
+                 "                 mix(coef(2), coef(3), test(2)),  \n"
+                 "                 test(1)),                        \n"
+                 "             mix(mix(coef(4), coef(5), test(4)),  \n"
+                 "                 mix(coef(6), coef(7), test(6)),  \n"
+                 "                 test(5)),                        \n"
+                 "             test(3));                            \n"
+                 "#undef test                                       \n"
+                 "#undef coef                                       \n",
+                 pivots, coeffs);
+
+        } else {
+
+            // No need for a single pivot, just set the coeffs directly
+            GLSL("coeffs = "$"; \n", sh_var(sh, (struct pl_shader_var) {
+                .var = pl_var_vec4("coeffs"),
+                .data = coeffs_data,
+            }));
+
+        }
+
+        ident_t mmr = NULL_IDENT;
+        if (has_mmr) {
+            mmr = sh_var(sh, (struct pl_shader_var) {
+                .data = mmr_packed_data,
+                .var = {
+                    .name = "mmr",
+                    .type = PL_VAR_FLOAT,
+                    .dim_v = 4,
+                    .dim_m = 1,
+                    .dim_a = mmr_idx,
+                },
+            });
+        }
+
+        if (has_mmr && has_poly) {
+            GLSL("if (coeffs.w == 0.0) { \n");
+            reshape_poly(sh);
+            GLSL("} else { \n");
+            reshape_mmr(sh, mmr, mmr_single, min_order, max_order);
+            GLSL("} \n");
+        } else if (has_poly) {
+            reshape_poly(sh);
+        } else {
+            assert(has_mmr);
+            GLSL("{ \n");
+            reshape_mmr(sh, mmr, mmr_single, min_order, max_order);
+            GLSL("} \n");
+        }
+
+        ident_t lo = sh_var(sh, (struct pl_shader_var) {
+            .var = pl_var_float("lo"),
+            .data = &comp->pivots[0],
+        });
+        ident_t hi = sh_var(sh, (struct pl_shader_var) {
+            .var = pl_var_float("hi"),
+            .data = &comp->pivots[comp->num_pivots - 1],
+        });
+        GLSL("color[%d] = clamp(s, "$", "$"); \n", c, lo, hi);
+    }
+
+    GLSL("} \n");
+#else
+    SH_FAIL(sh, "libplacebo was compiled without support for dolbyvision reshaping");
+#endif
+}
+
+void pl_shader_decode_color(pl_shader sh, struct pl_color_repr *repr,
+                            const struct pl_color_adjustment *params)
 {
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
 
-    if (trc == PL_COLOR_TRC_LINEAR)
+    sh_describe(sh, "color decoding");
+    GLSL("// pl_shader_decode_color \n"
+         "{ \n");
+
+    // Do this first because the following operations are potentially nonlinear
+    pl_shader_set_alpha(sh, repr, PL_ALPHA_INDEPENDENT);
+
+    if (repr->sys == PL_COLOR_SYSTEM_XYZ ||
+        repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
+    {
+        ident_t scale = SH_FLOAT(pl_color_repr_normalize(repr));
+        GLSL("color.rgb *= vec3("$"); \n", scale);
+    }
+
+    if (repr->sys == PL_COLOR_SYSTEM_XYZ) {
+        pl_shader_linearize(sh, &(struct pl_color_space) {
+            .transfer = PL_COLOR_TRC_ST428,
+        });
+    }
+
+    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
+        pl_shader_dovi_reshape(sh, repr->dovi);
+
+    enum pl_color_system orig_sys = repr->sys;
+    pl_transform3x3 tr = pl_color_repr_decode(repr, params);
+
+    if (memcmp(&tr, &pl_transform3x3_identity, sizeof(tr))) {
+        ident_t cmat = sh_var(sh, (struct pl_shader_var) {
+            .var  = pl_var_mat3("cmat"),
+            .data = PL_TRANSPOSE_3X3(tr.mat.m),
+        });
+
+        ident_t cmat_c = sh_var(sh, (struct pl_shader_var) {
+            .var  = pl_var_vec3("cmat_c"),
+            .data = tr.c,
+        });
+
+        GLSL("color.rgb = "$" * color.rgb + "$"; \n", cmat, cmat_c);
+    }
+
+    switch (orig_sys) {
+    case PL_COLOR_SYSTEM_BT_2020_C:
+        // Conversion for C'rcY'cC'bc via the BT.2020 CL system:
+        // C'bc = (B'-Y'c) / 1.9404  | C'bc <= 0
+        //      = (B'-Y'c) / 1.5816  | C'bc >  0
+        //
+        // C'rc = (R'-Y'c) / 1.7184  | C'rc <= 0
+        //      = (R'-Y'c) / 0.9936  | C'rc >  0
+        //
+        // as per the BT.2020 specification, table 4. This is a non-linear
+        // transformation because (constant) luminance receives non-equal
+        // contributions from the three different channels.
+        GLSL("// constant luminance conversion                              \n"
+             "color.br = color.br * mix(vec2(1.5816, 0.9936),               \n"
+             "                          vec2(1.9404, 1.7184),               \n"
+             "                          lessThanEqual(color.br, vec2(0.0))) \n"
+             "           + color.gg;                                        \n");
+        // Expand channels to camera-linear light. This shader currently just
+        // assumes everything uses the BT.2020 12-bit gamma function, since the
+        // difference between 10 and 12-bit is negligible for anything other
+        // than 12-bit content.
+        GLSL("vec3 lin = mix(color.rgb * vec3(1.0/4.5),                        \n"
+             "                pow((color.rgb + vec3(0.0993))*vec3(1.0/1.0993), \n"
+             "                    vec3(1.0/0.45)),                             \n"
+             "                lessThanEqual(vec3(0.08145), color.rgb));        \n");
+        // Calculate the green channel from the expanded RYcB, and recompress to G'
+        // The BT.2020 specification says Yc = 0.2627*R + 0.6780*G + 0.0593*B
+        GLSL("color.g = (lin.g - 0.2627*lin.r - 0.0593*lin.b)*1.0/0.6780;   \n"
+             "color.g = mix(color.g * 4.5,                                  \n"
+             "              1.0993 * pow(color.g, 0.45) - 0.0993,           \n"
+             "              0.0181 <= color.g);                             \n");
+        break;
+
+    case PL_COLOR_SYSTEM_BT_2100_PQ:;
+        // Conversion process from the spec:
+        //
+        // 1. L'M'S' = cmat * ICtCp
+        // 2. LMS = linearize(L'M'S')  (EOTF for PQ, inverse OETF for HLG)
+        // 3. RGB = lms2rgb * LMS
+        //
+        // After this we need to invert step 2 to arrive at non-linear RGB.
+        // (It's important we keep the transfer function conversion separate
+        // from the color system decoding, so we have to partially undo our
+        // work here even though we will end up linearizing later on anyway)
+
+        GLSL(// PQ EOTF
+             "color.rgb = pow(max(color.rgb, 0.0), vec3(1.0/%f));           \n"
+             "color.rgb = max(color.rgb - vec3(%f), 0.0)                    \n"
+             "             / (vec3(%f) - vec3(%f) * color.rgb);             \n"
+             "color.rgb = pow(color.rgb, vec3(1.0/%f));                     \n"
+             // LMS matrix
+             "color.rgb = mat3( 3.43661, -0.79133, -0.0259499,              \n"
+             "                 -2.50645,  1.98360, -0.0989137,              \n"
+             "                  0.06984, -0.192271, 1.12486) * color.rgb;   \n"
+             // PQ OETF
+             "color.rgb = pow(max(color.rgb, 0.0), vec3(%f));               \n"
+             "color.rgb = (vec3(%f) + vec3(%f) * color.rgb)                 \n"
+             "             / (vec3(1.0) + vec3(%f) * color.rgb);            \n"
+             "color.rgb = pow(color.rgb, vec3(%f));                         \n",
+             PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
+             PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
+        break;
+
+    case PL_COLOR_SYSTEM_BT_2100_HLG:
+        GLSL(// HLG OETF^-1
+             "color.rgb = mix(vec3(4.0) * color.rgb * color.rgb,                \n"
+             "                exp((color.rgb - vec3(%f)) * vec3(1.0/%f))        \n"
+             "                    + vec3(%f),                                   \n"
+             "                lessThan(vec3(0.5), color.rgb));                  \n"
+             // LMS matrix
+             "color.rgb = mat3( 3.43661, -0.79133, -0.0259499,                  \n"
+             "                 -2.50645,  1.98360, -0.0989137,                  \n"
+             "                  0.06984, -0.192271, 1.12486) * color.rgb;       \n"
+            // HLG OETF
+             "color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                      \n"
+             "                vec3(%f) * log(color.rgb - vec3(%f)) + vec3(%f),  \n"
+             "                lessThan(vec3(1.0), color.rgb));                  \n",
+             HLG_C, HLG_A, HLG_B,
+             HLG_A, HLG_B, HLG_C);
+        break;
+
+    case PL_COLOR_SYSTEM_DOLBYVISION:;
+#ifdef PL_HAVE_DOVI
+        // Dolby Vision always outputs BT.2020-referred HPE LMS, so hard-code
+        // the inverse LMS->RGB matrix corresponding to this color space.
+        pl_matrix3x3 dovi_lms2rgb = {{
+            { 3.06441879, -2.16597676,  0.10155818},
+            {-0.65612108,  1.78554118, -0.12943749},
+            { 0.01736321, -0.04725154,  1.03004253},
+        }};
+
+        pl_matrix3x3_mul(&dovi_lms2rgb, &repr->dovi->linear);
+        ident_t mat = sh_var(sh, (struct pl_shader_var) {
+            .var = pl_var_mat3("lms2rgb"),
+            .data = PL_TRANSPOSE_3X3(dovi_lms2rgb.m),
+        });
+
+        // PQ EOTF
+        GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(1.0/%f));   \n"
+             "color.rgb = max(color.rgb - vec3(%f), 0.0)            \n"
+             "             / (vec3(%f) - vec3(%f) * color.rgb);     \n"
+             "color.rgb = pow(color.rgb, vec3(1.0/%f));             \n",
+             PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1);
+        // LMS matrix
+        GLSL("color.rgb = "$" * color.rgb; \n", mat);
+        // PQ OETF
+        GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(%f));       \n"
+             "color.rgb = (vec3(%f) + vec3(%f) * color.rgb)         \n"
+             "             / (vec3(1.0) + vec3(%f) * color.rgb);    \n"
+             "color.rgb = pow(color.rgb, vec3(%f));                 \n",
+             PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
+        break;
+#else
+        SH_FAIL(sh, "libplacebo was compiled without support for dolbyvision reshaping");
         return;
+#endif
+
+    case PL_COLOR_SYSTEM_UNKNOWN:
+    case PL_COLOR_SYSTEM_RGB:
+    case PL_COLOR_SYSTEM_XYZ:
+    case PL_COLOR_SYSTEM_BT_601:
+    case PL_COLOR_SYSTEM_BT_709:
+    case PL_COLOR_SYSTEM_SMPTE_240M:
+    case PL_COLOR_SYSTEM_BT_2020_NC:
+    case PL_COLOR_SYSTEM_YCGCO:
+        break; // no special post-processing needed
+
+    case PL_COLOR_SYSTEM_COUNT:
+        pl_unreachable();
+    }
+
+    // Gamma adjustment. Doing this here (in non-linear light) is technically
+    // somewhat wrong, but this is just an aesthetic parameter and not really
+    // meant for colorimetric precision, so we don't care too much.
+    if (params && params->gamma == 0) {
+        // Avoid division by zero
+        GLSL("color.rgb = vec3(0.0); \n");
+    } else if (params && params->gamma != 1) {
+        ident_t gamma = sh_var(sh, (struct pl_shader_var) {
+            .var = pl_var_float("gamma"),
+            .data = &(float){ 1 / params->gamma },
+        });
+        GLSL("color.rgb = pow(max(color.rgb, vec3(0.0)), vec3("$")); \n", gamma);
+    }
+
+    GLSL("}\n");
+}
+
+void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
+{
+    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
+        return;
+
+    sh_describe(sh, "color encoding");
+    GLSL("// pl_shader_encode_color \n"
+         "{ \n");
+
+    switch (repr->sys) {
+    case PL_COLOR_SYSTEM_BT_2020_C:
+        // Expand R'G'B' to RGB
+        GLSL("vec3 lin = mix(color.rgb * vec3(1.0/4.5),                        \n"
+             "                pow((color.rgb + vec3(0.0993))*vec3(1.0/1.0993), \n"
+             "                    vec3(1.0/0.45)),                             \n"
+             "                lessThanEqual(vec3(0.08145), color.rgb));        \n");
+
+        // Compute Yc from RGB and compress to R'Y'cB'
+        GLSL("color.g = dot(vec3(0.2627, 0.6780, 0.0593), lin);     \n"
+             "color.g = mix(color.g * 4.5,                          \n"
+             "              1.0993 * pow(color.g, 0.45) - 0.0993,   \n"
+             "              0.0181 <= color.g);                     \n");
+
+        // Compute C'bc and C'rc into color.br
+        GLSL("color.br = color.br - color.gg;                       \n"
+             "color.br *= mix(vec2(1.0/1.5816, 1.0/0.9936),         \n"
+             "                vec2(1.0/1.9404, 1.0/1.7184),         \n"
+             "                lessThanEqual(color.br, vec2(0.0)));  \n");
+        break;
+
+    case PL_COLOR_SYSTEM_BT_2100_PQ:;
+        GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(1.0/%f));           \n"
+             "color.rgb = max(color.rgb - vec3(%f), 0.0)                    \n"
+             "             / (vec3(%f) - vec3(%f) * color.rgb);             \n"
+             "color.rgb = pow(color.rgb, vec3(1.0/%f));                     \n"
+             "color.rgb = mat3(0.412109, 0.166748, 0.024170,                \n"
+             "                 0.523925, 0.720459, 0.075440,                \n"
+             "                 0.063965, 0.112793, 0.900394) * color.rgb;   \n"
+             "color.rgb = pow(color.rgb, vec3(%f));                         \n"
+             "color.rgb = (vec3(%f) + vec3(%f) * color.rgb)                 \n"
+             "             / (vec3(1.0) + vec3(%f) * color.rgb);            \n"
+             "color.rgb = pow(color.rgb, vec3(%f));                         \n",
+             PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
+             PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
+        break;
+
+    case PL_COLOR_SYSTEM_BT_2100_HLG:
+        GLSL("color.rgb = mix(vec3(4.0) * color.rgb * color.rgb,                \n"
+             "                exp((color.rgb - vec3(%f)) * vec3(1.0/%f))        \n"
+             "                    + vec3(%f),                                   \n"
+             "                lessThan(vec3(0.5), color.rgb));                  \n"
+             "color.rgb = mat3(0.412109, 0.166748, 0.024170,                    \n"
+             "                 0.523925, 0.720459, 0.075440,                    \n"
+             "                 0.063965, 0.112793, 0.900394) * color.rgb;       \n"
+             "color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                      \n"
+             "                vec3(%f) * log(color.rgb - vec3(%f)) + vec3(%f),  \n"
+             "                lessThan(vec3(1.0), color.rgb));                  \n",
+             HLG_C, HLG_A, HLG_B,
+             HLG_A, HLG_B, HLG_C);
+        break;
+
+    case PL_COLOR_SYSTEM_DOLBYVISION:
+        SH_FAIL(sh, "Cannot un-apply dolbyvision yet (no inverse reshaping)!");
+        return;
+
+    case PL_COLOR_SYSTEM_UNKNOWN:
+    case PL_COLOR_SYSTEM_RGB:
+    case PL_COLOR_SYSTEM_XYZ:
+    case PL_COLOR_SYSTEM_BT_601:
+    case PL_COLOR_SYSTEM_BT_709:
+    case PL_COLOR_SYSTEM_SMPTE_240M:
+    case PL_COLOR_SYSTEM_BT_2020_NC:
+    case PL_COLOR_SYSTEM_YCGCO:
+        break; // no special pre-processing needed
+
+    case PL_COLOR_SYSTEM_COUNT:
+        pl_unreachable();
+    }
+
+    // Since this is a relatively rare operation, bypass it as much as possible
+    bool skip = true;
+    skip &= PL_DEF(repr->sys, PL_COLOR_SYSTEM_RGB) == PL_COLOR_SYSTEM_RGB;
+    skip &= PL_DEF(repr->levels, PL_COLOR_LEVELS_FULL) == PL_COLOR_LEVELS_FULL;
+    skip &= !repr->bits.sample_depth || !repr->bits.color_depth ||
+             repr->bits.sample_depth == repr->bits.color_depth;
+    skip &= !repr->bits.bit_shift;
+
+    if (!skip) {
+        struct pl_color_repr copy = *repr;
+        ident_t xyzscale = NULL_IDENT;
+        if (repr->sys == PL_COLOR_SYSTEM_XYZ)
+            xyzscale = SH_FLOAT(1.0 / pl_color_repr_normalize(&copy));
+
+        pl_transform3x3 tr = pl_color_repr_decode(&copy, NULL);
+        pl_transform3x3_invert(&tr);
+
+        ident_t cmat = sh_var(sh, (struct pl_shader_var) {
+            .var  = pl_var_mat3("cmat"),
+            .data = PL_TRANSPOSE_3X3(tr.mat.m),
+        });
+
+        ident_t cmat_c = sh_var(sh, (struct pl_shader_var) {
+            .var  = pl_var_vec3("cmat_c"),
+            .data = tr.c,
+        });
+
+        GLSL("color.rgb = "$" * color.rgb + "$"; \n", cmat, cmat_c);
+
+        if (repr->sys == PL_COLOR_SYSTEM_XYZ) {
+            pl_shader_delinearize(sh, &(struct pl_color_space) {
+                .transfer = PL_COLOR_TRC_ST428,
+            });
+            GLSL("color.rgb *= vec3("$"); \n", xyzscale);
+        }
+    }
+
+    if (repr->alpha == PL_ALPHA_PREMULTIPLIED)
+        GLSL("color.rgb *= vec3(color.a); \n");
+
+    GLSL("}\n");
+}
+
+static ident_t sh_luma_coeffs(pl_shader sh, const struct pl_raw_primaries *prim)
+{
+    pl_matrix3x3 rgb2xyz;
+    rgb2xyz = pl_get_rgb2xyz_matrix(prim);
+
+    // FIXME: Cannot use `const vec3` due to glslang bug #2025
+    ident_t coeffs = sh_fresh(sh, "luma_coeffs");
+    GLSLH("#define "$" vec3("$", "$", "$") \n", coeffs,
+          SH_FLOAT(rgb2xyz.m[1][0]), // RGB->Y vector
+          SH_FLOAT(rgb2xyz.m[1][1]),
+          SH_FLOAT(rgb2xyz.m[1][2]));
+    return coeffs;
+}
+
+void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
+{
+    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
+        return;
+
+    if (csp->transfer == PL_COLOR_TRC_LINEAR)
+        return;
+
+    float csp_min, csp_max;
+    pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+        .color      = csp,
+        .metadata   = PL_HDR_METADATA_HDR10,
+        .scaling    = PL_HDR_NORM,
+        .out_min    = &csp_min,
+        .out_max    = &csp_max,
+    ));
 
     // Note that this clamp may technically violate the definition of
     // ITU-R BT.2100, which allows for sub-blacks and super-whites to be
@@ -289,33 +641,49 @@ void pl_shader_linearize(struct pl_shader *sh, enum pl_color_transfer trc)
     GLSL("// pl_shader_linearize           \n"
          "color.rgb = max(color.rgb, 0.0); \n");
 
-    switch (trc) {
+    switch (csp->transfer) {
     case PL_COLOR_TRC_SRGB:
         GLSL("color.rgb = mix(color.rgb * vec3(1.0/12.92),               \n"
              "                pow((color.rgb + vec3(0.055))/vec3(1.055), \n"
              "                    vec3(2.4)),                            \n"
-             "                %s(lessThan(vec3(0.04045), color.rgb)));   \n",
-             sh_bvec(sh, 3));
-        break;
-    case PL_COLOR_TRC_BT_1886:
-        GLSL("color.rgb = pow(color.rgb, vec3(2.4));\n");
-        break;
+             "                lessThan(vec3(0.04045), color.rgb));       \n");
+        goto scale_out;
+    case PL_COLOR_TRC_BT_1886: {
+        const float lb = powf(csp_min, 1/2.4f);
+        const float lw = powf(csp_max, 1/2.4f);
+        const float a = powf(lw - lb, 2.4f);
+        const float b = lb / (lw - lb);
+        GLSL("color.rgb = "$" * pow(color.rgb + vec3("$"), vec3(2.4)); \n",
+             SH_FLOAT(a), SH_FLOAT(b));
+        return;
+    }
     case PL_COLOR_TRC_GAMMA18:
         GLSL("color.rgb = pow(color.rgb, vec3(1.8));\n");
-        break;
+        goto scale_out;
+    case PL_COLOR_TRC_GAMMA20:
+        GLSL("color.rgb = pow(color.rgb, vec3(2.0));\n");
+        goto scale_out;
     case PL_COLOR_TRC_UNKNOWN:
     case PL_COLOR_TRC_GAMMA22:
         GLSL("color.rgb = pow(color.rgb, vec3(2.2));\n");
-        break;
+        goto scale_out;
+    case PL_COLOR_TRC_GAMMA24:
+        GLSL("color.rgb = pow(color.rgb, vec3(2.4));\n");
+        goto scale_out;
+    case PL_COLOR_TRC_GAMMA26:
+        GLSL("color.rgb = pow(color.rgb, vec3(2.6));\n");
+        goto scale_out;
     case PL_COLOR_TRC_GAMMA28:
         GLSL("color.rgb = pow(color.rgb, vec3(2.8));\n");
-        break;
+        goto scale_out;
     case PL_COLOR_TRC_PRO_PHOTO:
         GLSL("color.rgb = mix(color.rgb * vec3(1.0/16.0),              \n"
              "                pow(color.rgb, vec3(1.8)),               \n"
-             "                %s(lessThan(vec3(0.03125), color.rgb))); \n",
-             sh_bvec(sh, 3));
-        break;
+             "                lessThan(vec3(0.03125), color.rgb));     \n");
+        goto scale_out;
+    case PL_COLOR_TRC_ST428:
+        GLSL("color.rgb = vec3(52.37/48.0) * pow(color.rgb, vec3(2.6));\n");
+        goto scale_out;
     case PL_COLOR_TRC_PQ:
         GLSL("color.rgb = pow(color.rgb, vec3(1.0/%f));         \n"
              "color.rgb = max(color.rgb - vec3(%f), 0.0)        \n"
@@ -325,79 +693,151 @@ void pl_shader_linearize(struct pl_shader *sh, enum pl_color_transfer trc)
              // to PL_COLOR_SDR_WHITE instead, so rescale
              "color.rgb *= vec3(%f);                            \n",
              PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1, 10000.0 / PL_COLOR_SDR_WHITE);
-        break;
-    case PL_COLOR_TRC_HLG:
-        GLSL("color.rgb = mix(vec3(4.0) * color.rgb * color.rgb,         \n"
-             "                exp((color.rgb - vec3(%f)) * vec3(1.0/%f)) \n"
-             "                    + vec3(%f),                            \n"
-             "                %s(lessThan(vec3(0.5), color.rgb)));       \n"
-             // Rescale from 0-12 to be relative to PL_COLOR_SDR_WHITE_HLG
-             "color.rgb *= vec3(1.0/%f);                                 \n",
-             HLG_C, HLG_A, HLG_B, sh_bvec(sh, 3), PL_COLOR_SDR_WHITE_HLG);
-        break;
+        return;
+    case PL_COLOR_TRC_HLG: {
+        const float y = fmaxf(1.2f + 0.42f * log10f(csp_max / HLG_REF), 1);
+        const float b = sqrtf(3 * powf(csp_min / csp_max, 1 / y));
+        // OETF^-1
+        GLSL("color.rgb = "$" * color.rgb + vec3("$");                  \n"
+             "color.rgb = mix(vec3(4.0) * color.rgb * color.rgb,        \n"
+             "                exp((color.rgb - vec3(%f)) * vec3(1.0/%f))\n"
+             "                    + vec3(%f),                           \n"
+             "                lessThan(vec3(0.5), color.rgb));          \n",
+             SH_FLOAT(1 - b), SH_FLOAT(b),
+             HLG_C, HLG_A, HLG_B);
+        // OOTF
+        GLSL("color.rgb *= 1.0 / 12.0;                                      \n"
+             "color.rgb *= "$" * pow(max(dot("$", color.rgb), 0.0), "$");   \n",
+             SH_FLOAT(csp_max),
+             sh_luma_coeffs(sh, pl_raw_primaries_get(csp->primaries)),
+             SH_FLOAT(y - 1));
+        return;
+    }
     case PL_COLOR_TRC_V_LOG:
         GLSL("color.rgb = mix((color.rgb - vec3(0.125)) * vec3(1.0/5.6), \n"
              "    pow(vec3(10.0), (color.rgb - vec3(%f)) * vec3(1.0/%f)) \n"
              "              - vec3(%f),                                  \n"
-             "    %s(lessThanEqual(vec3(0.181), color.rgb)));            \n",
-             VLOG_D, VLOG_C, VLOG_B, sh_bvec(sh, 3));
-        break;
+             "    lessThanEqual(vec3(0.181), color.rgb));                \n",
+             VLOG_D, VLOG_C, VLOG_B);
+        return;
     case PL_COLOR_TRC_S_LOG1:
         GLSL("color.rgb = pow(vec3(10.0), (color.rgb - vec3(%f)) * vec3(1.0/%f)) \n"
              "            - vec3(%f);                                            \n",
              SLOG_C, SLOG_A, SLOG_B);
-        break;
+        return;
     case PL_COLOR_TRC_S_LOG2:
         GLSL("color.rgb = mix((color.rgb - vec3(%f)) * vec3(1.0/%f),      \n"
              "    (pow(vec3(10.0), (color.rgb - vec3(%f)) * vec3(1.0/%f)) \n"
              "              - vec3(%f)) * vec3(1.0/%f),                   \n"
-             "    %s(lessThanEqual(vec3(%f), color.rgb)));                \n",
-             SLOG_Q, SLOG_P, SLOG_C, SLOG_A, SLOG_B, SLOG_K2, sh_bvec(sh, 3),
-             SLOG_Q);
+             "    lessThanEqual(vec3(%f), color.rgb));                    \n",
+             SLOG_Q, SLOG_P, SLOG_C, SLOG_A, SLOG_B, SLOG_K2, SLOG_Q);
+        return;
+    case PL_COLOR_TRC_LINEAR:
+    case PL_COLOR_TRC_COUNT:
         break;
-    default:
-        abort();
+    }
+
+    pl_unreachable();
+
+scale_out:
+    if (csp_max != 1 || csp_min != 0) {
+        GLSL("color.rgb = "$" * color.rgb + vec3("$"); \n",
+             SH_FLOAT(csp_max - csp_min), SH_FLOAT(csp_min));
     }
 }
 
-void pl_shader_delinearize(struct pl_shader *sh, enum pl_color_transfer trc)
+void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
 {
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
 
-    if (trc == PL_COLOR_TRC_LINEAR)
+    if (csp->transfer == PL_COLOR_TRC_LINEAR)
         return;
 
-    GLSL("// pl_shader_delinearize         \n"
-         "color.rgb = max(color.rgb, 0.0); \n");
+    float csp_min, csp_max;
+    pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+        .color      = csp,
+        .metadata   = PL_HDR_METADATA_HDR10,
+        .scaling    = PL_HDR_NORM,
+        .out_min    = &csp_min,
+        .out_max    = &csp_max,
+    ));
 
-    switch (trc) {
+    GLSL("// pl_shader_delinearize \n");
+    switch (csp->transfer) {
+    case PL_COLOR_TRC_UNKNOWN:
+    case PL_COLOR_TRC_SRGB:
+    case PL_COLOR_TRC_LINEAR:
+    case PL_COLOR_TRC_GAMMA18:
+    case PL_COLOR_TRC_GAMMA20:
+    case PL_COLOR_TRC_GAMMA22:
+    case PL_COLOR_TRC_GAMMA24:
+    case PL_COLOR_TRC_GAMMA26:
+    case PL_COLOR_TRC_GAMMA28:
+    case PL_COLOR_TRC_PRO_PHOTO:
+    case PL_COLOR_TRC_ST428: ;
+        if (csp_max != 1 || csp_min != 0) {
+            GLSL("color.rgb = "$" * color.rgb + vec3("$"); \n",
+                 SH_FLOAT(1 / (csp_max - csp_min)),
+                 SH_FLOAT(-csp_min / (csp_max - csp_min)));
+        }
+        break;
+    case PL_COLOR_TRC_BT_1886:
+    case PL_COLOR_TRC_PQ:
+    case PL_COLOR_TRC_HLG:
+    case PL_COLOR_TRC_V_LOG:
+    case PL_COLOR_TRC_S_LOG1:
+    case PL_COLOR_TRC_S_LOG2:
+        break; // scene-referred or absolute scale
+    case PL_COLOR_TRC_COUNT:
+        pl_unreachable();
+    }
+
+    GLSL("color.rgb = max(color.rgb, 0.0); \n");
+
+    switch (csp->transfer) {
     case PL_COLOR_TRC_SRGB:
         GLSL("color.rgb = mix(color.rgb * vec3(12.92),                        \n"
              "                vec3(1.055) * pow(color.rgb, vec3(1.0/2.4))     \n"
              "                    - vec3(0.055),                              \n"
-             "                %s(lessThanEqual(vec3(0.0031308), color.rgb))); \n",
-             sh_bvec(sh, 3));
-        break;
-    case PL_COLOR_TRC_BT_1886:
-        GLSL("color.rgb = pow(color.rgb, vec3(1.0/2.4));\n");
-        break;
+             "                lessThanEqual(vec3(0.0031308), color.rgb));     \n");
+        return;
+    case PL_COLOR_TRC_BT_1886: {
+        const float lb = powf(csp_min, 1/2.4f);
+        const float lw = powf(csp_max, 1/2.4f);
+        const float a = powf(lw - lb, 2.4f);
+        const float b = lb / (lw - lb);
+        GLSL("color.rgb = pow("$" * color.rgb, vec3(1.0/2.4)) - vec3("$"); \n",
+             SH_FLOAT(1.0 / a), SH_FLOAT(b));
+        return;
+    }
     case PL_COLOR_TRC_GAMMA18:
         GLSL("color.rgb = pow(color.rgb, vec3(1.0/1.8));\n");
-        break;
+        return;
+    case PL_COLOR_TRC_GAMMA20:
+        GLSL("color.rgb = pow(color.rgb, vec3(1.0/2.0));\n");
+        return;
     case PL_COLOR_TRC_UNKNOWN:
     case PL_COLOR_TRC_GAMMA22:
         GLSL("color.rgb = pow(color.rgb, vec3(1.0/2.2));\n");
-        break;
+        return;
+    case PL_COLOR_TRC_GAMMA24:
+        GLSL("color.rgb = pow(color.rgb, vec3(1.0/2.4));\n");
+        return;
+    case PL_COLOR_TRC_GAMMA26:
+        GLSL("color.rgb = pow(color.rgb, vec3(1.0/2.6));\n");
+        return;
     case PL_COLOR_TRC_GAMMA28:
         GLSL("color.rgb = pow(color.rgb, vec3(1.0/2.8));\n");
-        break;
+        return;
+    case PL_COLOR_TRC_ST428:
+        GLSL("color.rgb = pow(color.rgb * vec3(48.0/52.37), vec3(1.0/2.6));\n");
+        return;
     case PL_COLOR_TRC_PRO_PHOTO:
         GLSL("color.rgb = mix(color.rgb * vec3(16.0),                        \n"
              "                pow(color.rgb, vec3(1.0/1.8)),                 \n"
-             "                %s(lessThanEqual(vec3(0.001953), color.rgb))); \n",
-             sh_bvec(sh, 3));
-        break;
+             "                lessThanEqual(vec3(0.001953), color.rgb));     \n");
+        return;
     case PL_COLOR_TRC_PQ:
         GLSL("color.rgb *= vec3(1.0/%f);                         \n"
              "color.rgb = pow(color.rgb, vec3(%f));              \n"
@@ -405,45 +845,54 @@ void pl_shader_delinearize(struct pl_shader *sh, enum pl_color_transfer trc)
              "             / (vec3(1.0) + vec3(%f) * color.rgb); \n"
              "color.rgb = pow(color.rgb, vec3(%f));              \n",
              10000 / PL_COLOR_SDR_WHITE, PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
-        break;
-    case PL_COLOR_TRC_HLG:
-        GLSL("color.rgb *= vec3(%f);                                           \n"
-             "color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                     \n"
-             "                vec3(%f) * log(color.rgb - vec3(%f)) + vec3(%f), \n"
-             "                %s(lessThan(vec3(1.0), color.rgb)));             \n",
-             PL_COLOR_SDR_WHITE_HLG, HLG_A, HLG_B, HLG_C, sh_bvec(sh, 3));
-        break;
+        return;
+    case PL_COLOR_TRC_HLG: {
+        const float y = fmaxf(1.2f + 0.42f * log10f(csp_max / HLG_REF), 1);
+        const float b = sqrtf(3 * powf(csp_min / csp_max, 1 / y));
+        // OOTF^-1
+        GLSL("color.rgb *= 1.0 / "$";                                       \n"
+             "color.rgb *= 12.0 * max(1e-6, pow(dot("$", color.rgb), "$")); \n",
+             SH_FLOAT(csp_max),
+             sh_luma_coeffs(sh, pl_raw_primaries_get(csp->primaries)),
+             SH_FLOAT((1 - y) / y));
+        // OETF
+        GLSL("color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                      \n"
+             "                vec3(%f) * log(color.rgb - vec3(%f)) + vec3(%f),  \n"
+             "                lessThan(vec3(1.0), color.rgb));                  \n"
+             "color.rgb = "$" * color.rgb + vec3("$");                          \n",
+             HLG_A, HLG_B, HLG_C,
+             SH_FLOAT(1 / (1 - b)), SH_FLOAT(-b / (1 - b)));
+        return;
+    }
     case PL_COLOR_TRC_V_LOG:
         GLSL("color.rgb = mix(vec3(5.6) * color.rgb + vec3(0.125),       \n"
              "                vec3(%f) * log(color.rgb + vec3(%f))       \n"
              "                    + vec3(%f),                            \n"
-             "                %s(lessThanEqual(vec3(0.01), color.rgb))); \n",
-             VLOG_C / M_LN10, VLOG_B, VLOG_D, sh_bvec(sh, 3));
-        break;
+             "                lessThanEqual(vec3(0.01), color.rgb));     \n",
+             VLOG_C / M_LN10, VLOG_B, VLOG_D);
+        return;
     case PL_COLOR_TRC_S_LOG1:
         GLSL("color.rgb = vec3(%f) * log(color.rgb + vec3(%f)) + vec3(%f);\n",
              SLOG_A / M_LN10, SLOG_B, SLOG_C);
-        break;
+        return;
     case PL_COLOR_TRC_S_LOG2:
         GLSL("color.rgb = mix(vec3(%f) * color.rgb + vec3(%f),                \n"
              "                vec3(%f) * log(vec3(%f) * color.rgb + vec3(%f)) \n"
              "                    + vec3(%f),                                 \n"
-             "                %s(lessThanEqual(vec3(0.0), color.rgb)));       \n",
-             SLOG_P, SLOG_Q, SLOG_A / M_LN10, SLOG_K2, SLOG_B, SLOG_C,
-             sh_bvec(sh, 3));
+             "                lessThanEqual(vec3(0.0), color.rgb));           \n",
+             SLOG_P, SLOG_Q, SLOG_A / M_LN10, SLOG_K2, SLOG_B, SLOG_C);
+        return;
+    case PL_COLOR_TRC_LINEAR:
+    case PL_COLOR_TRC_COUNT:
         break;
-    default:
-        abort();
     }
+
+    pl_unreachable();
 }
 
-const struct pl_sigmoid_params pl_sigmoid_default_params = {
-    .center = 0.75,
-    .slope  = 6.50,
-};
+const struct pl_sigmoid_params pl_sigmoid_default_params = { PL_SIGMOID_DEFAULTS };
 
-void pl_shader_sigmoidize(struct pl_shader *sh,
-                          const struct pl_sigmoid_params *params)
+void pl_shader_sigmoidize(pl_shader sh, const struct pl_sigmoid_params *params)
 {
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
@@ -457,15 +906,16 @@ void pl_shader_sigmoidize(struct pl_shader *sh,
     float offset = 1.0 / (1 + expf(slope * center));
     float scale  = 1.0 / (1 + expf(slope * (center - 1))) - offset;
 
-    GLSL("// pl_shader_sigmoidize                                          \n"
-         "color = clamp(color, 0.0, 1.0);                                  \n"
-         "color = vec4(%f) - log(vec4(1.0) / (color * vec4(%f) + vec4(%f)) \n"
-         "                         - vec4(1.0)) * vec4(%f);                \n",
-         center, scale, offset, 1.0 / slope);
+    GLSL("// pl_shader_sigmoidize                               \n"
+         "color = clamp(color, 0.0, 1.0);                       \n"
+         "color = vec4("$") - vec4("$") *                       \n"
+         "    log(vec4(1.0) / (color * vec4("$") + vec4("$"))   \n"
+         "        - vec4(1.0));                                 \n",
+         SH_FLOAT(center), SH_FLOAT(1.0 / slope),
+         SH_FLOAT(scale), SH_FLOAT(offset));
 }
 
-void pl_shader_unsigmoidize(struct pl_shader *sh,
-                            const struct pl_sigmoid_params *params)
+void pl_shader_unsigmoidize(pl_shader sh, const struct pl_sigmoid_params *params)
 {
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
@@ -477,127 +927,118 @@ void pl_shader_unsigmoidize(struct pl_shader *sh,
     float offset = 1.0 / (1 + expf(slope * center));
     float scale  = 1.0 / (1 + expf(slope * (center - 1))) - offset;
 
-    GLSL("// pl_shader_unsigmoidize                                           \n"
-         "color = clamp(color, 0.0, 1.0);                                     \n"
-         "color = vec4(%f) / (vec4(1.0) + exp(vec4(%f) * (vec4(%f) - color))) \n"
-         "           - vec4(%f);                                              \n",
-         1.0 / scale, slope, center, offset / scale);
+    GLSL("// pl_shader_unsigmoidize                                 \n"
+         "color = clamp(color, 0.0, 1.0);                           \n"
+         "color = vec4("$") /                                       \n"
+         "    (vec4(1.0) + exp(vec4("$") * (vec4("$") - color)))    \n"
+         "    - vec4("$");                                          \n",
+         SH_FLOAT(1.0 / scale),
+         SH_FLOAT(slope), SH_FLOAT(center),
+         SH_FLOAT(offset / scale));
 }
 
-static ident_t sh_luma_coeffs(struct pl_shader *sh, enum pl_color_primaries prim)
+const struct pl_peak_detect_params pl_peak_detect_default_params = { PL_PEAK_DETECT_DEFAULTS };
+const struct pl_peak_detect_params pl_peak_detect_high_quality_params = { PL_PEAK_DETECT_HQ_DEFAULTS };
+
+static bool peak_detect_params_eq(const struct pl_peak_detect_params *a,
+                                  const struct pl_peak_detect_params *b)
 {
-    struct pl_matrix3x3 rgb2xyz;
-    rgb2xyz = pl_get_rgb2xyz_matrix(pl_raw_primaries_get(prim));
-    return sh_var(sh, (struct pl_shader_var) {
-        .var = pl_var_vec3("luma_coeffs"),
-        .data = rgb2xyz.m[1], // RGB->Y vector
-    });
+    return a->smoothing_period     == b->smoothing_period     &&
+           a->scene_threshold_low  == b->scene_threshold_low  &&
+           a->scene_threshold_high == b->scene_threshold_high &&
+           a->minimum_peak         == b->minimum_peak         &&
+           a->percentile           == b->percentile;
+    // don't compare `allow_delayed` because it doesn't change measurement
 }
 
-// Applies the OOTF / inverse OOTF - including the sig_scale adaptation
-static void pl_shader_ootf(struct pl_shader *sh, struct pl_color_space csp)
-{
-    if (csp.sig_scale != 1.0)
-        GLSL("color.rgb *= vec3(%f); \n", csp.sig_scale);
+enum {
+    // Split the peak buffer into several independent slices to reduce pressure
+    // on global atomics
+    SLICES = 12,
 
-    if (!csp.light || csp.light == PL_COLOR_LIGHT_DISPLAY)
-        return;
+    // How many bits to use for storing PQ data. Be careful when setting this
+    // too high, as it may overflow `unsigned int` on large video sources.
+    //
+    // The value chosen is enough to guarantee no overflow for an 8K x 4K frame
+    // consisting entirely of 100% 10k nits PQ values, with 16x16 workgroups.
+    PQ_BITS     = 14,
+    PQ_MAX      = (1 << PQ_BITS) - 1,
 
-    GLSL("// pl_shader_ootf                \n"
-         "color.rgb = max(color.rgb, 0.0); \n");
+    // How many bits to use for the histogram. We bias the histogram down
+    // by half the PQ range (~90 nits), effectively clumping the SDR part
+    // of the image into a single histogram bin.
+    HIST_BITS   = 7,
+    HIST_BIAS   = 1 << (HIST_BITS - 1),
+    HIST_BINS   = (1 << HIST_BITS) - HIST_BIAS,
 
-    switch (csp.light)
-    {
-    case PL_COLOR_LIGHT_SCENE_HLG: {
-        // HLG OOTF from BT.2100, tuned to the indicated peak
-        float peak = csp.sig_peak * PL_COLOR_SDR_WHITE;
-        float gamma = 1.2 + 0.42 * log10(peak / 1000.0);
-        gamma = PL_MAX(gamma, 1.0);
-        GLSL("color.rgb *= vec3(%f * pow(dot(%s, color.rgb), %f));\n",
-             csp.sig_peak / pow(12.0 / PL_COLOR_SDR_WHITE_HLG, gamma),
-             sh_luma_coeffs(sh, csp.primaries),
-             gamma - 1.0);
-        break;
-    }
-    case PL_COLOR_LIGHT_SCENE_709_1886:
-        // This OOTF is defined by encoding the result as 709 and then decoding
-        // it as 1886; although this is called 709_1886 we actually use the
-        // more precise (by one decimal) values from BT.2020 instead
-        GLSL("color.rgb = mix(color.rgb * vec3(4.5),                    \n"
-             "                vec3(1.0993) * pow(color.rgb, vec3(0.45)) \n"
-             "                             - vec3(0.0993),              \n"
-             "                %s(lessThan(vec3(0.0181), color.rgb)));   \n"
-             "color.rgb = pow(color.rgb, vec3(2.4));                    \n",
-             sh_bvec(sh, 3));
-        break;
-    case PL_COLOR_LIGHT_SCENE_1_2:
-        GLSL("color.rgb = pow(color.rgb, vec3(1.2));\n");
-        break;
-    default:
-        abort();
-    }
-}
-
-static void pl_shader_inverse_ootf(struct pl_shader *sh, struct pl_color_space csp)
-{
-    if (!csp.light || csp.light == PL_COLOR_LIGHT_DISPLAY)
-        goto skip;
-
-    GLSL("// pl_shader_inverse_ootf        \n"
-         "color.rgb = max(color.rgb, 0.0); \n");
-
-    switch (csp.light)
-    {
-    case PL_COLOR_LIGHT_SCENE_HLG: {
-        float peak = csp.sig_peak * PL_COLOR_SDR_WHITE;
-        float gamma = 1.2 + 0.42 * log10(peak / 1000.0);
-        gamma = PL_MAX(gamma, 1.0);
-        GLSL("color.rgb *= vec3(1.0/%f);                                \n"
-             "color.rgb /= vec3(max(1e-6, pow(dot(%s, color.rgb),       \n"
-             "                                %f)));                    \n",
-             csp.sig_peak / pow(12.0 / PL_COLOR_SDR_WHITE_HLG, gamma),
-             sh_luma_coeffs(sh, csp.primaries),
-             (gamma - 1.0) / gamma);
-        break;
-    }
-    case PL_COLOR_LIGHT_SCENE_709_1886:
-        GLSL("color.rgb = pow(color.rgb, vec3(1.0/2.4));                         \n"
-             "color.rgb = mix(color.rgb * vec3(1.0/4.5),                         \n"
-             "                pow((color.rgb + vec3(0.0993)) * vec3(1.0/1.0993), \n"
-             "                    vec3(1/0.45)),                                 \n"
-             "                %s(lessThan(vec3(0.08145), color.rgb)));           \n",
-             sh_bvec(sh, 3));
-        break;
-    case PL_COLOR_LIGHT_SCENE_1_2:
-        GLSL("color.rgb = pow(color.rgb, vec3(1.0/1.2));\n");
-        break;
-    default:
-        abort();
-    }
-
-skip:
-    if (csp.sig_scale != 1.0)
-        GLSL("color.rgb *= vec3(1.0 / %f); \n", csp.sig_scale);
-}
-
-const struct pl_peak_detect_params pl_peak_detect_default_params = {
-    .smoothing_period       = 100.0,
-    .scene_threshold_low    = 5.5,
-    .scene_threshold_high   = 10.0,
-    .overshoot_margin       = 0.05,
+    // Convert from histogram bin to (starting) PQ value
+#define HIST_PQ(bin) (((bin) + HIST_BIAS) << (PQ_BITS - HIST_BITS))
 };
 
-struct sh_peak_obj {
-    const struct pl_buf *buf;
-    struct pl_shader_desc desc;
-    float margin;
+
+pl_static_assert(PQ_BITS >= HIST_BITS);
+
+struct peak_buf_data {
+    unsigned frame_wg_count[SLICES]; // number of work groups processed
+    unsigned frame_sum_pq[SLICES];   // sum of PQ Y values over all WGs (PQ_BITS)
+    unsigned frame_max_pq[SLICES];   // maximum PQ Y value among these WGs (PQ_BITS)
+    unsigned frame_hist[SLICES][HIST_BINS]; // always allocated, conditionally used
 };
 
-static void sh_peak_uninit(const struct pl_gpu *gpu, void *ptr)
+static const struct pl_buffer_var peak_buf_vars[] = {
+#define VAR(field) {                                                            \
+    .var = {                                                                    \
+        .name = #field,                                                         \
+        .type = PL_VAR_UINT,                                                    \
+        .dim_v = 1,                                                             \
+        .dim_m = 1,                                                             \
+        .dim_a = sizeof(((struct peak_buf_data *) NULL)->field) /               \
+                 sizeof(unsigned),                                              \
+    },                                                                          \
+    .layout = {                                                                 \
+        .offset = offsetof(struct peak_buf_data, field),                        \
+        .size   = sizeof(((struct peak_buf_data *) NULL)->field),               \
+        .stride = sizeof(unsigned),                                             \
+    },                                                                          \
+}
+    VAR(frame_wg_count),
+    VAR(frame_sum_pq),
+    VAR(frame_max_pq),
+    VAR(frame_hist),
+#undef VAR
+};
+
+struct sh_color_map_obj {
+    // Tone map state
+    struct {
+        struct pl_tone_map_params params;
+        pl_shader_obj lut;
+    } tone;
+
+    // Gamut map state
+    struct {
+        struct pl_gamut_map_params params;
+        pl_shader_obj lut;
+    } gamut;
+
+    // Peak detection state
+    struct {
+        struct pl_peak_detect_params params;    // currently active parameters
+        pl_buf buf;                             // pending peak detection buffer
+        pl_buf readback;                        // readback buffer (fallback)
+        float avg_pq;                           // current (smoothed) values
+        float max_pq;
+    } peak;
+};
+
+static void sh_color_map_uninit(pl_gpu gpu, void *ptr)
 {
-    struct sh_peak_obj *obj = ptr;
-    pl_buf_destroy(gpu, &obj->buf);
-    *obj = (struct sh_peak_obj) {0};
+    struct sh_color_map_obj *obj = ptr;
+    pl_shader_obj_destroy(&obj->tone.lut);
+    pl_shader_obj_destroy(&obj->gamut.lut);
+    pl_buf_destroy(gpu, &obj->peak.buf);
+    pl_buf_destroy(gpu, &obj->peak.readback);
+    memset(obj, 0, sizeof(*obj));
 }
 
 static inline float iir_coeff(float rate)
@@ -606,784 +1047,1009 @@ static inline float iir_coeff(float rate)
     return sqrt(a*a + 2*a) - a;
 }
 
-bool pl_shader_detect_peak(struct pl_shader *sh,
-                           struct pl_color_space csp,
-                           struct pl_shader_obj **state,
+static float measure_peak(const struct peak_buf_data *data, float percentile)
+{
+    unsigned frame_max_pq = data->frame_max_pq[0];
+    for (int k = 1; k < SLICES; k++)
+        frame_max_pq = PL_MAX(frame_max_pq, data->frame_max_pq[k]);
+    const float frame_max = (float) frame_max_pq / PQ_MAX;
+    if (percentile <= 0 || percentile >= 100)
+        return frame_max;
+    unsigned total_pixels = 0;
+    for (int k = 0; k < SLICES; k++) {
+        for (int i = 0; i < HIST_BINS; i++)
+            total_pixels += data->frame_hist[k][i];
+    }
+    if (!total_pixels) // no histogram data available?
+        return frame_max;
+
+    const unsigned target_pixel = ceilf(percentile / 100.0f * total_pixels);
+    if (target_pixel >= total_pixels)
+        return frame_max;
+
+    unsigned sum = 0;
+    for (int i = 0; i < HIST_BINS; i++) {
+        unsigned next = sum;
+        for (int k = 0; k < SLICES; k++)
+            next += data->frame_hist[k][i];
+        if (next < target_pixel) {
+            sum = next;
+            continue;
+        }
+
+        // Upper and lower frequency boundaries of the matching histogram bin
+        const unsigned count_low  = sum;      // last pixel of previous bin
+        const unsigned count_high = next + 1; // first pixel of next bin
+        pl_assert(count_low < target_pixel && target_pixel < count_high);
+
+        // PQ luminance associated with count_low/high respectively
+        const float pq_low  = (float) HIST_PQ(i)     / PQ_MAX;
+        float pq_high       = (float) HIST_PQ(i + 1) / PQ_MAX;
+        if (count_high > total_pixels) // special case for last histogram bin
+            pq_high = frame_max;
+
+        // Position of `target_pixel` inside this bin, assumes pixels are
+        // equidistributed inside a histogram bin
+        const float ratio = (float) (target_pixel - count_low) /
+                                    (count_high - count_low);
+        return PL_MIX(pq_low, pq_high, ratio);
+    }
+
+    pl_unreachable();
+}
+
+// if `force` is true, ensures the buffer is read, even if `allow_delayed`
+static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force)
+{
+    const struct pl_peak_detect_params *params = &obj->peak.params;
+    if (!obj->peak.buf)
+        return;
+
+    if (!force && params->allow_delayed && pl_buf_poll(gpu, obj->peak.buf, 0))
+        return; // buffer not ready yet
+
+    bool ok;
+    struct peak_buf_data data = {0};
+    if (obj->peak.readback) {
+        pl_buf_copy(gpu, obj->peak.readback, 0, obj->peak.buf, 0, sizeof(data));
+        ok = pl_buf_read(gpu, obj->peak.readback, 0, &data, sizeof(data));
+    } else {
+        ok = pl_buf_read(gpu, obj->peak.buf, 0, &data, sizeof(data));
+    }
+    if (ok && data.frame_wg_count[0] > 0) {
+        // Peak detection completed successfully
+        pl_buf_destroy(gpu, &obj->peak.buf);
+    } else {
+        // No data read? Possibly this peak obj has not been executed yet
+        if (params->allow_delayed) {
+            PL_TRACE(gpu, "Peak detection buffer seems empty, ignoring..");
+        } else if (ok) {
+            PL_WARN(gpu, "Peak detection usage error: attempted detecting peak "
+                    "and using detected peak in the same shader program, "
+                    "but `params->allow_delayed` is false! Ignoring, but "
+                    "expect incorrect output.");
+        } else {
+            PL_ERR(gpu, "Failed reading peak detection buffer!");
+        }
+        if (force)
+            pl_buf_destroy(gpu, &obj->peak.buf);
+        return;
+    }
+
+    uint64_t frame_sum_pq = 0u, frame_wg_count = 0u;
+    for (int k = 0; k < SLICES; k++) {
+        frame_sum_pq   += data.frame_sum_pq[k];
+        frame_wg_count += data.frame_wg_count[k];
+    }
+    float avg_pq = (float) frame_sum_pq / (frame_wg_count * PQ_MAX);
+    float max_pq = measure_peak(&data, params->percentile);
+    const float min_peak = PL_DEF(params->minimum_peak, 1.0f);
+    max_pq = fmaxf(max_pq, pl_hdr_rescale(PL_HDR_NORM, PL_HDR_PQ, min_peak));
+
+    if (!obj->peak.avg_pq) {
+        // Set the initial value accordingly if it contains no data
+        obj->peak.avg_pq = avg_pq;
+        obj->peak.max_pq = max_pq;
+    } else {
+        // Ignore small deviations from existing peak (rounding error)
+        static const float epsilon = 1.0f / PQ_MAX;
+        if (fabsf(avg_pq - obj->peak.avg_pq) < epsilon)
+            avg_pq = obj->peak.avg_pq;
+        if (fabsf(max_pq - obj->peak.max_pq) < epsilon)
+            max_pq = obj->peak.max_pq;
+    }
+
+    // Use an IIR low-pass filter to smooth out the detected values
+    const float coeff = iir_coeff(PL_DEF(params->smoothing_period, 100.0f));
+    obj->peak.avg_pq += coeff * (avg_pq - obj->peak.avg_pq);
+    obj->peak.max_pq += coeff * (max_pq - obj->peak.max_pq);
+
+    // Scene change hysteresis
+    if (params->scene_threshold_low > 0 && params->scene_threshold_high > 0) {
+        const float log10_pq = 1e-2f; // experimentally determined approximate
+        const float thresh_low = params->scene_threshold_low * log10_pq;
+        const float thresh_high = params->scene_threshold_high * log10_pq;
+        const float delta = fabsf(avg_pq - obj->peak.avg_pq);
+        const float mix_coeff = pl_smoothstep(thresh_low, thresh_high, delta);
+        obj->peak.avg_pq = PL_MIX(obj->peak.avg_pq, avg_pq, mix_coeff);
+        obj->peak.max_pq = PL_MIX(obj->peak.max_pq, max_pq, mix_coeff);
+    }
+}
+
+bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
+                           pl_shader_obj *state,
                            const struct pl_peak_detect_params *params)
 {
     params = PL_DEF(params, &pl_peak_detect_default_params);
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return false;
 
-    if (!sh_try_compute(sh, 8, 8, true, 2 * sizeof(int32_t))) {
-        PL_ERR(sh, "HDR peak detection requires compute shaders!");
+    pl_gpu gpu = SH_GPU(sh);
+    if (!gpu || gpu->limits.max_ssbo_size < sizeof(struct peak_buf_data)) {
+        PL_ERR(sh, "HDR peak detection requires a GPU with support for at "
+               "least %zu bytes of SSBO data (supported: %zu)",
+               sizeof(struct peak_buf_data), gpu ? gpu->limits.max_ssbo_size : 0);
         return false;
     }
 
-    if (sh_glsl(sh).version < 130) {
-        // uint was added in GLSL 130
-        PL_ERR(sh, "HDR peak detection requires GLSL >= 130!");
+    const bool use_histogram = params->percentile > 0 && params->percentile < 100;
+    size_t shmem_req = 2 * sizeof(uint32_t);
+    if (use_histogram)
+        shmem_req += sizeof(uint32_t[HIST_BINS]);
+
+    if (!sh_try_compute(sh, 16, 16, true, shmem_req)) {
+        PL_ERR(sh, "HDR peak detection requires compute shaders with support "
+               "for at least %zu bytes of shared memory! (avail: %zu)",
+               shmem_req, sh_glsl(sh).max_shmem_size);
         return false;
     }
 
-    struct sh_peak_obj *obj;
-    obj = SH_OBJ(sh, state, PL_SHADER_OBJ_PEAK_DETECT, struct sh_peak_obj,
-                 sh_peak_uninit);
+    struct sh_color_map_obj *obj;
+    obj = SH_OBJ(sh, state, PL_SHADER_OBJ_COLOR_MAP, struct sh_color_map_obj,
+                 sh_color_map_uninit);
     if (!obj)
         return false;
 
-    const struct pl_gpu *gpu = SH_GPU(sh);
-    obj->margin = params->overshoot_margin;
-
-    if (!obj->buf) {
-        obj->desc = (struct pl_shader_desc) {
-            .desc = {
-                .name   = "PeakDetect",
-                .type   = PL_DESC_BUF_STORAGE,
-            },
-        };
-
-        // Note: Don't change this order, `vec2 average` being the first
-        // element is hard-coded in `pl_get_detected_peak`
-        bool ok = true;
-        ok &= sh_buf_desc_append(obj, gpu, &obj->desc, NULL, pl_var_vec2("average"));
-        ok &= sh_buf_desc_append(obj, gpu, &obj->desc, NULL, pl_var_int("frame_sum"));
-        ok &= sh_buf_desc_append(obj, gpu, &obj->desc, NULL, pl_var_int("frame_max"));
-        ok &= sh_buf_desc_append(obj, gpu, &obj->desc, NULL, pl_var_uint("counter"));
-
-        if (!ok) {
-            PL_ERR(sh, "HDR peak detection exhausts device limits!");
-            return false;
-        }
-
-        // Create the SSBO
-        size_t size = sh_buf_desc_size(&obj->desc);
-        static const uint8_t zero[32] = {0};
-        pl_assert(sizeof(zero) >= size);
-        struct pl_buf_params buf_params = {
-            .size = size,
-            .host_readable = true,
-            .memory_type = PL_BUF_MEM_DEVICE,
-            .storable = true,
-            .initial_data = zero,
-        };
-
-        // Attempt creating host-readable SSBO first, suppress errors
-        pl_log_level_cap(gpu->ctx, PL_LOG_DEBUG);
-        obj->buf = pl_buf_create(gpu, &buf_params);
-        pl_log_level_cap(gpu->ctx, PL_LOG_NONE);
-
-        if (!obj->buf) {
-            // Fall back to non-host-readable SSBO
-            buf_params.host_readable = false;
-            obj->buf = pl_buf_create(gpu, &buf_params);
-        }
-
-        obj->desc.binding.object = obj->buf;
+    if (peak_detect_params_eq(&obj->peak.params, params)) {
+        update_peak_buf(gpu, obj, true); // prevent over-writing previous frame
+    } else {
+        pl_reset_detected_peak(*state);
     }
 
-    if (!obj->buf) {
+    pl_assert(!obj->peak.buf);
+    static const struct peak_buf_data zero = {0};
+
+retry_ssbo:
+    if (obj->peak.readback) {
+        obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
+            .size           = sizeof(struct peak_buf_data),
+            .storable       = true,
+            .initial_data   = &zero,
+        ));
+    } else {
+        obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
+            .size           = sizeof(struct peak_buf_data),
+            .memory_type    = PL_BUF_MEM_DEVICE,
+            .host_readable  = true,
+            .storable       = true,
+            .initial_data   = &zero,
+        ));
+    }
+
+    if (!obj->peak.buf && !obj->peak.readback) {
+        PL_WARN(sh, "Failed creating host-readable peak detection SSBO, "
+                "retrying with fallback buffer");
+        obj->peak.readback = pl_buf_create(gpu, pl_buf_params(
+            .size           = sizeof(struct peak_buf_data),
+            .host_readable  = true,
+        ));
+        if (obj->peak.readback)
+            goto retry_ssbo;
+    }
+
+    if (!obj->peak.buf) {
         SH_FAIL(sh, "Failed creating peak detection SSBO!");
         return false;
     }
 
-    // Attach the SSBO and perform the peak detection logic
-    obj->desc.desc.access = PL_DESC_ACCESS_READWRITE;
-    obj->desc.memory = PL_MEMORY_COHERENT;
-    sh_desc(sh, obj->desc);
-    GLSL("// pl_shader_detect_peak \n"
-         "{                        \n"
-         "vec4 color_orig = color; \n");
+    obj->peak.params = *params;
 
-    // Decode the color into linear light absolute scale representation
-    pl_color_space_infer(&csp);
-    pl_shader_linearize(sh, csp.transfer);
-    pl_shader_ootf(sh, csp);
+    sh_desc(sh, (struct pl_shader_desc) {
+        .desc = {
+            .name   = "PeakBuf",
+            .type   = PL_DESC_BUF_STORAGE,
+            .access = PL_DESC_ACCESS_READWRITE,
+        },
+        .binding.object  = obj->peak.buf,
+        .buffer_vars     = (struct pl_buffer_var *) peak_buf_vars,
+        .num_buffer_vars = PL_ARRAY_SIZE(peak_buf_vars),
+    });
+
+    sh_describe(sh, "peak detection");
+    GLSL("// pl_shader_detect_peak                                      \n"
+         "{                                                             \n"
+         "const uint wg_size = gl_WorkGroupSize.x * gl_WorkGroupSize.y; \n"
+         "uint wg_idx = gl_WorkGroupID.y * gl_NumWorkGroups.x +         \n"
+         "              gl_WorkGroupID.x;                               \n"
+         "uint slice = wg_idx %% %du;                                   \n"
+         "vec4 color_orig = color;                                      \n",
+         SLICES);
 
     // For performance, we want to do as few atomic operations on global
     // memory as possible, so use an atomic in shmem for the work group.
-    ident_t wg_sum = sh_fresh(sh, "wg_sum"), wg_max = sh_fresh(sh, "wg_max");
-    GLSLH("shared int %s;   \n", wg_sum);
-    GLSLH("shared int %s;   \n", wg_max);
-    GLSL("%s = 0; %s = 0;   \n"
+    ident_t wg_sum = sh_fresh(sh, "wg_sum"),
+            wg_max = sh_fresh(sh, "wg_max"),
+            wg_hist = NULL_IDENT;
+    GLSLH("shared uint "$", "$"; \n", wg_sum, wg_max);
+    if (use_histogram) {
+        wg_hist = sh_fresh(sh, "wg_hist");
+        GLSLH("shared uint "$"[%u]; \n", wg_hist, HIST_BINS);
+        GLSL("for (uint i = gl_LocalInvocationIndex; i < %du; i += wg_size) \n"
+             "    "$"[i] = 0u;                                              \n",
+             HIST_BINS, wg_hist);
+    }
+    GLSL($" = 0u; "$" = 0u; \n"
          "barrier();        \n",
          wg_sum, wg_max);
 
-    // Chosen to avoid overflowing on an 8K buffer
-    const float log_min = 1e-3, log_scale = 400.0, sig_scale = 10000.0;
+    // Decode color into linear light representation
+    pl_color_space_infer(&csp);
+    pl_shader_linearize(sh, &csp);
 
-    GLSL("float sig_max = max(max(color.r, color.g), color.b);  \n"
-         "float sig_log = log(max(sig_max, %f));                \n"
-         "int isig_max = int(sig_max * %f);                     \n"
-         "int isig_log = int(sig_log * %f);                     \n",
-         log_min, sig_scale, log_scale);
+    // Measure luminance as N-bit PQ
+    GLSL("float luma = dot("$", color.rgb);             \n"
+         "luma *= %f;                                   \n"
+         "luma = pow(clamp(luma, 0.0, 1.0), %f);        \n"
+         "luma = (%f + %f * luma) / (1.0 + %f * luma);  \n"
+         "luma = pow(luma, %f);                         \n"
+         "uint y_pq = uint(%d.0 * luma);                \n",
+         sh_luma_coeffs(sh, &csp.hdr.prim),
+         PL_COLOR_SDR_WHITE / 10000.0,
+         PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2,
+         PQ_MAX);
 
     // Update the work group's shared atomics
-    if (gpu->caps & PL_GPU_CAP_SUBGROUPS) {
-        GLSL("int group_max = subgroupMax(isig_max);    \n"
-             "int group_sum = subgroupAdd(isig_log);    \n"
-             "if (subgroupElect()) {                    \n"
-             "    atomicMax(%s, group_max);             \n"
-             "    atomicAdd(%s, group_sum);             \n"
-             "}                                         \n"
-             "barrier();                                \n",
-             wg_max, wg_sum);
-    } else {
-        GLSL("atomicMax(%s, isig_max);  \n"
-             "atomicAdd(%s, isig_log);  \n"
-             "barrier();                \n",
-             wg_max, wg_sum);
+    bool has_subgroups = sh_glsl(sh).subgroup_size > 0;
+    if (use_histogram) {
+        GLSL("int bin = (int(y_pq) >> %d) - %d; \n"
+             "bin = clamp(bin, 0, %d);          \n",
+             PQ_BITS - HIST_BITS, HIST_BIAS,
+             HIST_BINS - 1);
+        if (has_subgroups) {
+            // Optimize for the very common case of identical histogram bins
+            GLSL("if (subgroupAllEqual(bin)) {                  \n"
+                 "    if (subgroupElect())                      \n"
+                 "        atomicAdd("$"[bin], gl_SubgroupSize); \n"
+                 "} else {                                      \n"
+                 "    atomicAdd("$"[bin], 1u);                  \n"
+                 "}                                             \n",
+                 wg_hist, wg_hist);
+        } else {
+            GLSL("atomicAdd("$"[bin], 1u); \n", wg_hist);
+        }
     }
 
-    GLSL("color = color_orig;   \n"
-         "}                     \n");
+    if (has_subgroups) {
+        GLSL("uint group_sum = subgroupAdd(y_pq);   \n"
+             "uint group_max = subgroupMax(y_pq);   \n"
+             "if (subgroupElect()) {                \n"
+             "    atomicAdd("$", group_sum);        \n"
+             "    atomicMax("$", group_max);        \n"
+             "}                                     \n"
+             "barrier();                            \n",
+             wg_sum, wg_max);
+    } else {
+        GLSL("atomicAdd("$", y_pq); \n"
+             "atomicMax("$", y_pq); \n"
+             "barrier();            \n",
+             wg_sum, wg_max);
+    }
 
-    // Have one thread per work group update the global atomics. Do this
-    // at the end of the shader to avoid clobbering `average`, in case the
-    // state object will be used by the same pass.
-    GLSLF("// pl_shader_detect_peak                                             \n"
-          "if (gl_LocalInvocationIndex == 0u) {                                 \n"
-          "    int wg_avg = %s / int(gl_WorkGroupSize.x * gl_WorkGroupSize.y);  \n"
-          "    atomicAdd(frame_sum, wg_avg);                                    \n"
-          "    atomicMax(frame_max, %s);                                        \n"
-          "    memoryBarrierBuffer();                                           \n"
-          "}                                                                    \n"
-          "barrier();                                                           \n",
+    if (use_histogram) {
+        GLSL("for (uint i = gl_LocalInvocationIndex; i < %du; i += wg_size) \n"
+             "    atomicAdd(frame_hist[slice * %du + i], "$"[i]);           \n",
+             HIST_BINS, HIST_BINS, wg_hist);
+    }
+
+    // Have one thread per work group update the global atomics
+    GLSL("if (gl_LocalInvocationIndex == 0u) {              \n"
+         "    atomicAdd(frame_wg_count[slice], 1u);         \n"
+         "    atomicAdd(frame_sum_pq[slice], "$" / wg_size);\n"
+         "    atomicMax(frame_max_pq[slice], "$");          \n"
+         "}                                                 \n"
+         "color = color_orig;                               \n"
+         "}                                                 \n",
           wg_sum, wg_max);
 
-    // Finally, to update the global state per dispatch, we increment a counter
-    GLSLF("if (gl_LocalInvocationIndex == 0u) {                                 \n"
-          "    uint num_wg = gl_NumWorkGroups.x * gl_NumWorkGroups.y;           \n"
-          "    if (atomicAdd(counter, 1u) == num_wg - 1u) {                     \n"
-          "        vec2 cur = vec2(float(frame_sum) / float(num_wg), frame_max);\n"
-          "        cur *= vec2(1.0 / %f, 1.0 / %f);                             \n"
-          "        cur.x = exp(cur.x);                                          \n",
-          log_scale, sig_scale);
-
-    // Set the initial value accordingly if it contains no data
-    GLSLF("        if (average.y == 0.0) \n"
-          "            average = cur;    \n");
-
-    // Use an IIR low-pass filter to smooth out the detected values
-    GLSLF("        average += %f * (cur - average); \n",
-          iir_coeff(PL_DEF(params->smoothing_period, 100.0)));
-
-    // Scene change hysteresis
-    float log_db = 10.0 / log(10.0);
-    if (params->scene_threshold_low > 0 && params->scene_threshold_high > 0) {
-        GLSLF("    float delta = abs(log(cur.x / average.x));               \n"
-              "    average = mix(average, cur, smoothstep(%f, %f, delta));  \n",
-              params->scene_threshold_low / log_db,
-              params->scene_threshold_high / log_db);
-    }
-
-    // Reset SSBO state for the next frame
-    GLSLF("        frame_sum = 0;            \n"
-          "        frame_max = 0;            \n"
-          "        counter = 0u;             \n"
-          "        memoryBarrierBuffer();    \n"
-          "    }                             \n"
-          "}                                 \n");
-
     return true;
 }
 
-bool pl_get_detected_peak(const struct pl_shader_obj *state,
-                          float *out_peak, float *out_avg)
+bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
+                                  struct pl_hdr_metadata *out)
 {
-    if (!state || state->type != PL_SHADER_OBJ_PEAK_DETECT)
+    if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
         return false;
 
-    struct sh_peak_obj *obj = state->priv;
-    const struct pl_gpu *gpu = state->gpu;
-    const struct pl_buf *buf = obj->buf;
+    struct sh_color_map_obj *obj = state->priv;
+    update_peak_buf(state->gpu, obj, false);
+    if (!obj->peak.avg_pq)
+        return false;
 
-    float average[2] = {0};
-    pl_assert(obj->buf->params.size >= sizeof(average));
-
-    if (buf->params.host_readable) {
-
-        // We can read directly from the SSBO
-        if (!pl_buf_read(gpu, buf, 0, average, sizeof(average))) {
-            PL_ERR(gpu, "Failed reading from peak detect state buffer");
-            return false;
-        }
-
-    } else {
-
-        // We can't read directly from the SSBO, go via an intermediary
-        const struct pl_buf *tmp = pl_buf_create(gpu, &(struct pl_buf_params) {
-            .size = sizeof(average),
-            .host_readable = true,
-        });
-
-        if (!tmp) {
-            PL_ERR(gpu, "Failed creating buffer for SSBO read-back");
-            return false;
-        }
-
-        pl_buf_copy(gpu, tmp, 0, buf, 0, sizeof(average));
-        if (!pl_buf_read(gpu, tmp, 0, average, sizeof(average))) {
-            PL_ERR(gpu, "Failed reading from SSBO read-back buffer");
-            pl_buf_destroy(gpu, &tmp);
-            return false;
-        }
-        pl_buf_destroy(gpu, &tmp);
-
-    }
-
-    *out_avg = average[0];
-    *out_peak = average[1];
-
-    if (obj->margin > 0.0) {
-        *out_peak *= 1.0 + obj->margin;
-        *out_peak = PL_MIN(*out_peak, 10000 / PL_COLOR_SDR_WHITE);
-    }
-
+    out->max_pq_y = obj->peak.max_pq;
+    out->avg_pq_y = obj->peak.avg_pq;
     return true;
 }
 
-static inline float pq_delinearize(float x)
+bool pl_get_detected_peak(const pl_shader_obj state,
+                          float *out_peak, float *out_avg)
 {
-    x *= PL_COLOR_SDR_WHITE / 10000.0;
-    x = powf(x, PQ_M1);
-    x = (PQ_C1 + PQ_C2 * x) / (1.0 + PQ_C3 * x);
-    x = pow(x, PQ_M2);
-    return x;
+    struct pl_hdr_metadata data;
+    if (!pl_get_detected_hdr_metadata(state, &data))
+        return false;
+
+    // Preserves old behavior
+    *out_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, data.max_pq_y);
+    *out_avg  = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, data.avg_pq_y);
+    return true;
 }
 
-const struct pl_color_map_params pl_color_map_default_params = {
-    .intent                 = PL_INTENT_RELATIVE_COLORIMETRIC,
-    .tone_mapping_algo      = PL_TONE_MAPPING_BT_2390,
-    .desaturation_strength  = 0.75,
-    .desaturation_exponent  = 1.50,
-    .desaturation_base      = 0.18,
-    .gamut_clipping         = true,
-};
-
-static void pl_shader_tone_map(struct pl_shader *sh, struct pl_color_space src,
-                               struct pl_color_space dst,
-                               struct pl_shader_obj **peak_detect_state,
-                               const struct pl_color_map_params *params)
+void pl_reset_detected_peak(pl_shader_obj state)
 {
-    GLSL("// pl_shader_tone_map \n"
-         "{                     \n");
+    if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
+        return;
 
-    // To prevent discoloration due to out-of-bounds clipping, we need to make
-    // sure to reduce the value range as far as necessary to keep the entire
-    // signal in range, so tone map based on the brightest component.
-    GLSL("int sig_idx = 0;                              \n"
-         "if (color[1] > color[sig_idx]) sig_idx = 1;   \n"
-         "if (color[2] > color[sig_idx]) sig_idx = 2;   \n"
-         "float sig_max = color[sig_idx];               \n"
-         "float sig_peak = %f;                          \n"
-         "float sig_avg = %f;                           \n",
-         src.sig_peak * src.sig_scale,
-         src.sig_avg * src.sig_scale);
-
-    // Update the variables based on values from the peak detection buffer
-    if (peak_detect_state) {
-        struct sh_peak_obj *obj;
-        obj = SH_OBJ(sh, peak_detect_state, PL_SHADER_OBJ_PEAK_DETECT,
-                     struct sh_peak_obj, sh_peak_uninit);
-        if (obj && obj->buf) {
-            obj->desc.desc.access = PL_DESC_ACCESS_READONLY;
-            obj->desc.memory = 0;
-            sh_desc(sh, obj->desc);
-            GLSL("sig_avg  = average.x; \n"
-                 "sig_peak = average.y; \n");
-
-            // Apply a tiny bit of extra margin of error for overshoot to the
-            // smoothed peak values, clamped to the maximum reasonable range.
-            if (obj->margin > 0.0) {
-                GLSL("sig_peak = min(sig_peak * %f, %f); \n",
-                     1.0 + obj->margin,
-                     10000 / PL_COLOR_SDR_WHITE);
-            }
-        }
-    }
-
-    // Rescale the input in order to bring it into a representation where 1.0
-    // represents the dst_peak. This is because (almost) all of the tone
-    // mapping algorithms are defined in such a way that they map to the range
-    // [0.0, 1.0].
-    bool need_norm = params->tone_mapping_algo != PL_TONE_MAPPING_BT_2390;
-    float dst_range = dst.sig_peak * dst.sig_scale;
-    if (dst_range > 1.0 && need_norm) {
-        GLSL("color.rgb *= 1.0 / %f; \n"
-             "sig_peak *= 1.0 / %f;  \n",
-             dst_range, dst_range);
-    }
-
-    // Rename `color.rgb` to something shorter for conciseness, and also
-    // apply clipping to prevent the tone mapping functions from exploding
-    // for input values exceeding sig_peak
-    GLSL("vec3 sig = min(color.rgb, sig_peak); \n"
-         "vec3 sig_orig = color.rgb;           \n");
-
-    // Scale the signal to compensate for differences in the average brightness
-    GLSL("float slope = min(%f, %f / sig_avg); \n"
-         "sig *= slope;                        \n"
-         "sig_peak *= slope;                   \n",
-         PL_DEF(params->max_boost, 1.0), dst.sig_avg * dst.sig_scale);
-
-    float param = params->tone_mapping_param;
-    switch (params->tone_mapping_algo) {
-    case PL_TONE_MAPPING_CLIP:
-        GLSL("sig *= min(%f, 1.0) ;\n", PL_DEF(param, 1.0));
-        break;
-
-    case PL_TONE_MAPPING_MOBIUS:
-        // Mobius isn't well-defined for sig_peak <= 1.0, but the limit of
-        // mobius as sig_peak -> 1.0 is a linear function, so we can just skip
-        // tone-mapping in this case
-        GLSL("if (sig_peak > 1.0 + 1e-6) {                                      \n"
-             "    const float j = %f;                                           \n"
-             // solve for M(j) = j; M(sig_peak) = 1.0; M'(j) = 1.0
-             // where M(x) = scale * (x+a)/(x+b)
-             "    float a = -j*j * (sig_peak - 1.0) / (j*j - 2.0*j + sig_peak); \n"
-             "    float b = (j*j - 2.0*j*sig_peak + sig_peak) /                 \n"
-             "              max(1e-6, sig_peak - 1.0);                          \n"
-             "    float scale = (b*b + 2.0*b*j + j*j) / (b-a);                  \n"
-             "    sig = mix(sig, scale * (sig + vec3(a)) / (sig + vec3(b)),     \n"
-             "              %s(greaterThan(sig, vec3(j))));                     \n"
-             "}                                                                 \n",
-             PL_DEF(param, 0.3),
-             sh_bvec(sh, 3));
-        break;
-
-    case PL_TONE_MAPPING_REINHARD: {
-        float contrast = PL_DEF(param, 0.5),
-              offset = (1.0 - contrast) / contrast;
-        GLSL("sig = sig / (sig + vec3(%f));             \n"
-             "float scale = (sig_peak + %f) / sig_peak; \n"
-             "sig *= scale;                             \n",
-             offset, offset);
-        break;
-    }
-
-    case PL_TONE_MAPPING_HABLE: {
-        float A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
-        ident_t hable = sh_fresh(sh, "hable");
-        GLSLH("vec3 %s(vec3 x) {                                \n"
-              "    return (x * (%f*x + vec3(%f)) + vec3(%f)) /  \n"
-              "           (x * (%f*x + vec3(%f)) + vec3(%f))    \n"
-              "           - vec3(%f);                           \n"
-              "}                                                \n",
-              hable, A, C*B, D*E, A, B, D*F, E/F);
-        GLSL("sig = %s(sig) / %s(vec3(sig_peak)).x;\n", hable, hable);
-        break;
-    }
-
-    case PL_TONE_MAPPING_GAMMA:
-        GLSL("const float cutoff = 0.05, gamma = 1.0/%f;            \n"
-             "float scale = pow(cutoff / sig_peak, gamma) / cutoff; \n"
-             "sig = mix(scale * sig,                                \n"
-             "          pow(sig / sig_peak, vec3(gamma)),           \n"
-             "          %s(greaterThan(sig, vec3(cutoff))));        \n",
-             PL_DEF(param, 1.8),
-             sh_bvec(sh, 3));
-        break;
-
-    case PL_TONE_MAPPING_LINEAR:
-        GLSL("sig *= min(%f / sig_peak, 1.0);\n", PL_DEF(param, 1.0));
-        break;
-
-    case PL_TONE_MAPPING_BT_2390:
-        // We first need to encode both sig and sig_peak into PQ space
-        GLSL("vec4 sig_pq = vec4(sig.rgb, sig_peak);                            \n"
-             "sig_pq *= vec4(1.0/%f);                                           \n"
-             "sig_pq = pow(max(sig_pq, 0.0), vec4(%f));                         \n"
-             "sig_pq = (vec4(%f) + vec4(%f) * sig_pq)                           \n"
-             "          / (vec4(1.0) + vec4(%f) * sig_pq);                      \n"
-             "sig_pq = pow(sig_pq, vec4(%f));                                   \n",
-             10000 / PL_COLOR_SDR_WHITE, PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
-        // Encode both the signal and the target brightness to be relative to
-        // the source peak brightness, and figure out the target peak in this space
-        GLSL("float scale = 1.0 / sig_pq.a;                                     \n"
-             "sig_pq.rgb = min(vec3(scale) * sig_pq.rgb, 1.0);                  \n"
-             "float maxLum = %f * scale;                                        \n",
-             pq_delinearize(dst_range));
-        // Apply piece-wise hermite spline
-        GLSL("float ks = 1.5 * maxLum - 0.5;                                    \n"
-             "vec3 tb = (sig_pq.rgb - vec3(ks)) / vec3(1.0 - ks);               \n"
-             "vec3 tb2 = tb * tb;                                               \n"
-             "vec3 tb3 = tb2 * tb;                                              \n"
-             "vec3 pb = (2.0 * tb3 - 3.0 * tb2 + vec3(1.0)) * vec3(ks) +        \n"
-             "          (tb3 - 2.0 * tb2 + tb) * vec3(1.0 - ks) +               \n"
-             "          (-2.0 * tb3 + 3.0 * tb2) * vec3(maxLum);                \n"
-             "sig = mix(pb, sig_pq.rgb, %s(lessThan(sig_pq.rgb, vec3(ks))));    \n",
-             sh_bvec(sh, 3));
-        // Convert back from PQ space to linear light
-        GLSL("sig *= vec3(sig_pq.a);                                            \n"
-             "sig = pow(max(sig, 0.0), vec3(1.0/%f));                           \n"
-             "sig = max(sig - vec3(%f), 0.0) /                                  \n"
-             "          (vec3(%f) - vec3(%f) * sig);                            \n"
-             "sig = pow(sig, vec3(1.0/%f));                                     \n"
-             "sig *= vec3(%f);                                                  \n",
-             PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1, 10000.0 / PL_COLOR_SDR_WHITE);
-        break;
-
-    default:
-        abort();
-    }
-
-    GLSL("vec3 sig_lin = sig_orig * (sig[sig_idx] / sig_orig[sig_idx]); \n");
-
-    // Mix between the per-channel tone mapped `sig` and the linear tone
-    // mapped `sig_lin` based on the desaturation strength
-    if (params->desaturation_strength > 0.0) {
-        GLSL("float coeff = max(sig[sig_idx] - %f, 1e-6) /  \n"
-             "              max(sig[sig_idx], 1.0);         \n"
-             "coeff = %f * pow(coeff, %f);                  \n"
-             "color.rgb = mix(sig_lin, sig, coeff);         \n",
-             params->desaturation_base,
-             params->desaturation_strength,
-             params->desaturation_exponent);
-    } else {
-        GLSL("color.rgb = sig_lin; \n");
-    }
-
-    // Undo the normalization by `dst_peak`
-    if (dst_range > 1.0 && need_norm)
-        GLSL("color.rgb *= %f; \n", dst_range);
-
-    GLSL("} \n");
+    struct sh_color_map_obj *obj = state->priv;
+    pl_buf readback = obj->peak.readback;
+    pl_buf_destroy(state->gpu, &obj->peak.buf);
+    memset(&obj->peak, 0, sizeof(obj->peak));
+    obj->peak.readback = readback;
 }
 
-void pl_shader_color_map(struct pl_shader *sh,
-                         const struct pl_color_map_params *params,
-                         struct pl_color_space src, struct pl_color_space dst,
-                         struct pl_shader_obj **peak_detect_state,
-                         bool prelinearized)
+void pl_shader_extract_features(pl_shader sh, struct pl_color_space csp)
 {
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
 
-    GLSL("// pl_shader_color_map\n");
-    GLSL("{\n");
+    sh_describe(sh, "feature extraction");
+    pl_shader_linearize(sh, &csp);
+    GLSL("// pl_shader_extract_features             \n"
+         "{                                         \n"
+         "vec3 lms = %f * "$" * color.rgb;          \n"
+         "lms = pow(max(lms, 0.0), vec3(%f));       \n"
+         "lms = (vec3(%f) + %f * lms)               \n"
+         "        / (vec3(1.0) + %f * lms);         \n"
+         "lms = pow(lms, vec3(%f));                 \n"
+         "float I = dot(vec3(%f, %f, %f), lms);     \n"
+         "color = vec4(I, 0.0, 0.0, 1.0);           \n"
+         "}                                         \n",
+         PL_COLOR_SDR_WHITE / 10000,
+         SH_MAT3(pl_ipt_rgb2lms(pl_raw_primaries_get(csp.primaries))),
+         PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2,
+         pl_ipt_lms2ipt.m[0][0], pl_ipt_lms2ipt.m[0][1], pl_ipt_lms2ipt.m[0][2]);
+}
+
+const struct pl_color_map_params pl_color_map_default_params = { PL_COLOR_MAP_DEFAULTS };
+const struct pl_color_map_params pl_color_map_high_quality_params = { PL_COLOR_MAP_HQ_DEFAULTS };
+
+static ident_t rect_pos(pl_shader sh, pl_rect2df rc)
+{
+    if (!rc.x0 && !rc.x1)
+        rc.x1 = 1.0f;
+    if (!rc.y0 && !rc.y1)
+        rc.y1 = 1.0f;
+
+    return sh_attr_vec2(sh, "tone_map_coords", &(pl_rect2df) {
+        .x0 = -rc.x0         / (rc.x1 - rc.x0),
+        .x1 = (1.0f - rc.x0) / (rc.x1 - rc.x0),
+        .y0 = -rc.y1         / (rc.y0 - rc.y1),
+        .y1 = (1.0f - rc.y1) / (rc.y0 - rc.y1),
+    });
+}
+
+static void visualize_tone_map(pl_shader sh, pl_rect2df rc, float alpha,
+                               const struct pl_tone_map_params *params)
+{
+    pl_assert(params->input_scaling  == PL_HDR_PQ);
+    pl_assert(params->output_scaling == PL_HDR_PQ);
+
+    GLSL("// Visualize tone mapping                 \n"
+         "{                                         \n"
+         "vec2 pos = "$";                           \n"
+         "if (min(pos.x, pos.y) >= 0.0 &&           \n" // visualizer rect
+         "    max(pos.x, pos.y) <= 1.0)             \n"
+         "{                                         \n"
+         "float xmin = "$";                         \n"
+         "float xmax = "$";                         \n"
+         "float xavg = "$";                         \n"
+         "float ymin = "$";                         \n"
+         "float ymax = "$";                         \n"
+         "float alpha = 0.8 * "$";                  \n"
+         "vec3 viz = color.rgb;                     \n"
+         "float vv = tone_map(pos.x);               \n"
+         // Color based on region
+         "if (pos.x < xmin || pos.x > xmax) {       \n" // outside source
+         "} else if (pos.y < ymin || pos.y > ymax) {\n" // outside target
+         "    if (pos.y < xmin || pos.y > xmax) {   \n" //  and also source
+         "        viz = vec3(0.1, 0.1, 0.5);        \n"
+         "    } else {                              \n"
+         "        viz = vec3(0.2, 0.05, 0.05);      \n" //  but inside source
+         "    }                                     \n"
+         "} else {                                  \n" // inside domain
+         "    if (abs(pos.x - pos.y) < 1e-3) {      \n" // main diagonal
+         "        viz = vec3(0.2);                  \n"
+         "    } else if (pos.y < vv) {              \n" // inside function
+         "        alpha *= 0.6;                     \n"
+         "        viz = vec3(0.05);                 \n"
+         "        if (vv > pos.x && pos.y > pos.x)  \n" // output brighter than input
+         "            viz.rg = vec2(0.5, 0.7);      \n"
+         "    } else {                              \n" // outside function
+         "        if (vv < pos.x && pos.y < pos.x)  \n" // output darker than input
+         "            viz = vec3(0.0, 0.1, 0.2);    \n"
+         "    }                                     \n"
+         "    if (pos.y > xmax) {                   \n" // inverse tone-mapping region
+         "        vec3 hi = vec3(0.2, 0.5, 0.8);    \n"
+         "        viz = mix(viz, hi, 0.5);          \n"
+         "    } else if (pos.y < xmin) {            \n" // black point region
+         "        viz = mix(viz, vec3(0.0), 0.3);   \n"
+         "    }                                     \n"
+         "    if (xavg > 0.0 && abs(pos.x - xavg) < 1e-3)\n" // source avg brightness
+         "        viz = vec3(0.5);                  \n"
+         "}                                         \n"
+         "color.rgb = mix(color.rgb, viz, alpha);   \n"
+         "}                                         \n"
+         "}                                         \n",
+         rect_pos(sh, rc),
+         SH_FLOAT_DYN(params->input_min),
+         SH_FLOAT_DYN(params->input_max),
+         SH_FLOAT_DYN(params->input_avg),
+         SH_FLOAT(params->output_min),
+         SH_FLOAT_DYN(params->output_max),
+         SH_FLOAT_DYN(alpha));
+}
+
+static void visualize_gamut_map(pl_shader sh, pl_rect2df rc,
+                                ident_t lut, float hue, float theta,
+                                const struct pl_gamut_map_params *params)
+{
+    ident_t ipt2lms = SH_MAT3(pl_ipt_ipt2lms);
+    ident_t lms2rgb_src = SH_MAT3(pl_ipt_lms2rgb(&params->input_gamut));
+    ident_t lms2rgb_dst = SH_MAT3(pl_ipt_lms2rgb(&params->output_gamut));
+
+    GLSL("// Visualize gamut mapping                            \n"
+         "vec2 pos = "$";                                       \n"
+         "float pqmin = "$";                                    \n"
+         "float pqmax = "$";                                    \n"
+         "float rgbmin = "$";                                   \n"
+         "float rgbmax = "$";                                   \n"
+         "vec3 orig = ipt;                                      \n"
+         "if (min(pos.x, pos.y) >= 0.0 &&                       \n"
+         "    max(pos.x, pos.y) <= 1.0)                         \n"
+         "{                                                     \n"
+         // Source color to visualize
+         "float mid = mix(pqmin, pqmax, 0.6);                   \n"
+         "vec3 base = vec3(0.5, 0.0, 0.0);                      \n"
+         "float hue = "$", theta = "$";                         \n"
+         "base.x = mix(base.x, mid, sin(theta));                \n"
+         "mat3 rot1 = mat3(1.0,    0.0,      0.0,               \n"
+         "                 0.0,  cos(hue), sin(hue),            \n"
+         "                 0.0, -sin(hue), cos(hue));           \n"
+         "mat3 rot2 = mat3( cos(theta), 0.0, sin(theta),        \n"
+         "                     0.0,     1.0,    0.0,            \n"
+         "                 -sin(theta), 0.0, cos(theta));       \n"
+         "vec3 dir = vec3(pos.yx - vec2(0.5), 0.0);             \n"
+         "ipt = base + rot1 * rot2 * dir;                       \n"
+         // Convert back to RGB (for gamut boundary testing)
+         "lmspq = "$" * ipt;                                    \n"
+         "lms = pow(max(lmspq, 0.0), vec3(1.0/%f));             \n"
+         "lms = max(lms - vec3(%f), 0.0)                        \n"
+         "             / (vec3(%f) - %f * lms);                 \n"
+         "lms = pow(lms, vec3(1.0/%f));                         \n"
+         "lms *= %f;                                            \n"
+         // Check against src/dst gamut boundaries
+         "vec3 rgbsrc = "$" * lms;                              \n"
+         "vec3 rgbdst = "$" * lms;                              \n"
+         "bool insrc, indst;                                    \n"
+         "insrc = all(lessThan(rgbsrc, vec3(rgbmax))) &&        \n"
+         "              all(greaterThan(rgbsrc, vec3(rgbmin))); \n"
+         "indst = all(lessThan(rgbdst, vec3(rgbmax))) &&        \n"
+         "              all(greaterThan(rgbdst, vec3(rgbmin))); \n"
+         // Sample from gamut mapping 3DLUT
+         "idx.x = (ipt.x - pqmin) / (pqmax - pqmin);            \n"
+         "idx.y = 2.0 * length(ipt.yz);                         \n"
+         "idx.z = %f * atan(ipt.z, ipt.y) + 0.5;                \n"
+         "vec3 mapped = "$"(idx).xyz;                           \n"
+         "float mappedhue = atan(mapped.z, mapped.y);           \n"
+         "float mappedchroma = length(mapped.yz);               \n"
+         "ipt = mapped;                                         \n"
+         // Visualize gamuts
+         "if (!insrc && !indst) {                               \n"
+         "    ipt = orig;                                       \n"
+         "} else if (insrc && !indst) {                         \n"
+         "    ipt.x -= 0.1;                                     \n"
+         "} else if (indst && !insrc) {                         \n"
+         "    ipt.x += 0.1;                                     \n"
+         "}                                                     \n"
+         // Visualize iso-luminance and iso-hue lines
+         "vec3 line;                                            \n"
+         "if (insrc && fract(50.0 * mapped.x) < 1e-1) {         \n"
+         "    float k = smoothstep(0.1, 0.0, abs(sin(theta)));  \n"
+         "    line.x = mix(mapped.x, 0.3, 0.5);                 \n"
+         "    line.yz = sqrt(length(mapped.yz)) *               \n"
+         "              normalize(mapped.yz);                   \n"
+         "    ipt = mix(ipt, line, k);                          \n"
+         "}                                                     \n"
+         "if (insrc && fract(10.0 * (mappedhue - hue)) < 1e-1) {\n"
+         "    float k = smoothstep(0.3, 0.0, abs(cos(theta)));  \n"
+         "    line.x = mapped.x - 0.05;                         \n"
+         "    line.yz = 1.2 * mapped.yz;                        \n"
+         "    ipt = mix(ipt, line, k);                          \n"
+         "}                                                     \n"
+         "if (insrc && fract(100.0 * mappedchroma) < 1e-1) {    \n"
+         "    line.x = mapped.x + 0.1;                          \n"
+         "    line.yz = 0.4 * mapped.yz;                        \n"
+         "    ipt = mix(ipt, line, 0.5);                        \n"
+         "}                                                     \n"
+         "}                                                     \n",
+         rect_pos(sh, rc),
+         SH_FLOAT(params->min_luma), SH_FLOAT(params->max_luma),
+         SH_FLOAT(pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, params->min_luma)),
+         SH_FLOAT(pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, params->max_luma)),
+         SH_FLOAT_DYN(hue), SH_FLOAT_DYN(theta),
+         ipt2lms,
+         PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
+         10000 / PL_COLOR_SDR_WHITE,
+         lms2rgb_src,
+         lms2rgb_dst,
+         0.5f / M_PI,
+         lut);
+}
+
+static void fill_tone_lut(void *data, const struct sh_lut_params *params)
+{
+    const struct pl_tone_map_params *lut_params = params->priv;
+    pl_tone_map_generate(data, lut_params);
+}
+
+static void fill_gamut_lut(void *data, const struct sh_lut_params *params)
+{
+    const struct pl_gamut_map_params *lut_params = params->priv;
+    pl_gamut_map_generate(data, lut_params);
+}
+
+void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *params,
+                            const struct pl_color_map_args *args)
+{
+    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
+        return;
+
+    struct pl_color_space src = args->src, dst = args->dst;
+    pl_color_space_infer_map(&src, &dst);
+    if (pl_color_space_equal(&src, &dst)) {
+        if (args->prelinearized)
+            pl_shader_delinearize(sh, &dst);
+        return;
+    }
+
+    struct sh_color_map_obj *obj = NULL;
+    if (args->state) {
+        pl_get_detected_hdr_metadata(*args->state, &src.hdr);
+        obj = SH_OBJ(sh, args->state, PL_SHADER_OBJ_COLOR_MAP, struct sh_color_map_obj,
+                     sh_color_map_uninit);
+        if (!obj)
+            return;
+    }
+
     params = PL_DEF(params, &pl_color_map_default_params);
+    GLSL("// pl_shader_color_map \n"
+         "{                      \n");
 
-    // Default the source color space to reasonable values
-    pl_color_space_infer(&src);
+    struct pl_tone_map_params tone = {
+        .function = params->tone_mapping_function,
+        .param = params->tone_mapping_param,
+        .input_scaling = PL_HDR_PQ,
+        .output_scaling = PL_HDR_PQ,
+        .lut_size = PL_DEF(params->lut_size, pl_color_map_default_params.lut_size),
+        .hdr = src.hdr,
+    };
 
-    // To be as conservative as possible, color mapping is disabled by default
-    // except for special cases which are considered to be "sufficiently
-    // different" from the source space. For primaries, this means anything
-    // wide gamut; and for transfers, this means anything radically different
-    // from the typical SDR curves.
-    if (!dst.primaries) {
-        dst.primaries = src.primaries;
-        if (pl_color_primaries_is_wide_gamut(dst.primaries))
-            dst.primaries = PL_COLOR_PRIM_BT_709;
+    pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+        .color      = &src,
+        .metadata   = params->metadata,
+        .scaling    = tone.input_scaling,
+        .out_min    = &tone.input_min,
+        .out_max    = &tone.input_max,
+        .out_avg    = &tone.input_avg,
+    ));
+
+    pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+        .color      = &dst,
+        .metadata   = PL_HDR_METADATA_HDR10,
+        .scaling    = tone.output_scaling,
+        .out_min    = &tone.output_min,
+        .out_max    = &tone.output_max,
+    ));
+
+    if (!params->inverse_tone_mapping) {
+        // Never exceed the source unless requested, but still allow
+        // black point adaptation
+        tone.output_max = PL_MIN(tone.output_max, tone.input_max);
     }
 
-    if (!dst.transfer) {
-        dst.transfer = src.transfer;
-        if (pl_color_transfer_is_hdr(dst.transfer) ||
-            dst.transfer == PL_COLOR_TRC_LINEAR)
-        {
-            dst.transfer = PL_COLOR_TRC_GAMMA22;
+    // Round sufficiently similar values
+    if (fabs(tone.input_max - tone.output_max) < 1e-6)
+        tone.output_max = tone.input_max;
+    if (fabs(tone.input_min - tone.output_min) < 1e-6)
+        tone.output_min = tone.input_min;
+
+    pl_tone_map_params_infer(&tone);
+
+    struct pl_gamut_map_params gamut = {
+        .function        = PL_DEF(params->gamut_mapping, &pl_gamut_map_clip),
+        .input_gamut     = src.hdr.prim,
+        .output_gamut    = dst.hdr.prim,
+        .lut_size_I      = PL_DEF(params->lut3d_size[0], 23),
+        .lut_size_C      = PL_DEF(params->lut3d_size[1], 32),
+        .lut_size_h      = PL_DEF(params->lut3d_size[2], 128),
+        .lut_stride      = 4,
+    };
+
+    float src_peak_static;
+    pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+        .color      = &src,
+        .metadata   = PL_HDR_METADATA_HDR10,
+        .scaling    = PL_HDR_PQ,
+        .out_max    = &src_peak_static,
+    ));
+
+    pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+        .color      = &dst,
+        .metadata   = PL_HDR_METADATA_HDR10,
+        .scaling    = PL_HDR_PQ,
+        .out_min    = &gamut.min_luma,
+        .out_max    = &gamut.max_luma,
+    ));
+
+    // Clip the gamut mapping output to the input gamut for perceptual
+    if (gamut.function == &pl_gamut_map_perceptual) {
+        if (pl_primaries_compatible(&gamut.input_gamut, &gamut.output_gamut)) {
+            gamut.output_gamut = pl_primaries_clip(&gamut.output_gamut,
+                                                   &gamut.input_gamut);
         }
     }
 
-    // Defaults the dest average based on the source average, unless the source
-    // is HDR and the destination is not
-    if (!dst.sig_avg) {
-        bool src_hdr = pl_color_space_is_hdr(src);
-        bool dst_hdr = pl_color_space_is_hdr(dst);
-        if (!(src_hdr && !dst_hdr))
-            dst.sig_avg = src.sig_avg;
+    // Backwards compatibility with older API
+    switch (params->gamut_mode) {
+    case PL_GAMUT_CLIP:
+        switch (params->intent) {
+        case PL_INTENT_AUTO:
+        case PL_INTENT_PERCEPTUAL:
+        case PL_INTENT_RELATIVE_COLORIMETRIC:
+            break; // leave default
+        case PL_INTENT_SATURATION:
+            gamut.function = &pl_gamut_map_saturation;
+            break;
+        case PL_INTENT_ABSOLUTE_COLORIMETRIC:
+            gamut.function = &pl_gamut_map_absolute;
+            break;
+        }
+        break;
+    case PL_GAMUT_DARKEN:
+        gamut.function = &pl_gamut_map_darken;
+        break;
+    case PL_GAMUT_WARN:
+        gamut.function = &pl_gamut_map_highlight;
+        break;
+    case PL_GAMUT_DESATURATE:
+        gamut.function = &pl_gamut_map_desaturate;
+        break;
+    case PL_GAMUT_MODE_COUNT:
+        pl_unreachable();
     }
 
-    // Infer the remaining fields after making the above choices
-    pl_color_space_infer(&dst);
-
-    // All operations from here on require linear light as a starting point,
-    // so we linearize even if src.transfer == dst.transfer when one of the other
-    // operations needs it
-    bool need_linear = src.transfer != dst.transfer ||
-                       src.primaries != dst.primaries ||
-                       src.sig_peak > dst.sig_peak ||
-                       src.sig_avg != dst.sig_avg ||
-                       src.sig_scale != dst.sig_scale ||
-                       src.light != dst.light;
-    bool need_gamut_warn = false;
-    bool is_linear = prelinearized;
-    if (need_linear && !is_linear) {
-        pl_shader_linearize(sh, src.transfer);
-        is_linear = true;
+    bool can_fast = !params->force_tone_mapping_lut;
+    if (!args->state) {
+        // No state object provided, forcibly disable advanced methods
+        can_fast = true;
+        if (tone.function != &pl_tone_map_clip)
+            tone.function = &pl_tone_map_linear;
+        if (gamut.function != &pl_gamut_map_clip)
+            gamut.function = &pl_gamut_map_saturation;
     }
 
-    if (need_linear)
-        pl_shader_ootf(sh, src);
+    bool need_tone_map = !pl_tone_map_params_noop(&tone);
+    bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
 
-    // Tone map to rescale the signal average/peak if needed
-    if (src.sig_peak * src.sig_scale > dst.sig_peak * dst.sig_scale + 1e-6) {
-        pl_shader_tone_map(sh, src, dst, peak_detect_state, params);
-        need_gamut_warn = true;
+    if (!args->prelinearized)
+        pl_shader_linearize(sh, &src);
+
+    pl_matrix3x3 rgb2lms = pl_ipt_rgb2lms(pl_raw_primaries_get(src.primaries));
+    pl_matrix3x3 lms2rgb = pl_ipt_lms2rgb(pl_raw_primaries_get(dst.primaries));
+    ident_t lms2ipt = SH_MAT3(pl_ipt_lms2ipt);
+    ident_t ipt2lms = SH_MAT3(pl_ipt_ipt2lms);
+
+    if (need_gamut_map && gamut.function == &pl_gamut_map_saturation && can_fast) {
+        const pl_matrix3x3 lms2src = pl_ipt_lms2rgb(&gamut.input_gamut);
+        const pl_matrix3x3 dst2lms = pl_ipt_rgb2lms(&gamut.output_gamut);
+        sh_describe(sh, "gamut map (saturation)");
+        pl_matrix3x3_mul(&lms2rgb, &dst2lms);
+        pl_matrix3x3_mul(&lms2rgb, &lms2src);
+        need_gamut_map = false;
     }
 
-    // Adapt to the right colorspace (primaries) if necessary
-    if (src.primaries != dst.primaries) {
-        const struct pl_raw_primaries *csp_src, *csp_dst;
-        csp_src = pl_raw_primaries_get(src.primaries),
-        csp_dst = pl_raw_primaries_get(dst.primaries);
-        struct pl_matrix3x3 cms_mat;
-        cms_mat = pl_get_color_mapping_matrix(csp_src, csp_dst, params->intent);
+    // Fast path: simply convert between primaries (if needed)
+    if (!need_tone_map && !need_gamut_map) {
+        if (src.primaries != dst.primaries) {
+            sh_describe(sh, "colorspace conversion");
+            pl_matrix3x3_mul(&lms2rgb, &rgb2lms);
+            GLSL("color.rgb = "$" * color.rgb; \n", SH_MAT3(lms2rgb));
+        }
+        goto done;
+    }
 
-        GLSL("color.rgb = %s * color.rgb;\n", sh_var(sh, (struct pl_shader_var) {
-            .var = pl_var_mat3("cms_matrix"),
-            .data = PL_TRANSPOSE_3X3(cms_mat.m),
-        }));
+    // Full path: convert input from normalized RGB to IPT
+    GLSL("vec3 lms = "$" * color.rgb;               \n"
+         "vec3 lmspq = %f * lms;                    \n"
+         "lmspq = pow(max(lmspq, 0.0), vec3(%f));   \n"
+         "lmspq = (vec3(%f) + %f * lmspq)           \n"
+         "        / (vec3(1.0) + %f * lmspq);       \n"
+         "lmspq = pow(lmspq, vec3(%f));             \n"
+         "vec3 ipt = "$" * lmspq;                   \n"
+         "float i_orig = ipt.x;                     \n",
+         SH_MAT3(rgb2lms),
+         PL_COLOR_SDR_WHITE / 10000,
+         PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2,
+         lms2ipt);
 
-        if (!pl_primaries_superset(csp_dst, csp_src)) {
-            if (params->gamut_clipping) {
-                GLSL("float cmin = min(min(color.r, color.g), color.b);     \n"
-                     "if (cmin < 0.0) {                                     \n"
-                     "    float luma = dot(%s, color.rgb);                  \n"
-                     "    float coeff = cmin / (cmin - luma);               \n"
-                     "    color.rgb = mix(color.rgb, vec3(luma), coeff);    \n"
-                     "}                                                     \n"
-                     "float cmax = max(max(color.r, color.g), color.b);     \n"
-                     "if (cmax > 1.0)                                       \n"
-                     "    color.rgb /= cmax;                                \n",
-                     sh_luma_coeffs(sh, dst.primaries));
+    if (params->show_clipping) {
+        const float eps = 1e-6f;
+        GLSL("bool clip_hi, clip_lo;                            \n"
+             "clip_hi = any(greaterThan(color.rgb, vec3("$"))); \n"
+             "clip_lo = any(lessThan(color.rgb, vec3("$")));    \n"
+             "clip_hi = clip_hi || ipt.x > "$";                 \n"
+             "clip_lo = clip_lo || ipt.x < "$";                 \n",
+             SH_FLOAT_DYN(pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, tone.input_max) + eps),
+             SH_FLOAT(pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, tone.input_min) - eps),
+             SH_FLOAT_DYN(tone.input_max + eps),
+             SH_FLOAT(tone.input_min - eps));
+    }
 
-            } else {
-                need_gamut_warn = true;
+    if (need_tone_map) {
+        const struct pl_tone_map_function *fun = tone.function;
+        sh_describef(sh, "%s tone map (%.0f -> %.0f)", fun->name,
+                     pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, tone.input_max),
+                     pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, tone.output_max));
+
+        if (fun == &pl_tone_map_clip && can_fast) {
+
+            GLSL("#define tone_map(x) clamp((x), "$", "$") \n",
+                 SH_FLOAT(tone.input_min),
+                 SH_FLOAT_DYN(tone.input_max));
+
+        } else if (fun == &pl_tone_map_linear && can_fast) {
+
+            const float gain = PL_DEF(tone.param, 1.0f);
+            const float scale = tone.input_max - tone.input_min;
+
+            ident_t linfun = sh_fresh(sh, "linear_pq");
+            GLSLH("float "$"(float x) {                         \n"
+                 // Stretch the input range (while clipping)
+                 "    x = "$" * x + "$";                        \n"
+                 "    x = clamp(x, 0.0, 1.0);                   \n"
+                 "    x = "$" * x + "$";                        \n"
+                 "    return x;                                 \n"
+                 "}                                             \n",
+                 linfun,
+                 SH_FLOAT_DYN(gain / scale),
+                 SH_FLOAT_DYN(-gain / scale * tone.input_min),
+                 SH_FLOAT_DYN(tone.output_max - tone.output_min),
+                 SH_FLOAT(tone.output_min));
+
+            GLSL("#define tone_map(x) ("$"(x)) \n", linfun);
+
+        } else {
+
+            pl_assert(obj);
+            ident_t lut = sh_lut(sh, sh_lut_params(
+                .object     = &obj->tone.lut,
+                .var_type   = PL_VAR_FLOAT,
+                .lut_type   = SH_LUT_AUTO,
+                .method     = SH_LUT_LINEAR,
+                .width      = tone.lut_size,
+                .comps      = 1,
+                .update     = !pl_tone_map_params_equal(&tone, &obj->tone.params),
+                .dynamic    = tone.input_avg > 0, // dynamic metadata
+                .fill       = fill_tone_lut,
+                .priv       = &tone,
+            ));
+            obj->tone.params = tone;
+            if (!lut) {
+                SH_FAIL(sh, "Failed generating tone-mapping LUT!");
+                return;
             }
+
+            const float lut_range = tone.input_max - tone.input_min;
+            GLSL("#define tone_map(x) ("$"("$" * (x) + "$")) \n",
+                 lut, SH_FLOAT_DYN(1.0f / lut_range),
+                 SH_FLOAT_DYN(-tone.input_min / lut_range));
+
+        }
+
+        bool need_recovery = tone.input_max >= tone.output_max;
+        if (need_recovery && params->contrast_recovery && args->feature_map) {
+            ident_t pos, pt;
+            ident_t lowres = sh_bind(sh, args->feature_map, PL_TEX_ADDRESS_CLAMP,
+                                     PL_TEX_SAMPLE_LINEAR, "feature_map",
+                                     NULL, &pos, &pt);
+
+            // Obtain HF detail map from bicubic interpolation of LF features
+            GLSL("vec2 lpos  = "$";                                 \n"
+                 "vec2 lpt   = "$";                                 \n"
+                 "vec2 lsize = vec2(textureSize("$", 0));           \n"
+                 "vec2 frac  = fract(lpos * lsize + vec2(0.5));     \n"
+                 "vec2 frac2 = frac * frac;                         \n"
+                 "vec2 inv   = vec2(1.0) - frac;                    \n"
+                 "vec2 inv2  = inv * inv;                           \n"
+                 "vec2 w0 = 1.0/6.0 * inv2 * inv;                   \n"
+                 "vec2 w1 = 2.0/3.0 - 0.5 * frac2 * (2.0 - frac);   \n"
+                 "vec2 w2 = 2.0/3.0 - 0.5 * inv2  * (2.0 - inv);    \n"
+                 "vec2 w3 = 1.0/6.0 * frac2 * frac;                 \n"
+                 "vec4 g = vec4(w0 + w1, w2 + w3);                  \n"
+                 "vec4 h = vec4(w1, w3) / g + inv.xyxy;             \n"
+                 "h.xy -= vec2(2.0);                                \n"
+                 "vec4 p = lpos.xyxy + lpt.xyxy * h;                \n"
+                 "float l00 = textureLod("$", p.xy, 0.0).r;         \n"
+                 "float l01 = textureLod("$", p.xw, 0.0).r;         \n"
+                 "float l0 = mix(l01, l00, g.y);                    \n"
+                 "float l10 = textureLod("$", p.zy, 0.0).r;         \n"
+                 "float l11 = textureLod("$", p.zw, 0.0).r;         \n"
+                 "float l1 = mix(l11, l10, g.y);                    \n"
+                 "float luma = mix(l1, l0, g.x);                    \n"
+                 // Mix low-resolution tone mapped image with high-resolution
+                 // tone mapped image according to desired strength.
+                 "float highres = clamp(ipt.x, 0.0, 1.0);           \n"
+                 "float lowres = clamp(luma, 0.0, 1.0);             \n"
+                 "float detail = highres - lowres;                  \n"
+                 "float base = tone_map(highres);                   \n"
+                 "float sharp = tone_map(lowres) + detail;          \n"
+                 "ipt.x = mix(base, sharp, "$");                    \n",
+                 pos, pt, lowres,
+                 lowres, lowres, lowres, lowres,
+                 SH_FLOAT(params->contrast_recovery));
+
+        } else {
+
+            GLSL("ipt.x = tone_map(ipt.x); \n");
+        }
+
+        // Avoid raising saturation excessively when changing brightness
+        GLSL("ipt.yz *= min(i_orig / ipt.x, ipt.x / i_orig); \n");
+    }
+
+    if (need_gamut_map) {
+        const struct pl_gamut_map_function *fun = gamut.function;
+        sh_describef(sh, "gamut map (%s)", fun->name);
+
+        pl_assert(obj);
+        ident_t lut = sh_lut(sh, sh_lut_params(
+            .object     = &obj->gamut.lut,
+            .var_type   = PL_VAR_FLOAT,
+            .lut_type   = SH_LUT_TEXTURE,
+            .method     = params->lut3d_tricubic ? SH_LUT_CUBIC : SH_LUT_LINEAR,
+            .width      = gamut.lut_size_I,
+            .height     = gamut.lut_size_C,
+            .depth      = gamut.lut_size_h,
+            .comps      = gamut.lut_stride,
+            .update     = !pl_gamut_map_params_equal(&gamut, &obj->gamut.params),
+            .fill       = fill_gamut_lut,
+            .priv       = &gamut,
+        ));
+        obj->gamut.params = gamut;
+        if (!lut) {
+            SH_FAIL(sh, "Failed generating gamut-mapping LUT!");
+            return;
+        }
+
+        // 3D LUT lookup (in ICh space)
+        const float lut_range = gamut.max_luma - gamut.min_luma;
+        GLSL("vec3 idx;                             \n"
+             "idx.x = "$" * ipt.x + "$";            \n"
+             "idx.y = 2.0 * length(ipt.yz);         \n"
+             "idx.z = %f * atan(ipt.z, ipt.y) + 0.5;\n"
+             "ipt = "$"(idx).xyz;                   \n",
+             SH_FLOAT(1.0f / lut_range),
+             SH_FLOAT(-gamut.min_luma / lut_range),
+             0.5f / M_PI, lut);
+
+        if (params->show_clipping) {
+            GLSL("clip_lo = clip_lo || any(lessThan(idx, vec3(0.0)));    \n"
+                 "clip_hi = clip_hi || any(greaterThan(idx, vec3(1.0))); \n");
+        }
+
+        if (params->visualize_lut) {
+            visualize_gamut_map(sh, params->visualize_rect, lut,
+                                params->visualize_hue, params->visualize_theta,
+                                &gamut);
         }
     }
 
-    // Warn for remaining out-of-gamut colors if enabled
-    if (params->gamut_warning && need_gamut_warn) {
-        GLSL("if (any(greaterThan(color.rgb, vec3(%f + 0.005))) ||\n"
-             "    any(lessThan(color.rgb, vec3(-0.005))))\n"
-             "    color.rgb = vec3(1.0, 0.0, 1.0); // magenta\n",
-             dst.sig_peak * dst.sig_scale);
+    // Convert IPT back to linear RGB
+    GLSL("lmspq = "$" * ipt;                        \n"
+         "lms = pow(max(lmspq, 0.0), vec3(1.0/%f)); \n"
+         "lms = max(lms - vec3(%f), 0.0)            \n"
+         "             / (vec3(%f) - %f * lms);     \n"
+         "lms = pow(lms, vec3(1.0/%f));             \n"
+         "lms *= %f;                                \n"
+         "color.rgb = "$" * lms;                    \n",
+         ipt2lms,
+         PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
+         10000 / PL_COLOR_SDR_WHITE,
+         SH_MAT3(lms2rgb));
+
+    if (params->show_clipping) {
+        GLSL("if (clip_hi) {                                                \n"
+             "    float k = dot(color.rgb, vec3(2.0 / 3.0));                \n"
+             "    color.rgb = clamp(vec3(k) - color.rgb, 0.0, 1.0);         \n"
+             "    float cmin = min(min(color.r, color.g), color.b);         \n"
+             "    float cmax = max(max(color.r, color.g), color.b);         \n"
+             "    float delta = cmax - cmin;                                \n"
+             "    vec3 sat = smoothstep(cmin - 1e-6, cmax, color.rgb);      \n"
+             "    const vec3 red = vec3(1.0, 0.0, 0.0);                     \n"
+             "    color.rgb = mix(red, sat, smoothstep(0.0, 0.3, delta));   \n"
+             "} else if (clip_lo) {                                         \n"
+             "    vec3 hi = vec3(0.0, 0.3, 0.3);                            \n"
+             "    color.rgb = mix(color.rgb, hi, 0.5);                      \n"
+             "}                                                             \n");
     }
 
-    if (need_linear)
-        pl_shader_inverse_ootf(sh, dst);
+    if (need_tone_map) {
+        if (params->visualize_lut) {
+            float alpha = need_gamut_map ? powf(cosf(params->visualize_theta), 5.0f) : 1.0f;
+            visualize_tone_map(sh, params->visualize_rect, alpha, &tone);
+        }
+        GLSL("#undef tone_map \n");
+    }
 
-    if (is_linear)
-        pl_shader_delinearize(sh, dst.transfer);
-
+done:
+    pl_shader_delinearize(sh, &dst);
     GLSL("}\n");
 }
 
-void pl_shader_cone_distort(struct pl_shader *sh, struct pl_color_space csp,
+// Backwards compatibility wrapper around `pl_shader_color_map_ex`
+void pl_shader_color_map(pl_shader sh, const struct pl_color_map_params *params,
+                         struct pl_color_space src, struct pl_color_space dst,
+                         pl_shader_obj *state, bool prelinearized)
+{
+    pl_shader_color_map_ex(sh, params, pl_color_map_args(
+        .src           = src,
+        .dst           = dst,
+        .prelinearized = prelinearized,
+        .state         = state,
+        .feature_map   = NULL
+    ));
+}
+
+void pl_shader_cone_distort(pl_shader sh, struct pl_color_space csp,
                             const struct pl_cone_params *params)
 {
+    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
+        return;
     if (!params || !params->cones)
         return;
 
-    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
-        return;
-
+    sh_describe(sh, "cone distortion");
     GLSL("// pl_shader_cone_distort\n");
     GLSL("{\n");
 
     pl_color_space_infer(&csp);
-    pl_shader_linearize(sh, csp.transfer);
+    pl_shader_linearize(sh, &csp);
 
-    struct pl_matrix3x3 cone_mat;
+    pl_matrix3x3 cone_mat;
     cone_mat = pl_get_cone_matrix(params, pl_raw_primaries_get(csp.primaries));
-    GLSL("color.rgb = %s * color.rgb;\n", sh_var(sh, (struct pl_shader_var) {
+    GLSL("color.rgb = "$" * color.rgb; \n", sh_var(sh, (struct pl_shader_var) {
         .var = pl_var_mat3("cone_mat"),
         .data = PL_TRANSPOSE_3X3(cone_mat.m),
     }));
 
-    pl_shader_delinearize(sh, csp.transfer);
+    pl_shader_delinearize(sh, &csp);
     GLSL("}\n");
 }
-
-struct sh_dither_obj {
-    enum pl_dither_method method;
-    struct pl_shader_obj *lut;
-};
-
-static void sh_dither_uninit(const struct pl_gpu *gpu, void *ptr)
-{
-    struct sh_dither_obj *obj = ptr;
-    pl_shader_obj_destroy(&obj->lut);
-    *obj = (struct sh_dither_obj) {0};
-}
-
-static void fill_dither_matrix(void *data, const struct sh_lut_params *params)
-{
-    pl_assert(params->width > 0 && params->height > 0 && params->comps == 1);
-
-    const struct sh_dither_obj *obj = params->priv;
-    switch (obj->method) {
-    case PL_DITHER_ORDERED_LUT:
-        pl_assert(params->width == params->height);
-        pl_generate_bayer_matrix(data, params->width);
-        break;
-
-    case PL_DITHER_BLUE_NOISE:
-        pl_assert(params->width == params->height);
-        pl_generate_blue_noise(data, params->width);
-        break;
-
-    default: abort();
-    }
-}
-
-static bool dither_method_is_lut(enum pl_dither_method method)
-{
-    switch (method) {
-    case PL_DITHER_BLUE_NOISE:
-    case PL_DITHER_ORDERED_LUT:
-        return true;
-    case PL_DITHER_ORDERED_FIXED:
-    case PL_DITHER_WHITE_NOISE:
-        return false;
-    default: abort();
-    }
-}
-
-void pl_shader_dither(struct pl_shader *sh, int new_depth,
-                      struct pl_shader_obj **dither_state,
-                      const struct pl_dither_params *params)
-{
-    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
-        return;
-
-    if (new_depth <= 0 || new_depth > 256) {
-        PL_WARN(sh, "Invalid dither depth: %d.. ignoring", new_depth);
-        return;
-    }
-
-    GLSL("// pl_shader_dither \n"
-        "{                    \n"
-        "float bias;          \n");
-
-    params = PL_DEF(params, &pl_dither_default_params);
-    if (params->lut_size < 0 || params->lut_size > 8) {
-        SH_FAIL(sh, "Invalid `lut_size` specified: %d", params->lut_size);
-        return;
-    }
-
-    enum pl_dither_method method = params->method;
-    bool can_fixed = sh_glsl(sh).version >= 130;
-    ident_t lut = NULL;
-    int lut_size = 0;
-
-    if (method == PL_DITHER_ORDERED_FIXED && !can_fixed) {
-        PL_WARN(sh, "PL_DITHER_ORDERED_FIXED requires glsl version >= 130.."
-                " falling back.");
-        goto fallback;
-    }
-
-    if (dither_method_is_lut(method)) {
-        if (!dither_state) {
-            PL_WARN(sh, "LUT-based dither method specified but no dither state "
-                    "object given, falling back to non-LUT based methods.");
-            goto fallback;
-        }
-
-        struct sh_dither_obj *obj;
-        obj = SH_OBJ(sh, dither_state, PL_SHADER_OBJ_DITHER,
-                     struct sh_dither_obj, sh_dither_uninit);
-        if (!obj)
-            goto fallback;
-
-        bool changed = obj->method != method;
-        obj->method = method;
-
-        lut_size = 1 << PL_DEF(params->lut_size, 6);
-        lut = sh_lut(sh, &(struct sh_lut_params) {
-            .object = &obj->lut,
-            .type = PL_VAR_FLOAT,
-            .width = lut_size,
-            .height = lut_size,
-            .comps = 1,
-            .update = changed,
-            .fill = fill_dither_matrix,
-            .priv = obj,
-        });
-        if (!lut)
-            goto fallback;
-    }
-
-    goto done;
-
-fallback:
-    method = can_fixed ? PL_DITHER_ORDERED_FIXED : PL_DITHER_WHITE_NOISE;
-    // fall through
-
-done: ;
-
-    int size = 0;
-    if (lut) {
-        size = lut_size;
-    } else if (method == PL_DITHER_ORDERED_FIXED) {
-        size = 16; // hard-coded size
-    }
-
-    if (size) {
-        // Transform the screen position to the cyclic range [0,1)
-        GLSL("vec2 pos = fract(gl_FragCoord.xy * 1.0/%d.0);\n", size);
-
-        if (params->temporal) {
-            int phase = SH_PARAMS(sh).index % 8;
-            float r = phase * (M_PI / 2); // rotate
-            float m = phase < 4 ? 1 : -1; // mirror
-            float mat[2][2] = {
-                {cos(r),     -sin(r)    },
-                {sin(r) * m,  cos(r) * m},
-            };
-
-            ident_t rot = sh_var(sh, (struct pl_shader_var) {
-                .var  = pl_var_mat2("dither_rot"),
-                .data = &mat[0][0],
-                .dynamic = true,
-            });
-            GLSL("pos = fract(%s * pos + vec2(1.0));\n", rot);
-        }
-    }
-
-    switch (method) {
-    case PL_DITHER_WHITE_NOISE: {
-        ident_t prng = sh_prng(sh, params->temporal, NULL);
-        GLSL("bias = %s;\n", prng);
-        break;
-    }
-
-    case PL_DITHER_ORDERED_FIXED:
-        // Bitwise ordered dither using only 32-bit uints
-        GLSL("uvec2 xy = uvec2(pos * 16.0) %% 16u;     \n"
-             // Bitwise merge (morton number)
-             "xy.x = xy.x ^ xy.y;                      \n"
-             "xy = (xy | xy << 2) & uvec2(0x33333333); \n"
-             "xy = (xy | xy << 1) & uvec2(0x55555555); \n"
-             // Bitwise inversion
-             "uint b = xy.x + (xy.y << 1);             \n"
-             "b = (b * 0x0802u & 0x22110u) |           \n"
-             "    (b * 0x8020u & 0x88440u);            \n"
-             "b = 0x10101u * b;                        \n"
-             "b = (b >> 16) & 0xFFu;                   \n"
-             // Generate bias value
-             "bias = float(b) * 1.0/256.0;             \n");
-        break;
-
-    default: // LUT-based methods
-        pl_assert(lut);
-        GLSL("bias = %s(ivec2(pos * %d.0));\n", lut, lut_size);
-        break;
-    }
-
-    uint64_t scale = (1LLU << new_depth) - 1;
-    GLSL("color = vec4(%llu.0) * color + vec4(bias); \n"
-         "color = floor(color) * vec4(1.0 / %llu.0); \n"
-         "}                                          \n",
-         (long long unsigned) scale, (long long unsigned) scale);
-}
-
-const struct pl_dither_params pl_dither_default_params = {
-    .method     = PL_DITHER_BLUE_NOISE,
-    .lut_size   = 6,
-    .temporal   = false, // commonly flickers on LCDs
-};

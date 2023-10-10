@@ -19,12 +19,14 @@
 
 #include "common.h"
 
+static int print_hex(char *buf, unsigned int x);
 static int ccStrPrintInt32( char *str, int32_t n );
 static int ccStrPrintUint32( char *str, uint32_t n );
 static int ccStrPrintInt64( char *str, int64_t n );
 static int ccStrPrintUint64( char *str, uint64_t n );
 static int ccStrPrintDouble( char *str, int bufsize, int decimals, double value );
 static int ccSeqParseInt64( char *seq, int seqlength, int64_t *retint );
+static int ccSeqParseUint64( char *seq, int seqlength, uint64_t *retint );
 static int ccSeqParseDouble( char *seq, int seqlength, double *retdouble );
 
 void pl_str_append_asprintf_c(void *alloc, pl_str *str, const char *fmt, ...)
@@ -40,7 +42,7 @@ void pl_str_append_vasprintf_c(void *alloc, pl_str *str, const char *fmt,
 {
     for (const char *c; (c = strchr(fmt, '%')) != NULL; fmt = c + 1) {
         // Append the preceding string literal
-        pl_str_append(alloc, str, (pl_str) { (char *) fmt, c - fmt });
+        pl_str_append_raw(alloc, str, fmt, c - fmt);
         c++; // skip '%'
 
         char buf[32];
@@ -49,35 +51,36 @@ void pl_str_append_vasprintf_c(void *alloc, pl_str *str, const char *fmt,
         // The format character follows the % sign
         switch (c[0]) {
         case '%':
-            pl_str_append(alloc, str, pl_str0("%"));
-            continue;
-        case 'c':
-            buf[0] = (char) va_arg(ap, int);
-            pl_str_append(alloc, str, (pl_str) { buf, 1 });
+            pl_str_append_raw(alloc, str, c, 1);
             continue;
         case 's': {
             const char *arg = va_arg(ap, const char *);
-            pl_str_append(alloc, str, pl_str0(arg));
+            pl_str_append_raw(alloc, str, arg, strlen(arg));
             continue;
         }
         case '.': { // only used for %.*s
             assert(c[1] == '*');
             assert(c[2] == 's');
-            pl_str arg;
-            arg.len = va_arg(ap, int);
-            arg.buf = va_arg(ap, char *);
-            pl_str_append(alloc, str, arg);
+            len = va_arg(ap, int);
+            pl_str_append_raw(alloc, str, va_arg(ap, char *), len);
             c += 2; // skip '*s'
             continue;
         }
+        case 'c':
+            buf[0] = (char) va_arg(ap, int);
+            len = 1;
+            break;
         case 'd':
             len = ccStrPrintInt32(buf, va_arg(ap, int));
-            pl_str_append(alloc, str, (pl_str) { buf, len });
-            continue;
+            break;
+        case 'h': ; // only used for %hx
+            assert(c[1] == 'x');
+            len = print_hex(buf, (unsigned short) va_arg(ap, unsigned int));
+            c++;
+            break;
         case 'u':
             len = ccStrPrintUint32(buf, va_arg(ap, unsigned int));
-            pl_str_append(alloc, str, (pl_str) { buf, len });
-            continue;
+            break;
         case 'l':
             assert(c[1] == 'l');
             switch (c[2]) {
@@ -87,39 +90,165 @@ void pl_str_append_vasprintf_c(void *alloc, pl_str *str, const char *fmt,
             case 'd':
                 len = ccStrPrintInt64(buf, va_arg(ap, long long));
                 break;
-            default: abort();
+            default: pl_unreachable();
             }
-            pl_str_append(alloc, str, (pl_str) { buf, len });
             c += 2;
-            continue;
+            break;
         case 'z':
             assert(c[1] == 'u');
             len = ccStrPrintUint64(buf, va_arg(ap, size_t));
-            pl_str_append(alloc, str, (pl_str) { buf, len });
             c++;
-            continue;
+            break;
         case 'f':
             len = ccStrPrintDouble(buf, sizeof(buf), 20, va_arg(ap, double));
-            pl_str_append(alloc, str, (pl_str) { buf, len });
-            continue;
+            break;
         default:
             fprintf(stderr, "Invalid conversion character: '%c'!\n", c[0]);
             abort();
         }
+
+        pl_str_append_raw(alloc, str, buf, len);
     }
 
     // Append the remaining string literal
     pl_str_append(alloc, str, pl_str0(fmt));
 }
 
+size_t pl_str_append_memprintf_c(void *alloc, pl_str *str, const char *fmt,
+                                 const void *args)
+{
+    const uint8_t *ptr = args;
+
+    for (const char *c; (c = strchr(fmt, '%')) != NULL; fmt = c + 1) {
+        pl_str_append_raw(alloc, str, fmt, c - fmt);
+        c++;
+
+        char buf[32];
+        int len;
+
+#define LOAD(var)                           \
+  do {                                      \
+      memcpy(&(var), ptr, sizeof(var));     \
+      ptr += sizeof(var);                   \
+  } while (0)
+
+        switch (c[0]) {
+        case '%':
+            pl_str_append_raw(alloc, str, c, 1);
+            continue;
+        case 's': {
+            len = strlen((const char *) ptr);
+            pl_str_append_raw(alloc, str, ptr, len);
+            ptr += len + 1; // also skip \0
+            continue;
+        }
+        case '.': {
+            assert(c[1] == '*');
+            assert(c[2] == 's');
+            LOAD(len);
+            pl_str_append_raw(alloc, str, ptr, len);
+            ptr += len; // no trailing \0
+            c += 2;
+            continue;
+        }
+        case 'c':
+            LOAD(buf[0]);
+            len = 1;
+            break;
+        case 'd': ;
+            int d;
+            LOAD(d);
+            len = ccStrPrintInt32(buf, d);
+            break;
+        case 'h': ;
+            assert(c[1] == 'x');
+            unsigned short hx;
+            LOAD(hx);
+            len = print_hex(buf, hx);
+            c++;
+            break;
+        case 'u': ;
+            unsigned u;
+            LOAD(u);
+            len = ccStrPrintUint32(buf, u);
+            break;
+        case 'l':
+            assert(c[1] == 'l');
+            switch (c[2]) {
+            case 'u': ;
+                long long unsigned llu;
+                LOAD(llu);
+                len = ccStrPrintUint64(buf, llu);
+                break;
+            case 'd': ;
+                long long int lld;
+                LOAD(lld);
+                len = ccStrPrintInt64(buf, lld);
+                break;
+            default: pl_unreachable();
+            }
+            c += 2;
+            break;
+        case 'z': ;
+            assert(c[1] == 'u');
+            size_t zu;
+            LOAD(zu);
+            len = ccStrPrintUint64(buf, zu);
+            c++;
+            break;
+        case 'f': ;
+            double f;
+            LOAD(f);
+            len = ccStrPrintDouble(buf, sizeof(buf), 20, f);
+            break;
+        default:
+            fprintf(stderr, "Invalid conversion character: '%c'!\n", c[0]);
+            abort();
+        }
+
+        pl_str_append_raw(alloc, str, buf, len);
+    }
+#undef LOAD
+
+    pl_str_append(alloc, str, pl_str0(fmt));
+    return (uintptr_t) ptr - (uintptr_t) args;
+}
+
 bool pl_str_parse_double(pl_str str, double *out)
 {
-    return ccSeqParseDouble(str.buf, str.len, out);
+    return ccSeqParseDouble((char *) str.buf, str.len, out);
 }
 
 bool pl_str_parse_int64(pl_str str, int64_t *out)
 {
-    return ccSeqParseInt64(str.buf, str.len, out);
+    return ccSeqParseInt64((char *) str.buf, str.len, out);
+}
+
+bool pl_str_parse_uint64(pl_str str, uint64_t *out)
+{
+    return ccSeqParseUint64((char *) str.buf, str.len, out);
+}
+
+static int print_hex(char *buf, unsigned int x)
+{
+    static const char hexdigits[16] = "0123456789abcdef";
+    const int nibbles0 = __builtin_clz(x | 1) >> 2;
+    buf -= nibbles0;
+
+    switch (nibbles0) {
+    pl_static_assert(sizeof(unsigned int) == sizeof(uint32_t));
+    case 0: buf[0] = hexdigits[(x >> 28) & 0xF]; // fall through
+    case 1: buf[1] = hexdigits[(x >> 24) & 0xF]; // fall through
+    case 2: buf[2] = hexdigits[(x >> 20) & 0xF]; // fall through
+    case 3: buf[3] = hexdigits[(x >> 16) & 0xF]; // fall through
+    case 4: buf[4] = hexdigits[(x >> 12) & 0xF]; // fall through
+    case 5: buf[5] = hexdigits[(x >>  8) & 0xF]; // fall through
+    case 6: buf[6] = hexdigits[(x >>  4) & 0xF]; // fall through
+    case 7: buf[7] = hexdigits[(x >>  0) & 0xF];
+            return 8 - nibbles0;
+    }
+
+    pl_unreachable();
 }
 
 /* *****************************************************************************
@@ -544,7 +673,8 @@ static int ccSeqParseInt64( char *seq, int seqlength, int64_t *retint )
   {
     negflag = 1;
     i = 1;
-  }
+  } else if( *seq == '+' )
+    i = 1;
 
   workint = 0;
   for( ; i < seqlength ; i++ )
@@ -564,6 +694,39 @@ static int ccSeqParseInt64( char *seq, int seqlength, int64_t *retint )
 
   if( negflag )
     workint = -workint;
+  *retint = workint;
+  return 1;
+}
+
+static int ccSeqParseUint64( char *seq, int seqlength, uint64_t *retint )
+{
+  int i;
+  char c;
+  uint64_t workint;
+
+  *retint = 0;
+  if( !( seqlength ) )
+    return 0;
+  i = 0;
+  if( *seq == '+' )
+    i = 1;
+
+  workint = 0;
+  for( ; i < seqlength ; i++ )
+  {
+    c = seq[i];
+    if( ( c >= '0' ) && ( c <= '9' ) )
+    {
+      if( workint >= (uint64_t)0x1999999999999999LL )
+        return 0;
+      workint = ( workint * 10 ) + ( c - '0' );
+    }
+    else if( CC_CHAR_IS_DELIMITER( c ) )
+      break;
+    else
+      return 0;
+  }
+
   *retint = workint;
   return 1;
 }

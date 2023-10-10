@@ -37,10 +37,13 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/time.h>
 #include <time.h>
 
 #include "common.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include <libplacebo/dispatch.h>
 #include <libplacebo/shaders/sampling.h>
@@ -171,29 +174,29 @@ void image_unlock(struct image *img);
 #define PARALLELISM 8
 
 struct entry {
-    const struct pl_buf *buf; // to stream the download
-    const struct pl_tex *tex_in[MAX_PLANES];
-    const struct pl_tex *tex_out[MAX_PLANES];
+    pl_buf buf; // to stream the download
+    pl_tex tex_in[MAX_PLANES];
+    pl_tex tex_out[MAX_PLANES];
     struct image image;
 
     // For entries that are associated with a held image, so we can unlock them
     // as soon as possible
     struct image *held_image;
-    const struct pl_buf *held_buf;
+    pl_buf held_buf;
 };
 
 // For both APIs:
 struct priv {
-    struct pl_context *ctx;
-    const struct pl_vulkan *vk;
-    const struct pl_gpu *gpu;
-    struct pl_dispatch *dp;
-    struct pl_shader_obj *dither_state;
+    pl_log log;
+    pl_vulkan vk;
+    pl_gpu gpu;
+    pl_dispatch dp;
+    pl_shader_obj dither_state;
 
     // Timer objects
-    struct pl_timer *render_timer;
-    struct pl_timer *upload_timer;
-    struct pl_timer *download_timer;
+    pl_timer render_timer;
+    pl_timer upload_timer;
+    pl_timer download_timer;
     uint64_t render_sum;
     uint64_t upload_sum;
     uint64_t download_sum;
@@ -202,8 +205,8 @@ struct priv {
     int download_count;
 
     // API #1: A simple pair of input and output textures
-    const struct pl_tex *tex_in[MAX_PLANES];
-    const struct pl_tex *tex_out[MAX_PLANES];
+    pl_tex tex_in[MAX_PLANES];
+    pl_tex tex_out[MAX_PLANES];
 
     // API #2: A ring buffer of textures/buffers for streaming
     int idx_in;  // points the next free entry
@@ -216,19 +219,18 @@ void *init(void) {
     if (!p)
         return NULL;
 
-    p->ctx = pl_context_create(PL_API_VER, &(struct pl_context_params) {
+    p->log = pl_log_create(PL_API_VER, pl_log_params(
         .log_cb = pl_log_simple,
         .log_level = PL_LOG_WARN,
-    });
-    assert(p->ctx);
+    ));
 
-    p->vk = pl_vulkan_create(p->ctx, &(struct pl_vulkan_params) {
+    p->vk = pl_vulkan_create(p->log, pl_vulkan_params(
         // Note: This is for API #2. In API #1 you could just pass params=NULL
         // and it wouldn't really matter much.
         .async_transfer = true,
         .async_compute = true,
         .queue_count = PARALLELISM,
-    });
+    ));
 
     if (!p->vk) {
         fprintf(stderr, "Failed creating vulkan context\n");
@@ -238,7 +240,7 @@ void *init(void) {
     // Give this a shorter name for convenience
     p->gpu = p->vk->gpu;
 
-    p->dp = pl_dispatch_create(p->ctx, p->gpu);
+    p->dp = pl_dispatch_create(p->log, p->gpu);
     if (!p->dp) {
         fprintf(stderr, "Failed creating shader dispatch object\n");
         goto error;
@@ -283,7 +285,7 @@ void uninit(void *priv)
     pl_shader_obj_destroy(&p->dither_state);
     pl_dispatch_destroy(&p->dp);
     pl_vulkan_destroy(&p->vk);
-    pl_context_destroy(&p->ctx);
+    pl_log_destroy(&p->log);
 
     free(p);
 }
@@ -306,7 +308,7 @@ static void setup_plane_data(const struct image *img,
 
         // For API 2 (direct rendering)
         if (img->associated_buf) {
-            const struct pl_buf *buf = img->associated_buf->priv;
+            pl_buf buf = img->associated_buf->priv;
             out[i].pixels = NULL;
             out[i].buf = buf;
             out[i].buf_offset = (uintptr_t) plane->data - (uintptr_t) buf->data;
@@ -320,20 +322,20 @@ static void setup_plane_data(const struct image *img,
     }
 }
 
-static bool do_plane(struct priv *p, const struct pl_tex *dst, const struct pl_tex *src)
+static bool do_plane(struct priv *p, pl_tex dst, pl_tex src)
 {
     int new_depth = dst->params.format->component_depth[0];
 
     // Do some debanding, and then also make sure to dither to the new depth
     // so that our debanded gradients are actually preserved well
-    struct pl_shader *sh = pl_dispatch_begin(p->dp);
-    pl_shader_deband(sh, &(struct pl_sample_src){ .tex = src }, NULL);
+    pl_shader sh = pl_dispatch_begin(p->dp);
+    pl_shader_deband(sh, pl_sample_src( .tex = src ), NULL);
     pl_shader_dither(sh, new_depth, &p->dither_state, NULL);
-    return pl_dispatch_finish(p->dp, &(struct pl_dispatch_params) {
+    return pl_dispatch_finish(p->dp, pl_dispatch_params(
         .shader = &sh,
         .target = dst,
         .timer  = p->render_timer,
-    });
+    ));
 }
 
 static void check_timers(struct priv *p)
@@ -370,28 +372,28 @@ bool api1_reconfig(void *priv, const struct image *proxy)
     setup_plane_data(proxy, data);
 
     for (int i = 0; i < proxy->num_planes; i++) {
-        const struct pl_fmt *fmt = pl_plane_find_fmt(p->gpu, NULL, &data[i]);
+        pl_fmt fmt = pl_plane_find_fmt(p->gpu, NULL, &data[i]);
         if (!fmt) {
             fprintf(stderr, "Failed configuring filter: no good texture format!\n");
             return false;
         }
 
         bool ok = true;
-        ok &= pl_tex_recreate(p->gpu, &p->tex_in[i], &(struct pl_tex_params) {
+        ok &= pl_tex_recreate(p->gpu, &p->tex_in[i], pl_tex_params(
             .w = data[i].width,
             .h = data[i].height,
             .format = fmt,
             .sampleable = true,
             .host_writable = true,
-        });
+        ));
 
-        ok &= pl_tex_recreate(p->gpu, &p->tex_out[i], &(struct pl_tex_params) {
+        ok &= pl_tex_recreate(p->gpu, &p->tex_out[i], pl_tex_params(
             .w = data[i].width,
             .h = data[i].height,
             .format = fmt,
             .renderable = true,
             .host_readable = true,
-        });
+        ));
 
         if (!ok) {
             fprintf(stderr, "Failed creating GPU textures!\n");
@@ -410,12 +412,12 @@ bool api1_filter(void *priv, struct image *dst, struct image *src)
 
     // Upload planes
     for (int i = 0; i < src->num_planes; i++) {
-        bool ok = pl_tex_upload(p->gpu, &(struct pl_tex_transfer_params) {
+        bool ok = pl_tex_upload(p->gpu, pl_tex_transfer_params(
             .tex = p->tex_in[i],
-            .stride_w = data[i].row_stride / data[i].pixel_stride,
+            .row_pitch = data[i].row_stride,
             .ptr = src->planes[i].data,
             .timer = p->upload_timer,
-        });
+        ));
 
         if (!ok) {
             fprintf(stderr, "Failed uploading data to the GPU!\n");
@@ -433,12 +435,12 @@ bool api1_filter(void *priv, struct image *dst, struct image *src)
 
     // Download planes
     for (int i = 0; i < src->num_planes; i++) {
-        bool ok = pl_tex_download(p->gpu, &(struct pl_tex_transfer_params) {
+        bool ok = pl_tex_download(p->gpu, pl_tex_transfer_params(
             .tex = p->tex_out[i],
-            .stride_w = dst->planes[i].stride / data[i].pixel_stride,
+            .row_pitch = dst->planes[i].stride,
             .ptr = dst->planes[i].data,
             .timer = p->download_timer,
-        });
+        ));
 
         if (!ok) {
             fprintf(stderr, "Failed downloading data from the GPU!\n");
@@ -479,7 +481,7 @@ static enum api2_status submit_work(struct priv *p, struct entry *e,
     setup_plane_data(img, data);
 
     for (int i = 0; i < img->num_planes; i++) {
-        const struct pl_fmt *fmt = pl_plane_find_fmt(p->gpu, NULL, &data[i]);
+        pl_fmt fmt = pl_plane_find_fmt(p->gpu, NULL, &data[i]);
         if (!fmt)
             return API2_ERR_FMT;
 
@@ -488,13 +490,13 @@ static enum api2_status submit_work(struct priv *p, struct entry *e,
             return API2_ERR_UNKNOWN;
 
         // Re-create the target FBO as well with this format if necessary
-        bool ok = pl_tex_recreate(p->gpu, &e->tex_out[i], &(struct pl_tex_params) {
+        bool ok = pl_tex_recreate(p->gpu, &e->tex_out[i], pl_tex_params(
             .w = data[i].width,
             .h = data[i].height,
             .format = fmt,
             .renderable = true,
             .host_readable = true,
-        });
+        ));
         if (!ok)
             return API2_ERR_UNKNOWN;
     }
@@ -515,7 +517,7 @@ static enum api2_status submit_work(struct priv *p, struct entry *e,
         // to a multiple of the GPU's preferred texture transfer stride
         // (This is entirely optional)
         stride[i] = ALIGN2(img->planes[i].stride,
-                           p->gpu->limits.align_tex_xfer_stride);
+                           p->gpu->limits.align_tex_xfer_pitch);
         int height = img->height >> img->planes[i].suby;
 
         // Round up the offset to the nearest multiple of the optimal
@@ -525,21 +527,21 @@ static enum api2_status submit_work(struct priv *p, struct entry *e,
     }
 
     // Dispatch the asynchronous download into a mapped buffer
-    bool ok = pl_buf_recreate(p->gpu, &e->buf, &(struct pl_buf_params) {
+    bool ok = pl_buf_recreate(p->gpu, &e->buf, pl_buf_params(
         .size = total_size,
         .host_mapped = true,
-    });
+    ));
     if (!ok)
         return API2_ERR_UNKNOWN;
 
     for (int i = 0; i < img->num_planes; i++) {
-        ok = pl_tex_download(p->gpu, &(struct pl_tex_transfer_params) {
+        ok = pl_tex_download(p->gpu, pl_tex_transfer_params(
             .tex = e->tex_out[i],
-            .stride_w = stride[i] / data[i].pixel_stride,
+            .row_pitch = stride[i],
             .buf = e->buf,
             .buf_offset = offset[i],
             .timer = p->download_timer,
-        });
+        ));
         if (!ok)
             return API2_ERR_UNKNOWN;
 
@@ -614,11 +616,13 @@ enum api2_status api2_process(void *priv)
 bool api2_alloc(void *priv, size_t size, struct api2_buf *out)
 {
     struct priv *p = priv;
+    if (!p->gpu->limits.buf_transfer || size > p->gpu->limits.max_mapped_size)
+        return false;
 
-    const struct pl_buf *buf = pl_buf_create(p->gpu, &(struct pl_buf_params) {
+    pl_buf buf = pl_buf_create(p->gpu, pl_buf_params(
         .size = size,
         .host_mapped = true,
-    });
+    ));
 
     if (!buf)
         return false;
@@ -634,7 +638,7 @@ bool api2_alloc(void *priv, size_t size, struct api2_buf *out)
 void api2_free(void *priv, const struct api2_buf *buf)
 {
     struct priv *p = priv;
-    const struct pl_buf *plbuf = buf->priv;
+    pl_buf plbuf = buf->priv;
     pl_buf_destroy(p->gpu, &plbuf);
 }
 
@@ -717,8 +721,8 @@ static void api1_example(void)
     dst.planes[0].data = dstbuf + OFFSET0;
     dst.planes[1].data = dstbuf + OFFSET1;
 
-    struct timeval start = {0}, stop = {0};
-    gettimeofday(&start, NULL);
+    struct timespec start = {0}, stop = {0};
+    timespec_get(&start, TIME_UTC);
 
     // Process this dummy frame a bunch of times
     unsigned frames = 0;
@@ -729,9 +733,9 @@ static void api1_example(void)
         }
     }
 
-    gettimeofday(&stop, NULL);
+    timespec_get(&stop, TIME_UTC);
     float secs = (float) (stop.tv_sec - start.tv_sec) +
-                 1e-6 * (stop.tv_usec - start.tv_usec);
+                 1e-9 * (stop.tv_nsec - start.tv_nsec);
 
     printf("api1: %4u frames in %1.6f s => %2.6f ms/frame (%5.2f fps)\n",
            frames, secs, 1000 * secs / frames, frames / secs);
@@ -784,8 +788,8 @@ static void api2_example(void)
         images[i].planes[1].data = data + OFFSET1;
     }
 
-    struct timeval start = {0}, stop = {0};
-    gettimeofday(&start, NULL);
+    struct timespec start = {0}, stop = {0};
+    timespec_get(&start, TIME_UTC);
 
     // Just keep driving the event loop regardless of the return status
     // until we reach the critical number of frames. (Good enough for this PoC)
@@ -797,13 +801,17 @@ static void api2_example(void)
         }
 
         // Sleep a short time (100us) to prevent busy waiting the CPU
+    #ifdef _WIN32
+        Sleep(0);
+    #else
         nanosleep(&(struct timespec) { .tv_nsec = 100000 }, NULL);
+    #endif
         check_timers(vf);
     }
 
-    gettimeofday(&stop, NULL);
+    timespec_get(&stop, TIME_UTC);
     float secs = (float) (stop.tv_sec - start.tv_sec) +
-                 1e-6 * (stop.tv_usec - start.tv_usec);
+                 1e-9 * (stop.tv_nsec - start.tv_nsec);
 
     printf("api2: %4u frames in %1.6f s => %2.6f ms/frame (%5.2f fps)\n",
            api2_frames_out, secs, 1000 * secs / api2_frames_out,

@@ -18,14 +18,50 @@
 #ifndef LIBPLACEBO_OPENGL_H_
 #define LIBPLACEBO_OPENGL_H_
 
+#include <string.h>
+
 #include <libplacebo/gpu.h>
 #include <libplacebo/swapchain.h>
 
-struct pl_opengl {
-    const struct pl_gpu *gpu;
-};
+PL_API_BEGIN
+
+// Note on thread safety: The thread safety of `pl_opengl` and any associated
+// GPU objects follows the same thread safety rules as the underlying OpenGL
+// context. In other words, they must only be called from the thread the OpenGL
+// context is current on.
+
+typedef const struct pl_opengl_t {
+    pl_gpu gpu;
+
+    // Detected GL version
+    int major, minor;
+
+    // List of GL/EGL extensions, provided for convenience
+    const char * const *extensions;
+    int num_extensions;
+} *pl_opengl;
+
+static inline bool pl_opengl_has_ext(pl_opengl gl, const char *ext)
+{
+    for (int i = 0; i < gl->num_extensions; i++)
+        if (!strcmp(ext, gl->extensions[i]))
+            return true;
+    return false;
+}
+
+typedef void (*pl_voidfunc_t)(void);
 
 struct pl_opengl_params {
+    // Main gl*GetProcAddr function. This will be used to load all GL/EGL
+    // functions. Optional - if unspecified, libplacebo will default to an
+    // internal loading logic which should work on most platforms.
+    pl_voidfunc_t (*get_proc_addr_ex)(void *proc_ctx, const char *procname);
+    void *proc_ctx;
+
+    // Simpler API for backwards compatibility / convenience. (This one
+    // directly matches the signature of most gl*GetProcAddr library functions)
+    pl_voidfunc_t (*get_proc_addr)(const char *procname);
+
     // Enable OpenGL debug report callbacks. May have little effect depending
     // on whether or not the GL context was initialized with appropriate
     // debugging enabled.
@@ -36,18 +72,29 @@ struct pl_opengl_params {
     // undesirable when GPU-accelerated processing is expected.
     bool allow_software;
 
-    // Restrict specific features to e.g. work around driver bugs, or simply
-    // for testing purposes
-    pl_gpu_caps blacklist_caps; // capabilities to be excluded
-    int max_glsl_version;       // limit the maximum GLSL version
+    // Restrict the maximum allowed GLSL version. (Mainly for testing)
+    int max_glsl_version;
 
     // Optional. Required when importing/exporting dmabufs as textures.
     void *egl_display;
     void *egl_context;
+
+    // Optional callbacks to bind/release the OpenGL context on the current
+    // thread. If these are specified, then the resulting `pl_gpu` will have
+    // `pl_gpu_limits.thread_safe` enabled, and may therefore be used from any
+    // thread without first needing to bind the OpenGL context.
+    //
+    // If the user is re-using the same OpenGL context in non-libplacebo code,
+    // then these callbacks should include whatever synchronization is
+    // necessary to prevent simultaneous use between libplacebo and the user.
+    bool (*make_current)(void *priv);
+    void (*release_current)(void *priv);
+    void *priv;
 };
 
 // Default/recommended parameters
-extern const struct pl_opengl_params pl_opengl_default_params;
+#define pl_opengl_params(...) (&(struct pl_opengl_params) { __VA_ARGS__ })
+PL_API extern const struct pl_opengl_params pl_opengl_default_params;
 
 // Creates a new OpenGL renderer based on the given parameters. This will
 // internally use whatever platform-defined mechanism (WGL, X11, EGL) is
@@ -59,12 +106,15 @@ extern const struct pl_opengl_params pl_opengl_default_params;
 //
 // Note that creating multiple `pl_opengl` instances from the same OpenGL
 // context is undefined behavior.
-const struct pl_opengl *pl_opengl_create(struct pl_context *ctx,
-                                         const struct pl_opengl_params *params);
+PL_API pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params);
 
 // All resources allocated from the `pl_gpu` contained by this `pl_opengl` must
 // be explicitly destroyed by the user before calling `pl_opengl_destroy`.
-void pl_opengl_destroy(const struct pl_opengl **gl);
+PL_API void pl_opengl_destroy(pl_opengl *gl);
+
+// For a `pl_gpu` backed by `pl_opengl`, this function can be used to retrieve
+// the underlying `pl_opengl`. Returns NULL for any other type of `gpu`.
+PL_API pl_opengl pl_opengl_get(pl_gpu gpu);
 
 struct pl_opengl_framebuffer {
     // ID of the framebuffer, or 0 to use the context's default framebuffer.
@@ -99,18 +149,20 @@ struct pl_opengl_swapchain_params {
     void *priv;
 };
 
+#define pl_opengl_swapchain_params(...) (&(struct pl_opengl_swapchain_params) { __VA_ARGS__ })
+
 // Creates an instance of `pl_swapchain` tied to the active context.
 // Note: Due to OpenGL semantics, users *must* call `pl_swapchain_resize`
 // before attempting to use this swapchain, otherwise calls to
 // `pl_swapchain_start_frame` will fail.
-const struct pl_swapchain *pl_opengl_create_swapchain(const struct pl_opengl *gl,
-                            const struct pl_opengl_swapchain_params *params);
+PL_API pl_swapchain pl_opengl_create_swapchain(pl_opengl gl,
+                                               const struct pl_opengl_swapchain_params *params);
 
 // Update the framebuffer description. After calling this function, users
 // *must* call `pl_swapchain_resize` before attempting to use the swapchain
 // again, otherwise calls to `pl_swapchain_start_frame` will fail.
-void pl_opengl_swapchain_update_fb(const struct pl_swapchain *sw,
-                                   const struct pl_opengl_framebuffer *fb);
+PL_API void pl_opengl_swapchain_update_fb(pl_swapchain sw,
+                                          const struct pl_opengl_framebuffer *fb);
 
 struct pl_opengl_wrap_params {
     // The GLuint texture object itself. Optional. If no texture is provided,
@@ -144,11 +196,9 @@ struct pl_opengl_wrap_params {
 
     // The texture's GLint sized internal format (e.g. GL_RGBA16F). Required.
     int iformat;
-
-    // Deprecated fields. These are now ignored completely.
-    int filter PL_DEPRECATED;
-    int address_mode PL_DEPRECATED;
 };
+
+#define pl_opengl_wrap_params(...) (&(struct pl_opengl_wrap_params) { __VA_ARGS__ })
 
 // Wraps an external OpenGL object into a `pl_tex` abstraction. Due to the
 // internally synchronized nature of OpenGL, no explicit synchronization
@@ -160,8 +210,7 @@ struct pl_opengl_wrap_params {
 // which will *not* destroy the user-provided OpenGL texture or framebuffer.
 //
 // This function may fail, in which case it returns NULL.
-const struct pl_tex *pl_opengl_wrap(const struct pl_gpu *gpu,
-                                    const struct pl_opengl_wrap_params *params);
+PL_API pl_tex pl_opengl_wrap(pl_gpu gpu, const struct pl_opengl_wrap_params *params);
 
 // Analogous to `pl_opengl_wrap`, this function takes any `pl_tex` (including
 // ones created by `pl_tex_create`) and unwraps it to expose the underlying
@@ -173,8 +222,9 @@ const struct pl_tex *pl_opengl_wrap(const struct pl_gpu *gpu,
 //
 // For renderable/blittable textures, `out_fbo` will be updated to the ID of
 // the framebuffer attached to this texture, or 0 if there is none. (Optional)
-unsigned int pl_opengl_unwrap(const struct pl_gpu *gpu, const struct pl_tex *tex,
-                              unsigned int *out_target, int *out_iformat,
-                              unsigned int *out_fbo);
+PL_API unsigned int pl_opengl_unwrap(pl_gpu gpu, pl_tex tex, unsigned int *out_target,
+                                     int *out_iformat, unsigned int *out_fbo);
+
+PL_API_END
 
 #endif // LIBPLACEBO_OPENGL_H_

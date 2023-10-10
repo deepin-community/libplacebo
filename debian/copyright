@@ -6,18 +6,19 @@ Files: *
 Copyright: 2009-2016, Nicolas P. Rougier
            2013, Wessel Dankers <wsl@fruit.je>
            2017-2018, the mpv developers
+           2018, Philip Langdale
 License: LGPL-2.1+
 
 Files: debian/*
-Copyright: 2018-2020, Sebastian Ramacher
+Copyright: 2018-2022, Sebastian Ramacher
 License: LGPL-2.1+
 
 Files: demos/*.c
 Copyright: 2018, the mpv developers
 License: CC0
 
-Files: src/include/libplacebo/shaders/av1.h
-       src/shaders/av1.c
+Files: src/include/libplacebo/shaders/film_grain.h
+       src/shaders/film_grain_av1.c
 Copyright: 2018-2019, Niklas Haas
 License: LGPL-2.1+ or Expat
 

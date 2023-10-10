@@ -1,32 +1,23 @@
 #include "gpu_tests.h"
-
-#ifndef EPOXY_HAS_EGL
-int main()
-{
-    return SKIP;
-}
-#else // EPOXY_HAS_EGL
-
 #include "opengl/utils.h"
-#include <epoxy/gl.h>
-#include <epoxy/egl.h>
 
-static void opengl_interop_tests(const struct pl_gpu *gpu)
+#include <libplacebo/opengl.h>
+
+static void opengl_interop_tests(pl_gpu gpu)
 {
-    const struct pl_fmt *fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 0, 0,
-                                           PL_FMT_CAP_RENDERABLE |
-                                           PL_FMT_CAP_LINEAR);
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 0, 0,
+                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_LINEAR);
     if (!fmt)
         return;
 
-    const struct pl_tex *export = pl_tex_create(gpu, &(struct pl_tex_params) {
+    pl_tex export = pl_tex_create(gpu, pl_tex_params(
         .w = 32,
         .h = 32,
         .format = fmt,
         .sampleable = true,
         .renderable = true,
         .blit_dst = fmt->caps & PL_FMT_CAP_BLITTABLE,
-    });
+    ));
 
     REQUIRE(export);
 
@@ -39,10 +30,10 @@ static void opengl_interop_tests(const struct pl_gpu *gpu)
     wrap.texture = pl_opengl_unwrap(gpu, export, &wrap.target, &wrap.iformat, NULL);
     REQUIRE(wrap.texture);
 
-    const struct pl_tex *import = pl_opengl_wrap(gpu, &wrap);
+    pl_tex import = pl_opengl_wrap(gpu, &wrap);
     REQUIRE(import);
     REQUIRE(import->params.renderable);
-    REQUIRE(import->params.blit_dst == export->params.blit_dst);
+    REQUIRE_CMP(import->params.blit_dst, ==, export->params.blit_dst, "d");
 
     pl_tex_destroy(gpu, &import);
     pl_tex_destroy(gpu, &export);
@@ -62,19 +53,19 @@ static void swap_buffers(void *priv)
     eglSwapBuffers(p->display, p->surface);
 }
 
-static void opengl_swapchain_tests(const struct pl_opengl *gl,
+static void opengl_swapchain_tests(pl_opengl gl,
                                    EGLDisplay display, EGLSurface surface)
 {
     if (surface == EGL_NO_SURFACE)
         return;
 
     printf("testing opengl swapchain\n");
-    const struct pl_gpu *gpu = gl->gpu;
-    const struct pl_swapchain *sw;
-    sw = pl_opengl_create_swapchain(gl, &(struct pl_opengl_swapchain_params) {
+    pl_gpu gpu = gl->gpu;
+    pl_swapchain sw;
+    sw = pl_opengl_create_swapchain(gl, pl_opengl_swapchain_params(
         .swap_buffers = swap_buffers,
         .priv = &(struct swapchain_priv) { display, surface },
-    });
+    ));
     REQUIRE(sw);
 
     int w = PBUFFER_WIDTH, h = PBUFFER_HEIGHT;
@@ -97,60 +88,26 @@ static void opengl_swapchain_tests(const struct pl_opengl *gl,
     pl_swapchain_destroy(&sw);
 }
 
-static void opengl_test_export_import(const struct pl_opengl *gl,
-                                      enum pl_handle_type handle_type)
-{
-    const struct pl_gpu *gpu = gl->gpu;
-    printf("testing opengl import/export\n");
-
-    if (!(gpu->export_caps.tex & handle_type) ||
-        !(gpu->import_caps.tex & handle_type)) {
-        fprintf(stderr, "%s unsupported caps!\n", __func__);
-        return;
-    }
-
-    const struct pl_fmt *fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 0, 0,
-                                           PL_FMT_CAP_BLITTABLE);
-    if (!fmt) {
-        fprintf(stderr, "%s unsupported format\n", __func__);
-        return;
-    }
-
-    const struct pl_tex *export = pl_tex_create(gpu, &(struct pl_tex_params) {
-        .w = 32,
-        .h = 32,
-        .format = fmt,
-        .export_handle = handle_type,
-    });
-    REQUIRE(export);
-    REQUIRE(export->shared_mem.handle.fd > -1);
-
-    const struct pl_tex *import = pl_tex_create(gpu, &(struct pl_tex_params) {
-        .w = 32,
-        .h = 32,
-        .format = fmt,
-        .import_handle = handle_type,
-        .shared_mem = export->shared_mem,
-    });
-    REQUIRE(import);
-
-    pl_tex_destroy(gpu, &import);
-    pl_tex_destroy(gpu, &export);
-}
-
 int main()
 {
-    // Create the OpenGL context
-    if (!epoxy_has_egl_extension(EGL_NO_DISPLAY, "EGL_MESA_platform_surfaceless"))
+    if (!gladLoaderLoadEGL(EGL_NO_DISPLAY))
         return SKIP;
 
+    const char *extstr = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+    if (!extstr || !strstr(extstr, "EGL_MESA_platform_surfaceless"))
+        return SKIP;
+
+    // Create the OpenGL context
     EGLDisplay dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA,
-                                              EGL_DEFAULT_DISPLAY, NULL);
+                                              (void *) EGL_DEFAULT_DISPLAY, NULL);
     if (dpy == EGL_NO_DISPLAY)
         return SKIP;
 
     EGLint major, minor;
     if (!eglInitialize(dpy, &major, &minor))
+        return SKIP;
+
+    if (!gladLoaderLoadEGL(dpy))
         return SKIP;
 
     printf("Initialized EGL v%d.%d\n", major, minor);
@@ -164,24 +121,15 @@ int main()
         EGLenum profile;
     } egl_vers[] = {
         { EGL_OPENGL_API,       EGL_OPENGL_BIT,     4, 6, 460, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT },
-        { EGL_OPENGL_API,       EGL_OPENGL_BIT,     4, 5, 450, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT },
-        { EGL_OPENGL_API,       EGL_OPENGL_BIT,     4, 4, 440, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT },
-        { EGL_OPENGL_API,       EGL_OPENGL_BIT,     4, 0, 400, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT },
         { EGL_OPENGL_API,       EGL_OPENGL_BIT,     3, 3, 330, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT },
-        { EGL_OPENGL_API,       EGL_OPENGL_BIT,     3, 2, 150, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT },
-        { EGL_OPENGL_API,       EGL_OPENGL_BIT,     3, 1, 140, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT, },
         { EGL_OPENGL_API,       EGL_OPENGL_BIT,     3, 0, 130, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT, },
-        { EGL_OPENGL_API,       EGL_OPENGL_BIT,     2, 1, 120, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT, },
-        { EGL_OPENGL_API,       EGL_OPENGL_BIT,     2, 0, 110, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT, },
         { EGL_OPENGL_ES_API,    EGL_OPENGL_ES3_BIT, 3, 0, 300, },
-        { EGL_OPENGL_ES_API,    EGL_OPENGL_ES2_BIT, 2, 0, 100, },
     };
 
-    pl_gpu_caps last_caps = 0;
-    struct pl_glsl_desc last_glsl = {0};
+    struct pl_glsl_version last_glsl = {0};
     struct pl_gpu_limits last_limits = {0};
 
-    struct pl_context *ctx = pl_test_context();
+    pl_log log = pl_test_logger();
 
     for (int i = 0; i < PL_ARRAY_SIZE(egl_vers); i++) {
 
@@ -240,30 +188,33 @@ int main()
         if (!eglMakeCurrent(dpy, surf, surf, egl))
             goto error;
 
-        struct pl_opengl_params params = pl_opengl_default_params;
-        params.max_glsl_version = egl_vers[i].glsl_ver;
-        params.debug = true;
-        params.egl_display = dpy;
-        params.egl_context = egl;
+        pl_opengl gl = pl_opengl_create(log, pl_opengl_params(
+            .get_proc_addr = (pl_voidfunc_t (*)(const char *)) eglGetProcAddress,
+            .max_glsl_version = egl_vers[i].glsl_ver,
+            .debug = true,
+            .egl_display = dpy,
+            .egl_context = egl,
 #ifdef CI_ALLOW_SW
-        params.allow_software = true;
+            .allow_software = true,
 #endif
-
-        const struct pl_opengl *gl = pl_opengl_create(ctx, &params);
+        ));
         if (!gl)
             goto next;
 
         // Skip repeat tests
-        const struct pl_gpu *gpu = gl->gpu;
-        if (last_caps == gpu->caps &&
-            memcmp(&last_glsl, &gpu->glsl, sizeof(last_glsl)) == 0 &&
+        pl_gpu gpu = gl->gpu;
+        if (memcmp(&last_glsl, &gpu->glsl, sizeof(last_glsl)) == 0 &&
             memcmp(&last_limits, &gpu->limits, sizeof(last_limits)) == 0)
         {
             printf("Skipping tests due to duplicate capabilities/version\n");
             goto next;
         }
 
-        last_caps = gpu->caps;
+#ifdef CI_MAXGL
+        if (last_glsl.version && last_glsl.gles == gpu->glsl.gles)
+            goto next;
+#endif
+
         last_glsl = gpu->glsl;
         last_limits = gpu->limits;
 
@@ -271,10 +222,9 @@ int main()
         gpu_interop_tests(gpu);
         opengl_interop_tests(gpu);
         opengl_swapchain_tests(gl, dpy, surf);
-        opengl_test_export_import(gl, PL_HANDLE_DMA_BUF);
 
         // Reduce log spam after first successful test
-        pl_test_set_verbosity(ctx, PL_LOG_INFO);
+        pl_log_level_update(log, PL_LOG_INFO);
 
 next:
         pl_opengl_destroy(&gl);
@@ -289,10 +239,9 @@ error: ;
     }
 
     eglTerminate(dpy);
-    pl_context_destroy(&ctx);
+    gladLoaderUnloadEGL();
+    pl_log_destroy(&log);
 
     if (!last_glsl.version)
         return SKIP;
 }
-
-#endif // EPOXY_HAS_EGL

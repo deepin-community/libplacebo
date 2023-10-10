@@ -17,18 +17,18 @@ on both quality and performance. These include features such as the following:
   scaling.
 - **Color management** and format conversions for a wide variety of HDR or
   wide gamut color spaces. This includes support for ICC profiles, ITU-R
-  BT.1886 emulation, colorimetrically accurate clipping, scene-referred OOTFs
-  (such as HLG), constant luminance formats including ICtCp and a variety of
-  film industry formats ranging from XYZ to Sony's S-Log or Panasonic's
-  V-Gamut.
+  BT.1886 emulation, colorimetrically accurate clipping, custom 1D/3D LUTs,
+  scene-referred OOTFs (such as HLG), constant luminance formats including
+  ICtCp and a variety of film industry formats ranging from XYZ to Sony's
+  S-Log or Panasonic's V-Gamut.
 - Tunable **debanding** shader. This is based on flash3kyuu, expanded to
   provide high quality by combining multiple debanding passes.
 - Dynamic **HDR tone mapping**, including shaders for real-time peak and
   scene-change detection, chroma-preserving (luma-only) tone mapping,
   highlight desaturation, dynamic exposure control and a variety of
   industry-standard EETFs including BT.2390.
-- High performance AV1 **film grain synthesis**, allowing media players to
-  offload this part of AV1 decoding from the CPU to the GPU.
+- High performance **film grain synthesis** for AV1 and H.274, allowing media
+  players to offload this part of decoding from the CPU to the GPU.
 - A **pluggable, extensible custom shader syntax**, equivalent to an improved
   version of [mpv's `.hook`
   syntax](https://mpv.io/manual/master/#options-glsl-shaders). This can be
@@ -43,9 +43,17 @@ spaces, obscure subsampling modes, image metadata manipulation, and so on.
 Expert-level functionality is packed into easy-to-use functions like
 `pl_frame_from_avframe` and `pl_render_image`.
 
-libplacebo currently supports both Vulkan (including MoltenVK) and OpenGL, and
-contains backwards compatibility code for very old versions of GLSL down to
-GLES 2.0 and OpenGL 1.3.
+### Hardware requirements
+
+libplacebo currently supports Vulkan (including MoltenVK), OpenGL, and
+Direct3D 11. It currently has the following minimum hardware requirements:
+
+- **Vulkan**: Core version 1.1 + timeline semaphores
+- **OpenGL**: GLSL version >= 130 (GL >= 3.0, GL ES >= 3.0)
+- **Direct3D**: Feature level >= 9_1
+
+For more documentation, including an introduction to the API, see [the project
+website](https://libplacebo.org).
 
 ### Examples
 
@@ -53,7 +61,13 @@ This screenshot from the included [plplay demo program](./demos/plplay.c)
 highlights just some of the features supported by the libplacebo rendering
 code, all of which are adjustable dynamically during video playback.
 
-[<img src="./demos/plplay-screenshot.png" width="200" alt="plplay settings" />](./demos/plplay-screenshot.png)
+[<img src="./demos/screenshots/plplay1.png" width="200" alt="plplay settings 1" />](./demos/screenshots/plplay1.png)
+[<img src="./demos/screenshots/plplay2.png" width="200" alt="plplay settings 2" />](./demos/screenshots/plplay2.png)
+[<img src="./demos/screenshots/plplay3.png" width="200" alt="plplay settings 3" />](./demos/screenshots/plplay3.png)
+
+[<img src="./demos/screenshots/plplay4.png" width="200" alt="plplay settings 4" />](./demos/screenshots/plplay4.png)
+[<img src="./demos/screenshots/plplay5.png" width="200" alt="plplay settings 5" />](./demos/screenshots/plplay5.png)
+[<img src="./demos/screenshots/plplay6.png" width="200" alt="plplay settings 6" />](./demos/screenshots/plplay6.png)
 
 ### History
 
@@ -86,7 +100,7 @@ that need strong control over the entire rendering pipeline; whereas the
 high-level tiers are more suitable for smaller or simpler projects that want
 libplacebo to take care of everything.
 
-### Tier 0 (context, raw math primitives)
+### Tier 0 (logging, raw math primitives)
 
 - `colorspace.h`: A collection of enums and structs for describing color
   spaces, as well as a collection of helper functions for computing various
@@ -94,8 +108,7 @@ libplacebo to take care of everything.
 - `common.h`: A collection of miscellaneous utility types and macros that are
   shared among multiple subsystems. Usually does not need to be included
   directly.
-- `context.h`: The main entry-point into the library. Controls memory
-  allocation, logging. and guards ABI/thread safety.
+- `log.h`: Logging subsystem.
 - `config.h`: Macros defining information about the way libplacebo was built,
   including the version strings and compiled-in features/dependencies. Usually
   does not need to be included directly. May be useful for feature tests.
@@ -106,6 +119,11 @@ libplacebo to take care of everything.
   the needs of libplacebo, but may be useful to somebody else regardless. Also
   contains the structs needed to define a filter kernel for the purposes of
   libplacebo's upscaling routines.
+- `tone_mapping.h`: A collection of tone mapping functions, used for
+  conversions between HDR and SDR content.
+- `gamut_mapping.h`: A collection of gamut mapping functions, used for
+  conversions between wide gamut and standard gamut content, as well as
+  for gamut recompression after tone-mapping.
 
 The API functions in this tier are either used throughout the program
 (context, common etc.) or are low-level implementations of filter kernels,
@@ -120,6 +138,8 @@ and even the GPU in general.
   frames for presentation (e.g. to a window or display device).
 - `vulkan.h`: GPU API implementation based on Vulkan.
 - `opengl.h`: GPU API implementation based on OpenGL.
+- `d3d11.h`: GPU API implementation based on Direct3D 11.
+- `dummy.h`: Dummy GPI API (interfaces with CPU only, no shader support)
 
 As part of the public API, libplacebo exports a middle-level abstraction for
 dealing with GPU objects and state. Basically, this is the API libplacebo uses
@@ -143,14 +163,16 @@ other developers of GPU-accelerated image processing software.
 In addition to this low-level interface, there are several available shader
 routines which libplacebo exports:
 
-- `shaders/av1.h`: Helper shaders for AV1 decoding, currently only implements
-  a film grain synthesis shader.
 - `shaders/colorspace.h`: Shader routines for decoding and transforming
-  colors, tone mapping, dithering, and so forth.
+  colors, tone mapping, and so forth.
 - `shaders/custom.h`: Allows directly ingesting custom GLSL logic into the
   `pl_shader` abstraction, either as bare GLSL or in [mpv .hook
   format](https://mpv.io/manual/master/#options-glsl-shaders).
+- `shaders/deinterlacing.h`: GPU deinterlacing shader based on yadif.
+- `shaders/dithering.h`: Shader routine for various GPU dithering methods.
+- `shaders/film_grain.h`: Film grain synthesis shaders for AV1 and H.274.
 - `shaders/icc.h`: Shader for ICC profile based color management.
+- `shaders/lut.h`: Code for applying arbitrary 1D/3D LUTs.
 - `shaders/sampling.h`: Shader routines for various algorithms that sample
   from images, such as debanding and scaling.
 
@@ -237,9 +259,22 @@ Please open an issue if you have a use case for a BSD2-licensed libplacebo.
 
 ## Installing
 
-### Gentoo
+### Obtaining
 
-An ebuild is available as `media-libs/libplacebo` in the gentoo repository.
+When cloning libplacebo, make sure to provide the `--recursive``` flag:
+
+```bash
+$ git clone --recursive https://code.videolan.org/videolan/libplacebo
+```
+
+Alternatively (on an existing clone):
+
+```bash
+$ git submodule update --init
+```
+
+Doing either of these pulls in a handful of bundled 3rdparty dependencies.
+Alternatively, they can be provided via the system.
 
 ### Building from source
 
@@ -262,8 +297,8 @@ on distro packages.
 
 In principle, libplacebo has no mandatory dependencies - only optional ones.
 However, to get a useful version of libplacebo. you most likely want to build
-with support for either `opengl` or `vulkan`. libplacebo built without these
-can still be used (e.g. to generate GLSL shaders such as the ones used in
+with support for either `opengl`, `vulkan` or `d3d11`. libplacebo built without
+these can still be used (e.g. to generate GLSL shaders such as the ones used in
 VLC), but the usefulness is severely impacted since most components will be
 missing, impaired or otherwise not functional.
 
@@ -271,9 +306,12 @@ A full list of optional dependencies each feature requires:
 
 - **glslang**: `glslang` + its related libraries (e.g. `libSPIRV.so`)
 - **lcms**: `liblcms2`
-- **opengl**: `libepoxy`
+- **libdovi**: `libdovi`
+- **opengl**: `glad2` (*)
 - **shaderc**: `libshaderc`
-- **vulkan**: `libvulkan`, `python3-mako`
+- **vulkan**: `libvulkan`, `python3-jinja2` (*)
+
+(*) This dependency is bundled automatically when doing a recursive clone.
 
 #### Vulkan support
 
@@ -323,27 +361,6 @@ $ meson test -C$DIR benchmark --verbose
 ```
 
 ## Using
-
-Building a trivial project using libplacebo is straightforward:
-
-```c
-// build with -lplacebo
-
-#include <libplacebo/context.h>
-
-void main()
-{
-    struct pl_context *ctx;
-    ctx = pl_context_create(PL_API_VER, &(struct pl_context_params) {
-        .log_cb    = pl_log_color,
-        .log_level = PL_LOG_INFO,
-    });
-
-    // do something..
-
-    pl_context_destroy(&ctx);
-}
-```
 
 For a full documentation of the API, refer to the above [API
 Overview](#api-overview) as well as the [public header

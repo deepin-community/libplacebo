@@ -16,26 +16,29 @@
 # License along with libplacebo.  If not, see <http://www.gnu.org/licenses/>.
 
 import os.path
+import re
 import sys
 import xml.etree.ElementTree as ET
 
 try:
-    from mako.template import Template
+    from jinja2 import Environment
 except ModuleNotFoundError:
-    print('Module \'mako\' not found, please install \'python3-mako\' or '
-          'an equivalent package on your system!', file=sys.stderr)
+    print('Module \'jinja2\' not found, please install \'python3-Jinja2\' or '
+          'an equivalent package on your system! Alternatively, run '
+          '`git submodule update --init` followed by `meson --wipe`.',
+          file=sys.stderr)
     sys.exit(1)
 
-TEMPLATE = Template("""
+TEMPLATE = Environment(trim_blocks=True).from_string("""
 #define VK_ENABLE_BETA_EXTENSIONS
 #include "vulkan/utils.h"
 
 const char *vk_res_str(VkResult res)
 {
     switch (res) {
-%for res in vkresults:
-    case ${res}: return "${res}";
-%endfor
+{% for res in vkresults %}
+    case {{ res }}: return "{{ res }}";
+{% endfor %}
 
     default: return "unknown error";
     }
@@ -44,9 +47,9 @@ const char *vk_res_str(VkResult res)
 const char *vk_fmt_name(VkFormat fmt)
 {
     switch (fmt) {
-%for fmt in vkformats:
-    case ${fmt}: return "${fmt}";
-%endfor
+{% for fmt in vkformats %}
+    case {{ fmt }}: return "{{ fmt }}";
+{% endfor %}
 
     default: return "unknown format";
     }
@@ -55,9 +58,9 @@ const char *vk_fmt_name(VkFormat fmt)
 const char *vk_csp_name(VkColorSpaceKHR csp)
 {
     switch (csp) {
-%for csp in vkspaces:
-    case ${csp}: return "${csp}";
-%endfor
+{% for csp in vkspaces %}
+    case {{ csp }}: return "{{ csp }}";
+{% endfor %}
 
     default: return "unknown color space";
     }
@@ -66,9 +69,9 @@ const char *vk_csp_name(VkColorSpaceKHR csp)
 const char *vk_handle_name(VkExternalMemoryHandleTypeFlagBitsKHR handle)
 {
     switch (handle) {
-%for handle in vkhandles:
-    case ${handle}: return "${handle}";
-%endfor
+{% for handle in vkhandles %}
+    case {{ handle }}: return "{{ handle }}";
+{% endfor %}
 
     default: return "unknown handle type";
     }
@@ -77,9 +80,9 @@ const char *vk_handle_name(VkExternalMemoryHandleTypeFlagBitsKHR handle)
 const char *vk_alpha_mode(VkCompositeAlphaFlagsKHR alpha)
 {
     switch (alpha) {
-%for mode in vkalphas:
-    case ${mode}: return "${mode}";
-%endfor
+{% for mode in vkalphas %}
+    case {{ mode }}: return "{{ mode }}";
+{% endfor %}
 
     default: return "unknown alpha mode";
     }
@@ -88,9 +91,9 @@ const char *vk_alpha_mode(VkCompositeAlphaFlagsKHR alpha)
 const char *vk_surface_transform(VkSurfaceTransformFlagsKHR tf)
 {
     switch (tf) {
-%for tf in vktransforms:
-    case ${tf}: return "${tf}";
-%endfor
+{% for tf in vktransforms %}
+    case {{ tf }}: return "{{ tf }}";
+{% endfor %}
 
     default: return "unknown surface transform";
     }
@@ -100,9 +103,9 @@ const char *vk_surface_transform(VkSurfaceTransformFlagsKHR tf)
 const char *vk_obj_type(VkObjectType obj)
 {
     switch (obj) {
-%for obj in vkobjects:
-    case ${obj.enum}: return "${obj.name}";
-%endfor
+{% for obj in vkobjects %}
+    case {{ obj.enum }}: return "{{ obj.name }}";
+{% endfor %}
 
     default: return "unknown object";
     }
@@ -111,71 +114,206 @@ const char *vk_obj_type(VkObjectType obj)
 size_t vk_struct_size(VkStructureType stype)
 {
     switch (stype) {
-%for struct in vkstructs:
-    case ${struct.stype}: return sizeof(${struct.name});
-%endfor
+{% for struct in vkstructs %}
+    case {{ struct.stype }}: return sizeof({{ struct.name }});
+{% endfor %}
 
     default: return 0;
     }
 }
+
+uint32_t vk_ext_promoted_ver(const char *extension)
+{
+{% for ext in vkexts %}
+{%  if ext.promoted_ver %}
+    if (!strcmp(extension, "{{ ext.name }}"))
+        return {{ ext.promoted_ver }};
+{%  endif %}
+{% endfor %}
+    return 0;
+}
+
+void vk_features_normalize(void *alloc, const VkPhysicalDeviceFeatures2 *fin,
+                           uint32_t api_ver, VkPhysicalDeviceFeatures2 *out)
+{
+    for (const VkBaseInStructure *in = (void *) fin; in; in = in->pNext) {
+        switch (in->sType) {
+        default: break;
+{% for fs in vkfeatures %}
+        case {{ fs.stype }}: {
+            const {{ fs.name }} *i = (const void *) in;
+{% for f in fs.features %}
+            if (i->{{ f.name }}) {
+{% for r in f.replacements %}
+{% if r.core_ver %}
+               if (!api_ver || api_ver >= {{ r.core_ver }})
+{% elif r.max_ver %}
+               if (!api_ver || api_ver < {{ r.max_ver }})
+{% endif %}
+{% if fs.is_base %}
+                out->{{ f.name }} = true;
+{% else %}
+                (({{ r.name }} *) vk_chain_alloc(alloc, out, {{ r.stype }}))->{{ f.name }} = true;
+{% endif %}
+{% endfor %}
+            }
+{% endfor %}
+            break;
+        }
+{% endfor %}
+        }
+    }
+}
+
+const VkAccessFlags2 vk_access_read = {{ '0x%x' % vkaccess.read }}LLU;
+const VkAccessFlags2 vk_access_write = {{ '0x%x' % vkaccess.write }}LLU;
 """)
 
 class Obj(object):
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
 
-def findall_enum(registry, name):
-    for e in registry.iterfind('enums[@name="{0}"]/enum'.format(name)):
-        if not 'alias' in e.attrib:
-            yield e
-    for e in registry.iterfind('.//enum[@extends="{0}"]'.format(name)):
-        # ext 289 is a non-existing extension that defines some names for
-        # proprietary downstream consumers, causes problems unless excluded
-        if e.attrib.get('extnumber', '0') == '289':
-            continue
-        # some other extensions contain reserved identifiers that generally
-        # translate to compile failures
-        if 'RESERVED' in e.attrib['name']:
-            continue
-        if not 'alias' in e.attrib:
-            yield e
+class VkXML(ET.ElementTree):
+    def blacklist_block(self, req):
+        for t in req.iterfind('type'):
+            self.blacklist_types.add(t.attrib['name'])
+        for e in req.iterfind('enum'):
+            self.blacklist_enums.add(e.attrib['name'])
+
+    def __init__(self, *args, **kwargs):
+
+        super().__init__(*args, **kwargs)
+        self.blacklist_types = set()
+        self.blacklist_enums = set()
+
+        for f in self.iterfind('feature'):
+            # Feature block for non-Vulkan API
+            if not 'vulkan' in f.attrib['api'].split(','):
+                for r in f.iterfind('require'):
+                    self.blacklist_block(r)
+
+        for e in self.iterfind('extensions/extension'):
+            # Entire extension is unsupported on vulkan or platform-specifid
+            if not 'vulkan' in e.attrib['supported'].split(',') or 'platform' in e.attrib:
+                for r in e.iterfind('require'):
+                    self.blacklist_block(r)
+                continue
+
+            # Only individual <require> blocks are API-specific
+            for r in e.iterfind('require[@api]'):
+                if not 'vulkan' in r.attrib['api'].split(','):
+                    self.blacklist_block(r)
+
+    def findall_enum(self, name):
+        for e in self.iterfind('enums[@name="{0}"]/enum'.format(name)):
+            if not 'alias' in e.attrib:
+                if not e.attrib['name'] in self.blacklist_enums:
+                    yield e
+        for e in self.iterfind('.//enum[@extends="{0}"]'.format(name)):
+            if not 'alias' in e.attrib:
+                if not e.attrib['name'] in self.blacklist_enums:
+                    yield e
+
+    def findall_type(self, category):
+        for t in self.iterfind('types/type[@category="{0}"]'.format(category)):
+            name = t.attrib.get('name') or t.find('name').text
+            if name in self.blacklist_types:
+                continue
+            yield t
+
 
 def get_vkenum(registry, enum):
-    for e in findall_enum(registry, enum):
+    for e in registry.findall_enum(enum):
         yield e.attrib['name']
 
 def get_vkobjects(registry):
-    for e in findall_enum(registry, 'VkObjectType'):
-        if 'comment' in e.attrib:
-            yield Obj(enum = e.attrib['name'],
-                      name = e.attrib['comment'])
+    for t in registry.findall_type('handle'):
+        if 'objtypeenum' in t.attrib:
+            yield Obj(enum = t.attrib['objtypeenum'],
+                      name = t.find('name').text)
 
 def get_vkstructs(registry):
-    for e in registry.iterfind('types/type[@category="struct"]'):
-        # Strings for platform-specific crap we want to blacklist as they will
-        # most likely cause build failures
-        blacklist_strs = [
-            'ANDROID', 'Surface', 'Win32', 'D3D12', 'GGP', 'FUCHSIA',
-        ]
-
-        if any([ str in e.attrib['name'] for str in blacklist_strs ]):
-            continue
-
+    for t in registry.findall_type('struct'):
         stype = None
-        for m in e.iterfind('member'):
+        for m in t.iterfind('member'):
             if m.find('name').text == 'sType':
                 stype = m
                 break
 
         if stype and 'values' in stype.attrib:
             yield Obj(stype = stype.attrib['values'],
-                      name = e.attrib['name'])
+                      name = t.attrib['name'])
 
-def find_registry_xml():
+def get_vkaccess(registry):
+    access = Obj(read = 0, write = 0)
+    for e in registry.findall_enum('VkAccessFlagBits2'):
+        if '_READ_' in e.attrib['name']:
+            access.read |= 1 << int(e.attrib['bitpos'])
+        if '_WRITE_' in e.attrib['name']:
+            access.write |= 1 << int(e.attrib['bitpos'])
+    return access
+
+def get_vkexts(registry):
+    for e in registry.iterfind('extensions/extension'):
+        promoted_ver = None
+        if res := re.match(r'VK_VERSION_(\d)_(\d)', e.attrib.get('promotedto', '')):
+            promoted_ver = 'VK_API_VERSION_{0}_{1}'.format(res[1], res[2])
+        yield Obj(name = e.attrib['name'],
+                  promoted_ver = promoted_ver)
+
+def get_vkfeatures(registry):
+    structs = [];
+    featuremap = {}; # features -> [struct]
+    for t in registry.findall_type('struct'):
+        sname = t.attrib['name']
+        is_base = sname == 'VkPhysicalDeviceFeatures'
+        extends = t.attrib.get('structextends', [])
+        if is_base:
+            sname = 'VkPhysicalDeviceFeatures2'
+            stype = 'VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2'
+        elif not 'VkPhysicalDeviceFeatures2' in extends:
+            continue
+
+        features = []
+        for f in t.iterfind('member'):
+            if f.find('type').text == 'VkStructureType':
+                stype = f.attrib['values']
+            elif f.find('type').text == 'VkBool32':
+                fname = f.find('name').text
+                if is_base:
+                    fname = 'features.' + fname
+                features.append(Obj(name = fname))
+
+        core_ver = None
+        if res := re.match(r'VkPhysicalDeviceVulkan(\d)(\d)Features', sname):
+            core_ver = 'VK_API_VERSION_{0}_{1}'.format(res[1], res[2])
+
+        struct = Obj(name       = sname,
+                     stype      = stype,
+                     core_ver   = core_ver,
+                     is_base    = is_base,
+                     features   = features)
+
+        structs.append(struct)
+        for f in features:
+            featuremap.setdefault(f.name, []).append(struct)
+
+    for s in structs:
+        for f in s.features:
+            f.replacements = featuremap[f.name]
+            core_ver = next(( r.core_ver for r in f.replacements if r.core_ver ), None)
+            for r in f.replacements:
+                if not r.core_ver:
+                    r.max_ver = core_ver
+
+    yield from structs
+
+def find_registry_xml(datadir):
     registry_paths = [
+        '{0}/vulkan/registry/vk.xml'.format(datadir),
+        '$MINGW_PREFIX/share/vulkan/registry/vk.xml',
         '%VULKAN_SDK%/share/vulkan/registry/vk.xml',
         '$VULKAN_SDK/share/vulkan/registry/vk.xml',
-        '$MINGW_PREFIX/share/vulkan/registry/vk.xml',
         '/usr/share/vulkan/registry/vk.xml',
     ]
 
@@ -191,14 +329,15 @@ def find_registry_xml():
     sys.exit(1)
 
 if __name__ == '__main__':
-    assert len(sys.argv) == 3
-    xmlfile = sys.argv[1]
-    outfile = sys.argv[2]
+    assert len(sys.argv) == 4
+    datadir = sys.argv[1]
+    xmlfile = sys.argv[2]
+    outfile = sys.argv[3]
 
     if not xmlfile or xmlfile == '':
-        xmlfile = find_registry_xml()
+        xmlfile = find_registry_xml(datadir)
 
-    registry = ET.parse(xmlfile)
+    registry = VkXML(ET.parse(xmlfile))
     with open(outfile, 'w') as f:
         f.write(TEMPLATE.render(
             vkresults = get_vkenum(registry, 'VkResult'),
@@ -209,4 +348,7 @@ if __name__ == '__main__':
             vktransforms = get_vkenum(registry, 'VkSurfaceTransformFlagBitsKHR'),
             vkobjects = get_vkobjects(registry),
             vkstructs = get_vkstructs(registry),
+            vkaccess = get_vkaccess(registry),
+            vkexts = get_vkexts(registry),
+            vkfeatures = get_vkfeatures(registry),
         ))

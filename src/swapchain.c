@@ -16,63 +16,90 @@
  */
 
 #include "common.h"
-#include "context.h"
+#include "log.h"
 #include "swapchain.h"
 
-void pl_swapchain_destroy(const struct pl_swapchain **ptr)
+void pl_swapchain_destroy(pl_swapchain *ptr)
 {
-    const struct pl_swapchain *sw = *ptr;
+    pl_swapchain sw = *ptr;
     if (!sw)
         return;
 
-    sw->impl->destroy(sw);
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    impl->destroy(sw);
     *ptr = NULL;
 }
 
-int pl_swapchain_latency(const struct pl_swapchain *sw)
+int pl_swapchain_latency(pl_swapchain sw)
 {
-    if (!sw->impl->latency)
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    if (!impl->latency)
         return 0;
 
-    return sw->impl->latency(sw);
+    return impl->latency(sw);
 }
 
-bool pl_swapchain_resize(const struct pl_swapchain *sw, int *width, int *height)
+bool pl_swapchain_resize(pl_swapchain sw, int *width, int *height)
 {
     int dummy[2] = {0};
     width = PL_DEF(width, &dummy[0]);
     height = PL_DEF(height, &dummy[1]);
 
-    if (!sw->impl->resize) {
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    if (!impl->resize) {
         *width = *height = 0;
         return true;
     }
 
-    return sw->impl->resize(sw, width, height);
+    return impl->resize(sw, width, height);
 }
 
-bool pl_swapchain_hdr_metadata(const struct pl_swapchain *sw,
-                               const struct pl_hdr_metadata *metadata)
+void pl_swapchain_colorspace_hint(pl_swapchain sw, const struct pl_color_space *csp)
 {
-    if (!sw->impl->hdr_metadata)
-        return false;
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    if (!impl->colorspace_hint)
+        return;
 
-    return sw->impl->hdr_metadata(sw, metadata);
+    struct pl_swapchain_colors fix = {0};
+    if (csp) {
+        fix = *csp;
+
+        bool has_metadata = !pl_hdr_metadata_equal(&fix.hdr, &pl_hdr_metadata_empty);
+        bool is_hdr = pl_color_transfer_is_hdr(fix.transfer);
+
+        // Ensure consistency of the metadata and requested transfer function
+        if (has_metadata && !fix.transfer) {
+            fix.transfer = PL_COLOR_TRC_PQ;
+        } else if (has_metadata && !is_hdr) {
+            fix.hdr = pl_hdr_metadata_empty;
+        } else if (!has_metadata && is_hdr) {
+            fix.hdr = pl_hdr_metadata_hdr10;
+        }
+
+        // Ensure we have valid values set for all the fields
+        pl_color_space_infer(&fix);
+    }
+
+    impl->colorspace_hint(sw, &fix);
 }
 
-bool pl_swapchain_start_frame(const struct pl_swapchain *sw,
+bool pl_swapchain_start_frame(pl_swapchain sw,
                               struct pl_swapchain_frame *out_frame)
 {
     *out_frame = (struct pl_swapchain_frame) {0}; // sanity
-    return sw->impl->start_frame(sw, out_frame);
+
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    return impl->start_frame(sw, out_frame);
 }
 
-bool pl_swapchain_submit_frame(const struct pl_swapchain *sw)
+bool pl_swapchain_submit_frame(pl_swapchain sw)
 {
-    return sw->impl->submit_frame(sw);
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    return impl->submit_frame(sw);
 }
 
-void pl_swapchain_swap_buffers(const struct pl_swapchain *sw)
+void pl_swapchain_swap_buffers(pl_swapchain sw)
 {
-    sw->impl->swap_buffers(sw);
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    impl->swap_buffers(sw);
 }

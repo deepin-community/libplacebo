@@ -107,9 +107,7 @@ struct pl_peak_detect_params {
     // the cutoff period (= 1 / cutoff frequency) in frames. Frequencies below
     // this length will be suppressed. This helps block out annoying
     // "sparkling" or "flickering" due to small variations in frame-to-frame
-    // brightness.
-    //
-    // If left unset, this defaults to 100.0.
+    // brightness. If left as 0.0, this smoothing is completely disabled.
     float smoothing_period;
 
     // In order to avoid reacting sluggishly on scene changes as a result of
@@ -120,15 +118,9 @@ struct pl_peak_detect_params {
     // over a small window of brightness ranges. These parameters control the
     // lower and upper bounds of this window, in units of 1% PQ.
     //
-    // The default values are 5.5 and 10.0, respectively. To disable this logic
-    // entirely, set either one to a negative value.
+    // Setting either one of these to 0.0 disables this logic.
     float scene_threshold_low;
     float scene_threshold_high;
-
-    // To avoid over-tone-mapping very dark scenes (or black frames), this
-    // imposes a hard lower bound on the detected peak. If left as 0.0, it
-    // instead defaults to a value of 1.0.
-    float minimum_peak;
 
     // Which percentile of the input image brightness histogram to consider as
     // the true peak of the scene. If this is set to 100 (or 0), the brightest
@@ -142,18 +134,19 @@ struct pl_peak_detect_params {
     float percentile;
 
     // Allows the peak detection result to be delayed by up to a single frame,
-    // which can sometimes improve thoughpout. Disabled by default.
+    // which can sometimes improve thoughput, at the cost of introducing the
+    // possibility of 1-frame flickers on transitions. Disabled by default.
     bool allow_delayed;
 
-    // --- Deprecated fields
+    // --- Deprecated / removed fields
     float overshoot_margin PL_DEPRECATED;
+    float minimum_peak PL_DEPRECATED;
 };
 
 #define PL_PEAK_DETECT_DEFAULTS         \
-    .smoothing_period       = 100.0f,   \
-    .scene_threshold_low    = 5.5f,     \
-    .scene_threshold_high   = 10.0f,    \
-    .minimum_peak           = 1.0f,     \
+    .smoothing_period       = 20.0f,    \
+    .scene_threshold_low    = 1.0f,     \
+    .scene_threshold_high   = 3.0f,     \
     .percentile             = 100.0f,
 
 #define PL_PEAK_DETECT_HQ_DEFAULTS      \
@@ -239,25 +232,31 @@ struct pl_color_map_params {
     // colors which are out-of-gamut as a consequence of tone mapping.
     const struct pl_gamut_map_function *gamut_mapping;
 
+    // Gamut mapping constants, for expert tuning. Leave as default otherwise.
+    struct pl_gamut_map_constants gamut_constants;
+
     // Gamut mapping 3DLUT size, for channels ICh. Defaults to {48, 32, 256}
     int lut3d_size[3];
 
-    // Use higher quality tricubic interpolation for gamut mapping 3DLUTs.
-    // Off by default for performance reasons, but may substantially improve
-    // the 3DLUT gamut mapping accuracy.
+    // Use higher quality, but slower, tricubic interpolation for gamut mapping
+    // 3DLUTs. May substantially improve the 3DLUT gamut mapping accuracy, in
+    // particular at smaller 3DLUT sizes. Shouldn't have much effect at the
+    // default size.
     bool lut3d_tricubic;
+
+    // If true, allows the gamut mapping function to expand the gamut, in
+    // cases where the target gamut exceeds that of the source. If false,
+    // the source gamut will never be enlarged, even when using a gamut
+    // mapping function capable of bidirectional mapping.
+    bool gamut_expansion;
 
     // --- Tone mapping options
 
-    // Function and configuration used for tone-mapping. For non-tunable
-    // functions, the `param` is ignored. If the tone mapping parameter is
-    // left as 0.0, the tone-mapping curve's preferred default parameter will
-    // be used. The default function is pl_tone_map_auto.
-    //
-    // Note: This pointer changing invalidates the LUT, so make sure to only
-    // use stable (or static) storage for the pl_tone_map_function.
+    // Tone mapping function to use to handle out-of-range colors.
     const struct pl_tone_map_function *tone_mapping_function;
-    float tone_mapping_param;
+
+    // Tone mapping constants, for expert tuning. Leave as default otherwise.
+    struct pl_tone_map_constants tone_constants;
 
     // If true, and supported by the given tone mapping function, libplacebo
     // will perform inverse tone mapping to expand the dynamic range of a
@@ -271,7 +270,7 @@ struct pl_color_map_params {
     // Tone mapping LUT size. Defaults to 256.
     int lut_size;
 
-    // Contrast recovery strength. If set to a value above 0.0, the source
+    // HDR contrast recovery strength. If set to a value above 0.0, the source
     // image will be divided into high-frequency and low-frequency components,
     // and a portion of the high-frequency image is added back onto the
     // tone-mapped output. May cause excessive ringing artifacts for some HDR
@@ -306,6 +305,7 @@ struct pl_color_map_params {
 
     // --- Deprecated fields
     enum pl_tone_map_mode tone_mapping_mode PL_DEPRECATED; // removed
+    float tone_mapping_param PL_DEPRECATED;         // see `tone_constants`
     float tone_mapping_crosstalk PL_DEPRECATED;     // now hard-coded as 0.04
     enum pl_rendering_intent intent PL_DEPRECATED;  // see `gamut_mapping`
     enum pl_gamut_mode gamut_mode PL_DEPRECATED;    // see `gamut_mapping`
@@ -314,10 +314,13 @@ struct pl_color_map_params {
 
 #define PL_COLOR_MAP_DEFAULTS                                   \
     .gamut_mapping          = &pl_gamut_map_perceptual,         \
-    .tone_mapping_function  = &pl_tone_map_auto,                \
+    .tone_mapping_function  = &pl_tone_map_spline,              \
+    .gamut_constants        = { PL_GAMUT_MAP_CONSTANTS },       \
+    .tone_constants         = { PL_TONE_MAP_CONSTANTS },        \
     .metadata               = PL_HDR_METADATA_ANY,              \
     .lut3d_size             = {48, 32, 256},                    \
     .lut_size               = 256,                              \
+    .visualize_rect         = {0, 0, 1, 1},                     \
     .contrast_smoothness    = 3.5f,
 
 #define PL_COLOR_MAP_HQ_DEFAULTS                                \

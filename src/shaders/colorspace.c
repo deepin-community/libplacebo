@@ -16,8 +16,9 @@
  */
 
 #include <math.h>
+
+#include "cache.h"
 #include "shaders.h"
-#include "colorspace.h"
 
 #include <libplacebo/shaders/colorspace.h>
 
@@ -602,10 +603,10 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
     GLSL("}\n");
 }
 
-static ident_t sh_luma_coeffs(pl_shader sh, const struct pl_raw_primaries *prim)
+static ident_t sh_luma_coeffs(pl_shader sh, const struct pl_color_space *csp)
 {
     pl_matrix3x3 rgb2xyz;
-    rgb2xyz = pl_get_rgb2xyz_matrix(prim);
+    rgb2xyz = pl_get_rgb2xyz_matrix(pl_raw_primaries_get(csp->primaries));
 
     // FIXME: Cannot use `const vec3` due to glslang bug #2025
     ident_t coeffs = sh_fresh(sh, "luma_coeffs");
@@ -708,9 +709,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
         // OOTF
         GLSL("color.rgb *= 1.0 / 12.0;                                      \n"
              "color.rgb *= "$" * pow(max(dot("$", color.rgb), 0.0), "$");   \n",
-             SH_FLOAT(csp_max),
-             sh_luma_coeffs(sh, pl_raw_primaries_get(csp->primaries)),
-             SH_FLOAT(y - 1));
+             SH_FLOAT(csp_max), sh_luma_coeffs(sh, csp), SH_FLOAT(y - 1));
         return;
     }
     case PL_COLOR_TRC_V_LOG:
@@ -852,9 +851,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
         // OOTF^-1
         GLSL("color.rgb *= 1.0 / "$";                                       \n"
              "color.rgb *= 12.0 * max(1e-6, pow(dot("$", color.rgb), "$")); \n",
-             SH_FLOAT(csp_max),
-             sh_luma_coeffs(sh, pl_raw_primaries_get(csp->primaries)),
-             SH_FLOAT((1 - y) / y));
+             SH_FLOAT(csp_max), sh_luma_coeffs(sh, csp), SH_FLOAT((1 - y) / y));
         // OETF
         GLSL("color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                      \n"
              "                vec3(%f) * log(color.rgb - vec3(%f)) + vec3(%f),  \n"
@@ -898,8 +895,8 @@ void pl_shader_sigmoidize(pl_shader sh, const struct pl_sigmoid_params *params)
         return;
 
     params = PL_DEF(params, &pl_sigmoid_default_params);
-    float center = PL_DEF(params->center, 0.75);
-    float slope  = PL_DEF(params->slope, 6.5);
+    float center = PL_DEF(params->center, pl_sigmoid_default_params.center);
+    float slope  = PL_DEF(params->slope, pl_sigmoid_default_params.slope);
 
     // This function needs to go through (0,0) and (1,1), so we compute the
     // values at 1 and 0, and then scale/shift them, respectively.
@@ -922,8 +919,8 @@ void pl_shader_unsigmoidize(pl_shader sh, const struct pl_sigmoid_params *params
 
     // See: pl_shader_sigmoidize
     params = PL_DEF(params, &pl_sigmoid_default_params);
-    float center = PL_DEF(params->center, 0.75);
-    float slope  = PL_DEF(params->slope, 6.5);
+    float center = PL_DEF(params->center, pl_sigmoid_default_params.center);
+    float slope  = PL_DEF(params->slope, pl_sigmoid_default_params.slope);
     float offset = 1.0 / (1 + expf(slope * center));
     float scale  = 1.0 / (1 + expf(slope * (center - 1))) - offset;
 
@@ -946,7 +943,6 @@ static bool peak_detect_params_eq(const struct pl_peak_detect_params *a,
     return a->smoothing_period     == b->smoothing_period     &&
            a->scene_threshold_low  == b->scene_threshold_low  &&
            a->scene_threshold_high == b->scene_threshold_high &&
-           a->minimum_peak         == b->minimum_peak         &&
            a->percentile           == b->percentile;
     // don't compare `allow_delayed` because it doesn't change measurement
 }
@@ -980,6 +976,7 @@ pl_static_assert(PQ_BITS >= HIST_BITS);
 
 struct peak_buf_data {
     unsigned frame_wg_count[SLICES]; // number of work groups processed
+    unsigned frame_wg_active[SLICES];// number of active (nonzero) work groups
     unsigned frame_sum_pq[SLICES];   // sum of PQ Y values over all WGs (PQ_BITS)
     unsigned frame_max_pq[SLICES];   // maximum PQ Y value among these WGs (PQ_BITS)
     unsigned frame_hist[SLICES][HIST_BINS]; // always allocated, conditionally used
@@ -1002,6 +999,7 @@ static const struct pl_buffer_var peak_buf_vars[] = {
     },                                                                          \
 }
     VAR(frame_wg_count),
+    VAR(frame_wg_active),
     VAR(frame_sum_pq),
     VAR(frame_max_pq),
     VAR(frame_hist),
@@ -1017,7 +1015,6 @@ struct sh_color_map_obj {
 
     // Gamut map state
     struct {
-        struct pl_gamut_map_params params;
         pl_shader_obj lut;
     } gamut;
 
@@ -1031,6 +1028,19 @@ struct sh_color_map_obj {
     } peak;
 };
 
+// Excluding size, since this is checked by sh_lut
+static uint64_t gamut_map_signature(const struct pl_gamut_map_params *par)
+{
+    uint64_t sig = CACHE_KEY_GAMUT_LUT;
+    pl_hash_merge(&sig, pl_str0_hash(par->function->name));
+    pl_hash_merge(&sig, pl_var_hash(par->input_gamut));
+    pl_hash_merge(&sig, pl_var_hash(par->output_gamut));
+    pl_hash_merge(&sig, pl_var_hash(par->min_luma));
+    pl_hash_merge(&sig, pl_var_hash(par->max_luma));
+    pl_hash_merge(&sig, pl_var_hash(par->constants));
+    return sig;
+}
+
 static void sh_color_map_uninit(pl_gpu gpu, void *ptr)
 {
     struct sh_color_map_obj *obj = ptr;
@@ -1043,8 +1053,9 @@ static void sh_color_map_uninit(pl_gpu gpu, void *ptr)
 
 static inline float iir_coeff(float rate)
 {
-    float a = 1.0 - cos(1.0 / rate);
-    return sqrt(a*a + 2*a) - a;
+    if (!rate)
+        return 1.0f;
+    return 1.0f - expf(-1.0f / rate);
 }
 
 static float measure_peak(const struct peak_buf_data *data, float percentile)
@@ -1121,30 +1132,35 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
         pl_buf_destroy(gpu, &obj->peak.buf);
     } else {
         // No data read? Possibly this peak obj has not been executed yet
-        if (params->allow_delayed) {
-            PL_TRACE(gpu, "Peak detection buffer seems empty, ignoring..");
-        } else if (ok) {
+        if (!ok) {
+            PL_ERR(gpu, "Failed reading peak detection buffer!");
+        } else if (params->allow_delayed) {
+            PL_TRACE(gpu, "Peak detection buffer not yet ready, ignoring..");
+        } else {
             PL_WARN(gpu, "Peak detection usage error: attempted detecting peak "
                     "and using detected peak in the same shader program, "
                     "but `params->allow_delayed` is false! Ignoring, but "
                     "expect incorrect output.");
-        } else {
-            PL_ERR(gpu, "Failed reading peak detection buffer!");
         }
-        if (force)
+        if (force || !ok)
             pl_buf_destroy(gpu, &obj->peak.buf);
         return;
     }
 
-    uint64_t frame_sum_pq = 0u, frame_wg_count = 0u;
+    uint64_t frame_sum_pq = 0u, frame_wg_count = 0u, frame_wg_active = 0u;
     for (int k = 0; k < SLICES; k++) {
-        frame_sum_pq   += data.frame_sum_pq[k];
-        frame_wg_count += data.frame_wg_count[k];
+        frame_sum_pq    += data.frame_sum_pq[k];
+        frame_wg_count  += data.frame_wg_count[k];
+        frame_wg_active += data.frame_wg_active[k];
     }
-    float avg_pq = (float) frame_sum_pq / (frame_wg_count * PQ_MAX);
-    float max_pq = measure_peak(&data, params->percentile);
-    const float min_peak = PL_DEF(params->minimum_peak, 1.0f);
-    max_pq = fmaxf(max_pq, pl_hdr_rescale(PL_HDR_NORM, PL_HDR_PQ, min_peak));
+    float avg_pq, max_pq;
+    if (frame_wg_active) {
+        avg_pq = (float) frame_sum_pq / (frame_wg_active * PQ_MAX);
+        max_pq = measure_peak(&data, params->percentile);
+    } else {
+        // Solid black frame
+        avg_pq = max_pq = PL_COLOR_HDR_BLACK;
+    }
 
     if (!obj->peak.avg_pq) {
         // Set the initial value accordingly if it contains no data
@@ -1160,7 +1176,7 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
     }
 
     // Use an IIR low-pass filter to smooth out the detected values
-    const float coeff = iir_coeff(PL_DEF(params->smoothing_period, 100.0f));
+    const float coeff = iir_coeff(params->smoothing_period);
     obj->peak.avg_pq += coeff * (avg_pq - obj->peak.avg_pq);
     obj->peak.max_pq += coeff * (max_pq - obj->peak.max_pq);
 
@@ -1169,7 +1185,8 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
         const float log10_pq = 1e-2f; // experimentally determined approximate
         const float thresh_low = params->scene_threshold_low * log10_pq;
         const float thresh_high = params->scene_threshold_high * log10_pq;
-        const float delta = fabsf(avg_pq - obj->peak.avg_pq);
+        const float bias = (float) frame_wg_active / frame_wg_count;
+        const float delta = bias * fabsf(avg_pq - obj->peak.avg_pq);
         const float mix_coeff = pl_smoothstep(thresh_low, thresh_high, delta);
         obj->peak.avg_pq = PL_MIX(obj->peak.avg_pq, avg_pq, mix_coeff);
         obj->peak.max_pq = PL_MIX(obj->peak.max_pq, max_pq, mix_coeff);
@@ -1193,7 +1210,7 @@ bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
     }
 
     const bool use_histogram = params->percentile > 0 && params->percentile < 100;
-    size_t shmem_req = 2 * sizeof(uint32_t);
+    size_t shmem_req = 3 * sizeof(uint32_t);
     if (use_histogram)
         shmem_req += sizeof(uint32_t[HIST_BINS]);
 
@@ -1277,10 +1294,11 @@ retry_ssbo:
 
     // For performance, we want to do as few atomic operations on global
     // memory as possible, so use an atomic in shmem for the work group.
-    ident_t wg_sum = sh_fresh(sh, "wg_sum"),
-            wg_max = sh_fresh(sh, "wg_max"),
-            wg_hist = NULL_IDENT;
-    GLSLH("shared uint "$", "$"; \n", wg_sum, wg_max);
+    ident_t wg_sum   = sh_fresh(sh, "wg_sum"),
+            wg_max   = sh_fresh(sh, "wg_max"),
+            wg_black = sh_fresh(sh, "wg_black"),
+            wg_hist  = NULL_IDENT;
+    GLSLH("shared uint "$", "$", "$"; \n", wg_sum, wg_max, wg_black);
     if (use_histogram) {
         wg_hist = sh_fresh(sh, "wg_hist");
         GLSLH("shared uint "$"[%u]; \n", wg_hist, HIST_BINS);
@@ -1288,9 +1306,9 @@ retry_ssbo:
              "    "$"[i] = 0u;                                              \n",
              HIST_BINS, wg_hist);
     }
-    GLSL($" = 0u; "$" = 0u; \n"
-         "barrier();        \n",
-         wg_sum, wg_max);
+    GLSL($" = 0u; "$" = 0u; "$" = 0u; \n"
+         "barrier();                  \n",
+         wg_sum, wg_max, wg_black);
 
     // Decode color into linear light representation
     pl_color_space_infer(&csp);
@@ -1302,8 +1320,9 @@ retry_ssbo:
          "luma = pow(clamp(luma, 0.0, 1.0), %f);        \n"
          "luma = (%f + %f * luma) / (1.0 + %f * luma);  \n"
          "luma = pow(luma, %f);                         \n"
+         "luma *= smoothstep(0.0, 1e-2, luma);          \n"
          "uint y_pq = uint(%d.0 * luma);                \n",
-         sh_luma_coeffs(sh, &csp.hdr.prim),
+         sh_luma_coeffs(sh, &csp),
          PL_COLOR_SDR_WHITE / 10000.0,
          PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2,
          PQ_MAX);
@@ -1330,36 +1349,48 @@ retry_ssbo:
     }
 
     if (has_subgroups) {
-        GLSL("uint group_sum = subgroupAdd(y_pq);   \n"
-             "uint group_max = subgroupMax(y_pq);   \n"
-             "if (subgroupElect()) {                \n"
-             "    atomicAdd("$", group_sum);        \n"
-             "    atomicMax("$", group_max);        \n"
-             "}                                     \n"
-             "barrier();                            \n",
-             wg_sum, wg_max);
+        GLSL("uint group_sum = subgroupAdd(y_pq);           \n"
+             "uint group_max = subgroupMax(y_pq);           \n"
+             "uvec4 b = subgroupBallot(y_pq == 0u);         \n"
+             "if (subgroupElect()) {                        \n"
+             "    atomicAdd("$", group_sum);                \n"
+             "    atomicMax("$", group_max);                \n"
+             "    atomicAdd("$", subgroupBallotBitCount(b));\n"
+             "}                                             \n"
+             "barrier();                                    \n",
+             wg_sum, wg_max, wg_black);
     } else {
-        GLSL("atomicAdd("$", y_pq); \n"
-             "atomicMax("$", y_pq); \n"
-             "barrier();            \n",
-             wg_sum, wg_max);
+        GLSL("atomicAdd("$", y_pq);     \n"
+             "atomicMax("$", y_pq);     \n"
+             "if (y_pq == 0u)           \n"
+             "    atomicAdd("$", 1u);   \n"
+             "barrier();                \n",
+             wg_sum, wg_max, wg_black);
     }
 
     if (use_histogram) {
-        GLSL("for (uint i = gl_LocalInvocationIndex; i < %du; i += wg_size) \n"
+        GLSL("if (gl_LocalInvocationIndex == 0u)                            \n"
+             "    "$"[0] -= "$";                                            \n"
+             "for (uint i = gl_LocalInvocationIndex; i < %du; i += wg_size) \n"
              "    atomicAdd(frame_hist[slice * %du + i], "$"[i]);           \n",
-             HIST_BINS, HIST_BINS, wg_hist);
+             wg_hist, wg_black,
+             HIST_BINS,
+             HIST_BINS, wg_hist);
     }
 
     // Have one thread per work group update the global atomics
-    GLSL("if (gl_LocalInvocationIndex == 0u) {              \n"
-         "    atomicAdd(frame_wg_count[slice], 1u);         \n"
-         "    atomicAdd(frame_sum_pq[slice], "$" / wg_size);\n"
-         "    atomicMax(frame_max_pq[slice], "$");          \n"
-         "}                                                 \n"
-         "color = color_orig;                               \n"
-         "}                                                 \n",
-          wg_sum, wg_max);
+    GLSL("if (gl_LocalInvocationIndex == 0u) {                  \n"
+         "    uint num = wg_size - "$";                         \n"
+         "    atomicAdd(frame_wg_count[slice], 1u);             \n"
+         "    atomicAdd(frame_wg_active[slice], min(num, 1u));  \n"
+         "    if (num > 0u) {                                   \n"
+         "        atomicAdd(frame_sum_pq[slice], "$" / num);    \n"
+         "        atomicMax(frame_max_pq[slice], "$");          \n"
+         "    }                                                 \n"
+         "}                                                     \n"
+         "color = color_orig;                                   \n"
+         "}                                                     \n",
+         wg_black, wg_sum, wg_max);
 
     return true;
 }
@@ -1558,6 +1589,7 @@ static void visualize_gamut_map(pl_shader sh, pl_rect2df rc,
          "idx.y = 2.0 * length(ipt.yz);                         \n"
          "idx.z = %f * atan(ipt.z, ipt.y) + 0.5;                \n"
          "vec3 mapped = "$"(idx).xyz;                           \n"
+         "mapped.yz -= vec2(32768.0/65535.0);                   \n"
          "float mappedhue = atan(mapped.z, mapped.y);           \n"
          "float mappedchroma = length(mapped.yz);               \n"
          "ipt = mapped;                                         \n"
@@ -1613,7 +1645,24 @@ static void fill_tone_lut(void *data, const struct sh_lut_params *params)
 static void fill_gamut_lut(void *data, const struct sh_lut_params *params)
 {
     const struct pl_gamut_map_params *lut_params = params->priv;
-    pl_gamut_map_generate(data, lut_params);
+    const int lut_size = params->width * params->height * params->depth;
+    void *tmp = pl_alloc(NULL, lut_size * sizeof(float) * lut_params->lut_stride);
+    pl_gamut_map_generate(tmp, lut_params);
+
+    // Convert to 16-bit unsigned integer for GPU texture
+    const float *in = tmp;
+    uint16_t *out = data;
+    pl_assert(lut_params->lut_stride == 3);
+    pl_assert(params->comps == 4);
+    for (int i = 0; i < lut_size; i++) {
+        out[0] = roundf(in[0] * UINT16_MAX);
+        out[1] = roundf(in[1] * UINT16_MAX + (UINT16_MAX >> 1));
+        out[2] = roundf(in[2] * UINT16_MAX + (UINT16_MAX >> 1));
+        in  += 3;
+        out += 4;
+    }
+
+    pl_free(tmp);
 }
 
 void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *params,
@@ -1644,12 +1693,13 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          "{                      \n");
 
     struct pl_tone_map_params tone = {
-        .function = params->tone_mapping_function,
-        .param = params->tone_mapping_param,
-        .input_scaling = PL_HDR_PQ,
+        .function       = PL_DEF(params->tone_mapping_function, &pl_tone_map_clip),
+        .constants      = params->tone_constants,
+        .param          = params->tone_mapping_param,
+        .input_scaling  = PL_HDR_PQ,
         .output_scaling = PL_HDR_PQ,
-        .lut_size = PL_DEF(params->lut_size, pl_color_map_default_params.lut_size),
-        .hdr = src.hdr,
+        .lut_size       = PL_DEF(params->lut_size, pl_color_map_default_params.lut_size),
+        .hdr            = src.hdr,
     };
 
     pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
@@ -1669,11 +1719,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         .out_max    = &tone.output_max,
     ));
 
-    if (!params->inverse_tone_mapping) {
-        // Never exceed the source unless requested, but still allow
-        // black point adaptation
-        tone.output_max = PL_MIN(tone.output_max, tone.input_max);
-    }
+    pl_tone_map_params_infer(&tone);
 
     // Round sufficiently similar values
     if (fabs(tone.input_max - tone.output_max) < 1e-6)
@@ -1681,16 +1727,22 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     if (fabs(tone.input_min - tone.output_min) < 1e-6)
         tone.output_min = tone.input_min;
 
-    pl_tone_map_params_infer(&tone);
+    if (!params->inverse_tone_mapping) {
+        // Never exceed the source unless requested, but still allow
+        // black point adaptation
+        tone.output_max = PL_MIN(tone.output_max, tone.input_max);
+    }
 
+    const int *lut3d_size_def = pl_color_map_default_params.lut3d_size;
     struct pl_gamut_map_params gamut = {
         .function        = PL_DEF(params->gamut_mapping, &pl_gamut_map_clip),
+        .constants       = params->gamut_constants,
         .input_gamut     = src.hdr.prim,
         .output_gamut    = dst.hdr.prim,
-        .lut_size_I      = PL_DEF(params->lut3d_size[0], 23),
-        .lut_size_C      = PL_DEF(params->lut3d_size[1], 32),
-        .lut_size_h      = PL_DEF(params->lut3d_size[2], 128),
-        .lut_stride      = 4,
+        .lut_size_I      = PL_DEF(params->lut3d_size[0], lut3d_size_def[0]),
+        .lut_size_C      = PL_DEF(params->lut3d_size[1], lut3d_size_def[1]),
+        .lut_size_h      = PL_DEF(params->lut3d_size[2], lut3d_size_def[2]),
+        .lut_stride      = 3,
     };
 
     float src_peak_static;
@@ -1709,8 +1761,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         .out_max    = &gamut.max_luma,
     ));
 
-    // Clip the gamut mapping output to the input gamut for perceptual
-    if (gamut.function == &pl_gamut_map_perceptual) {
+    // Clip the gamut mapping output to the input gamut if disabled
+    if (!params->gamut_expansion && gamut.function->bidirectional) {
         if (pl_primaries_compatible(&gamut.input_gamut, &gamut.output_gamut)) {
             gamut.output_gamut = pl_primaries_clip(&gamut.output_gamut,
                                                    &gamut.input_gamut);
@@ -1754,6 +1806,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
             tone.function = &pl_tone_map_linear;
         if (gamut.function != &pl_gamut_map_clip)
             gamut.function = &pl_gamut_map_saturation;
+    }
+
+    pl_fmt gamut_fmt = pl_find_fmt(SH_GPU(sh), PL_FMT_UNORM, 4, 16, 16, PL_FMT_CAP_LINEAR);
+    if (!gamut_fmt) {
+        gamut.function = &pl_gamut_map_saturation;
+        can_fast = true;
     }
 
     bool need_tone_map = !pl_tone_map_params_noop(&tone);
@@ -1827,7 +1885,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
 
         } else if (fun == &pl_tone_map_linear && can_fast) {
 
-            const float gain = PL_DEF(tone.param, 1.0f);
+            const float gain = tone.constants.exposure;
             const float scale = tone.input_max - tone.input_min;
 
             ident_t linfun = sh_fresh(sh, "linear_pq");
@@ -1911,18 +1969,23 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                  "float detail = highres - lowres;                  \n"
                  "float base = tone_map(highres);                   \n"
                  "float sharp = tone_map(lowres) + detail;          \n"
-                 "ipt.x = mix(base, sharp, "$");                    \n",
+                 "ipt.x = clamp(mix(base, sharp, "$"), "$", "$");   \n",
                  pos, pt, lowres,
                  lowres, lowres, lowres, lowres,
-                 SH_FLOAT(params->contrast_recovery));
+                 SH_FLOAT(params->contrast_recovery),
+                 SH_FLOAT(tone.output_min), SH_FLOAT_DYN(tone.output_max));
 
         } else {
 
             GLSL("ipt.x = tone_map(ipt.x); \n");
         }
 
-        // Avoid raising saturation excessively when changing brightness
-        GLSL("ipt.yz *= min(i_orig / ipt.x, ipt.x / i_orig); \n");
+        // Avoid raising saturation excessively when raising brightness, and
+        // also desaturate when reducing brightness greatly to account for the
+        // reduction in gamut volume.
+        GLSL("vec2 hull = vec2(i_orig, ipt.x);                  \n"
+             "hull = ((hull - 6.0) * hull + 9.0) * hull;        \n"
+             "ipt.yz *= min(i_orig / ipt.x, hull.y / hull.x);   \n");
     }
 
     if (need_gamut_map) {
@@ -1934,16 +1997,17 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
             .object     = &obj->gamut.lut,
             .var_type   = PL_VAR_FLOAT,
             .lut_type   = SH_LUT_TEXTURE,
+            .fmt        = gamut_fmt,
             .method     = params->lut3d_tricubic ? SH_LUT_CUBIC : SH_LUT_LINEAR,
             .width      = gamut.lut_size_I,
             .height     = gamut.lut_size_C,
             .depth      = gamut.lut_size_h,
-            .comps      = gamut.lut_stride,
-            .update     = !pl_gamut_map_params_equal(&gamut, &obj->gamut.params),
+            .comps      = 4,
+            .signature  = gamut_map_signature(&gamut),
+            .cache      = SH_CACHE(sh),
             .fill       = fill_gamut_lut,
             .priv       = &gamut,
         ));
-        obj->gamut.params = gamut;
         if (!lut) {
             SH_FAIL(sh, "Failed generating gamut-mapping LUT!");
             return;
@@ -1955,7 +2019,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
              "idx.x = "$" * ipt.x + "$";            \n"
              "idx.y = 2.0 * length(ipt.yz);         \n"
              "idx.z = %f * atan(ipt.z, ipt.y) + 0.5;\n"
-             "ipt = "$"(idx).xyz;                   \n",
+             "ipt = "$"(idx).xyz;                   \n"
+             "ipt.yz -= vec2(32768.0/65535.0);      \n",
              SH_FLOAT(1.0f / lut_range),
              SH_FLOAT(-gamut.min_luma / lut_range),
              0.5f / M_PI, lut);

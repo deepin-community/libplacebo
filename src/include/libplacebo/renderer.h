@@ -69,17 +69,6 @@ struct pl_render_errors {
 PL_API pl_renderer pl_renderer_create(pl_log log, pl_gpu gpu);
 PL_API void pl_renderer_destroy(pl_renderer *rr);
 
-// Saves the internal shader cache of this renderer into an abstract cache
-// object that can be saved to disk and later re-loaded to speed up
-// recompilation of shaders. See `pl_dispatch_save` for more information.
-PL_API size_t pl_renderer_save(pl_renderer rr, uint8_t *out_cache);
-
-// Load the result of a previous `pl_renderer_save` call. See
-// `pl_dispatch_load` for more information.
-//
-// Note: See the security warnings on `pl_pass_params.cached_program`.
-PL_API void pl_renderer_load(pl_renderer rr, const uint8_t *cache);
-
 // Returns current renderer state, see pl_render_errors.
 PL_API struct pl_render_errors pl_renderer_get_errors(pl_renderer rr);
 
@@ -93,7 +82,7 @@ PL_API void pl_renderer_reset_errors(pl_renderer rr,
 enum pl_lut_type {
     PL_LUT_UNKNOWN = 0,
     PL_LUT_NATIVE,      // applied to raw image contents (after fixing bit depth)
-    PL_LUT_NORMALIZED,  // applied to normalized RGB values
+    PL_LUT_NORMALIZED,  // applied to normalized (HDR) RGB values
     PL_LUT_CONVERSION,  // LUT fully replaces color conversion
 
     // Note: When using a PL_LUT_CONVERSION to replace the YUV->RGB conversion,
@@ -132,7 +121,7 @@ struct pl_render_info {
 struct pl_render_params {
     // Configures the algorithms used for upscaling and downscaling,
     // respectively. If left as NULL, then libplacebo will only use inexpensive
-    // sampling (bilinear or neareast neighbour depending on the capabilities
+    // sampling (bilinear or nearest neighbour depending on the capabilities
     // of the hardware / texture).
     //
     // Note: Setting `downscaler` to NULL also implies `skip_anti_aliasing`,
@@ -153,11 +142,8 @@ struct pl_render_params {
     const struct pl_filter_config *plane_upscaler;
     const struct pl_filter_config *plane_downscaler;
 
-    // The number of entries for the scaler LUTs. Defaults to 64 if left unset.
-    int lut_entries;
-
-    // The anti-ringing strength to apply to non-polar filters. See the
-    // equivalent option in `pl_sample_filter_params` for more information.
+    // The anti-ringing strength to apply to filters. See the equivalent option
+    // in `pl_sample_filter_params` for more information.
     float antiringing_strength;
 
     // Configures the algorithm used for frame mixing (when using
@@ -205,10 +191,6 @@ struct pl_render_params {
     // dithering. If set, this will be used instead of `dither_params` whenever
     // possible. Leaving this as NULL disables error diffusion.
     const struct pl_error_diffusion_kernel *error_diffusion;
-
-    // Configures the settings used to handle ICC profiles, if required. If
-    // NULL, defaults to `&pl_icc_default_params`.
-    const struct pl_icc_params *icc_params;
 
     // Configures the settings used to simulate color blindness, if desired.
     // If NULL, this feature is disabled.
@@ -292,10 +274,6 @@ struct pl_render_params {
     // Significantly speeds up downscaling with high downscaling ratios.
     bool skip_anti_aliasing;
 
-    // Cutoff value for polar sampling. See the equivalent option in
-    // `pl_sample_filter_params` for more information.
-    float polar_cutoff;
-
     // Normally, when the size of the `target` used with `pl_render_image_mix`
     // changes, or the render parameters are updated, the internal cache of
     // mixed frames must be discarded in order to re-render all required
@@ -326,8 +304,8 @@ struct pl_render_params {
     // general-purpose ones.
     bool disable_builtin_scalers;
 
-    // Ignore ICC profiles attached to either `image` or `target`.
-    bool ignore_icc_profiles;
+    // Forces correction of subpixel offsets (using the configured `upscaler`).
+    bool correct_subpixel_offsets;
 
     // Forces the use of dithering, even when rendering to 16-bit FBOs. This is
     // generally pretty pointless because most 16-bit FBOs have high enough
@@ -366,19 +344,20 @@ struct pl_render_params {
 
     // --- Deprecated/removed fields
     bool allow_delayed_peak_detect PL_DEPRECATED; // moved to pl_peak_detect_params
+    const struct pl_icc_params *icc_params PL_DEPRECATED; // use pl_frame.icc
+    bool ignore_icc_profiles PL_DEPRECATED; // non-functional, just set pl_frame.icc to NULL
+    int lut_entries PL_DEPRECATED; // hard-coded as 256
+    float polar_cutoff PL_DEPRECATED; // hard-coded as 1e-3
 };
 
 // Bare minimum parameters, with no features enabled. This is the fastest
 // possible configuration, and should therefore be fine on any system.
 #define PL_RENDER_DEFAULTS                              \
-    /* set a frame mixer for pl_render_image_mix */     \
-    .frame_mixer        = &pl_filter_oversample,        \
     .color_map_params   = &pl_color_map_default_params, \
-    .lut_entries        = 64,                           \
+    .color_adjustment   = &pl_color_adjustment_neutral, \
     .tile_colors        = {{0.93, 0.93, 0.93},          \
                            {0.87, 0.87, 0.87}},         \
-    .tile_size          = 32,                           \
-    .polar_cutoff       = 0.001,
+    .tile_size          = 32,
 
 #define pl_render_params(...) (&(struct pl_render_params) { PL_RENDER_DEFAULTS __VA_ARGS__ })
 PL_API extern const struct pl_render_params pl_render_fast_params;
@@ -394,30 +373,11 @@ PL_API extern const struct pl_render_params pl_render_default_params;
 
 // This contains a higher quality preset for better image quality at the cost
 // of quite a bit of performance. In addition to the settings implied by
-// `pl_render_default_params`, it sets the upscaler to `pl_filter_ewa_lanczos`,
-// enables debanding, and uses pl_*_high_quality_params structs where available.
-// This should only really be used with a discrete GPU and where maximum image
-// quality is desired.
+// `pl_render_default_params`, it enables debanding, sets the upscaler to
+// `pl_filter_ewa_lanczossharp`, and uses pl_*_high_quality_params structs where
+// available. This should only really be used with a discrete GPU and where
+// maximum image quality is desired.
 PL_API extern const struct pl_render_params pl_render_high_quality_params;
-
-// Special filter config for the built-in oversampling algorithm. This is an
-// opaque filter with no meaningful representation. though it has one tunable
-// parameter controlling the threshold at which to switch back to ordinary
-// nearest neighbour sampling. (See `pl_shader_sample_oversample`)
-PL_API extern const struct pl_filter_config pl_filter_oversample;
-
-// Backwards compatibility
-#define pl_oversample_frame_mixer pl_filter_oversample
-
-// A list of recommended frame mixer presets, terminated by {0}
-PL_API extern const struct pl_filter_preset pl_frame_mixers[];
-PL_API extern const int pl_num_frame_mixers; // excluding trailing {0}
-
-// A list of recommended scaler presets, terminated by {0}. This is almost
-// equivalent to `pl_filter_presets` with the exception of including extra
-// built-in filters that don't map to the `pl_filter` architecture.
-PL_API extern const struct pl_filter_preset pl_scale_filters[];
-PL_API extern const int pl_num_scale_filters; // excluding trailing {0}
 
 #define PL_MAX_PLANES 4
 
@@ -595,6 +555,11 @@ struct pl_frame {
     struct pl_color_space color;
 
     // Optional ICC profile associated with this frame.
+    pl_icc_object icc;
+
+    // Alternative to `icc`, this can be used in cases where allocating and
+    // tracking an pl_icc_object externally may be inconvenient. The resulting
+    // profile will be managed internally by the pl_renderer.
     struct pl_icc_profile profile;
 
     // Optional LUT associated with this frame.
@@ -692,6 +657,27 @@ static inline void pl_frame_clear(pl_gpu gpu, const struct pl_frame *frame,
     pl_frame_clear_rgba(gpu, frame, clear_color_rgba);
 }
 
+// Helper functions to return the fixed/inferred pl_frame parameters used
+// for rendering internally. Mutates `image` and `target` in-place to hold
+// the modified values, which are what will actually be used for rendering.
+//
+// This currently includes:
+// - Defaulting all missing pl_color_space/repr parameters
+// - Coalescing all rotation to the target
+// - Rounding and clamping the target crop to pixel boundaries and adjusting the
+//   image crop correspondingly
+//
+// Note: This is idempotent and does not generally alter the effects of a
+// subsequent `pl_render_image` on the same pl_frame pair. (But see the
+// following warning)
+//
+// Warning: This does *not* call pl_frame.acquire/release, and so the returned
+// metadata *may* be incorrect if the acquire callback mutates the pl_frame in
+// nontrivial ways, in particular the crop and color space fields.
+PL_API void pl_frames_infer(pl_renderer rr, struct pl_frame *image,
+                            struct pl_frame *target);
+
+
 // Render a single image to a target using the given parameters. This is
 // fully dynamic, i.e. the params can change at any time. libplacebo will
 // internally detect and flush whatever caches are invalidated as a result of
@@ -710,11 +696,6 @@ static inline void pl_frame_clear(pl_gpu gpu, const struct pl_frame *frame,
 // freely overwritten or discarded by the caller, even the referenced
 // `pl_tex` objects may be freely reused.
 //
-// Note on overlays: `image.overlays` will be rendered directly onto the image,
-// which means they get affected by things like scaling and frame mixing.
-// `target.overlays` will also be rendered, but directly onto the target. They
-// don't even need to be inside `target.crop`.
-//
 // Note: `image` may be NULL, in which case `target.overlays` will still be
 // rendered, but nothing else.
 PL_API bool pl_render_image(pl_renderer rr, const struct pl_frame *image,
@@ -729,6 +710,12 @@ PL_API bool pl_render_image(pl_renderer rr, const struct pl_frame *image,
 // so calling it is a good idea if the content source is expected to change
 // dramatically (e.g. when switching to a different file).
 PL_API void pl_renderer_flush_cache(pl_renderer rr);
+
+// Mirrors `pl_get_detected_hdr_metadata`, giving you the current internal peak
+// detection HDR metadata (when peak detection is active). Returns false if no
+// information is available (e.g. not HDR source, peak detection disabled).
+PL_API bool pl_renderer_get_hdr_metadata(pl_renderer rr,
+                                         struct pl_hdr_metadata *metadata);
 
 // Represents a mixture of input frames, distributed temporally.
 //
@@ -798,7 +785,10 @@ struct pl_frame_mix {
     // "next" frames.
 };
 
-// Helper function to calculate the frame mixing radius.
+// Helper function to calculate the base frame mixing radius.
+//
+// Note: When the source FPS exceeds the display FPS, this radius must be
+// increased by the corresponding ratio.
 static inline float pl_frame_mix_radius(const struct pl_render_params *params)
 {
     // For backwards compatibility, allow !frame_mixer->kernel
@@ -807,6 +797,12 @@ static inline float pl_frame_mix_radius(const struct pl_render_params *params)
 
     return params->frame_mixer->kernel->radius;
 }
+
+// Find closest frame to current PTS by zero-order hold semantics, or NULL.
+PL_API const struct pl_frame *pl_frame_mix_current(const struct pl_frame_mix *mix);
+
+// Find closest frame to current PTS by nearest neighbour semantics, or NULL.
+PL_API const struct pl_frame *pl_frame_mix_nearest(const struct pl_frame_mix *mix);
 
 // Render a mixture of images to the target using the given parameters. This
 // functions much like a generalization of `pl_render_image`, for when the API
@@ -819,6 +815,32 @@ static inline float pl_frame_mix_radius(const struct pl_render_params *params)
 PL_API bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
                                 const struct pl_frame *target,
                                 const struct pl_render_params *params);
+
+// Analog of `pl_frame_infer` corresponding to `pl_render_image_mix`. This
+// function will *not* mutate the frames contained in `mix`, and instead
+// return an adjusted copy of the "reference" frame for that image mix in
+// `out_refimage`, or {0} if the mix is empty.
+PL_API void pl_frames_infer_mix(pl_renderer rr, const struct pl_frame_mix *mix,
+                                struct pl_frame *target, struct pl_frame *out_ref);
+
+// Backwards compatibility with old filters API, may be deprecated.
+// Redundant with pl_filter_configs and masking `allowed` for
+// PL_FILTER_SCALING and PL_FILTER_FRAME_MIXING respectively.
+
+// A list of recommended frame mixer presets, terminated by {0}
+PL_API extern const struct pl_filter_preset pl_frame_mixers[];
+PL_API extern const int pl_num_frame_mixers; // excluding trailing {0}
+
+// A list of recommended scaler presets, terminated by {0}. This is almost
+// equivalent to `pl_filter_presets` with the exception of including extra
+// built-in filters that don't map to the `pl_filter` architecture.
+PL_API extern const struct pl_filter_preset pl_scale_filters[];
+PL_API extern const int pl_num_scale_filters; // excluding trailing {0}
+
+// Deprecated in favor of `pl_cache_save/pl_cache_load` on the `pl_cache`
+// associated with the `pl_gpu` this renderer is using.
+PL_DEPRECATED PL_API size_t pl_renderer_save(pl_renderer rr, uint8_t *out_cache);
+PL_DEPRECATED PL_API void pl_renderer_load(pl_renderer rr, const uint8_t *cache);
 
 PL_API_END
 

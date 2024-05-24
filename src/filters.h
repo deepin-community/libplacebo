@@ -19,6 +19,12 @@
 
 #include <libplacebo/filters.h>
 
+static inline float pl_filter_radius_bound(const struct pl_filter_config *c)
+{
+    const float r = c->radius && c->kernel->resizable ? c->radius : c->kernel->radius;
+    return c->blur > 0.0 ? r * c->blur : r;
+}
+
 #define COMMON_FILTER_PRESETS                                                   \
     /* Highest priority / recommended filters */                                \
     {"bilinear",            &pl_filter_bilinear,    "Bilinear"},                \
@@ -26,6 +32,8 @@
     {"bicubic",             &pl_filter_bicubic,     "Bicubic"},                 \
     {"lanczos",             &pl_filter_lanczos,     "Lanczos"},                 \
     {"ewa_lanczos",         &pl_filter_ewa_lanczos, "Jinc (EWA Lanczos)"},      \
+    {"ewa_lanczossharp",    &pl_filter_ewa_lanczossharp,     "Sharpened Jinc"}, \
+    {"ewa_lanczos4sharpest",&pl_filter_ewa_lanczos4sharpest, "Sharpened Jinc-AR, 4 taps"},\
     {"gaussian",            &pl_filter_gaussian,    "Gaussian"},                \
     {"spline16",            &pl_filter_spline16,    "Spline (2 taps)"},         \
     {"spline36",            &pl_filter_spline36,    "Spline (3 taps)"},         \
@@ -38,6 +46,7 @@
     {"ewa_jinc",            &pl_filter_ewa_jinc,    "EWA Jinc (unwindowed)"},   \
     {"ewa_ginseng",         &pl_filter_ewa_ginseng, "EWA Ginseng"},             \
     {"ewa_hann",            &pl_filter_ewa_hann,    "EWA Hann"},                \
+    {"hermite",             &pl_filter_hermite,     "Hermite"},                 \
     {"catmull_rom",         &pl_filter_catmull_rom, "Catmull-Rom"},             \
     {"robidoux",            &pl_filter_robidoux,          "Robidoux"},          \
     {"robidouxsharp",       &pl_filter_robidouxsharp,     "RobidouxSharp"},     \

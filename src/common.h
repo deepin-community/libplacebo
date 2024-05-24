@@ -18,7 +18,18 @@
 #pragma once
 
 #define __STDC_FORMAT_MACROS
+
+#ifdef __cplusplus
+#include <version>
+#endif
+
+#if !defined(__cplusplus) || defined(__cpp_lib_stdatomic_h)
+#define PL_HAVE_STDATOMIC
+#endif
+
+#ifdef PL_HAVE_STDATOMIC
 #include <stdatomic.h>
+#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -27,10 +38,10 @@
 
 #if defined(__MINGW32__) && !defined(__clang__)
 #define PL_PRINTF(fmt, va) __attribute__ ((format(gnu_printf, fmt, va))) \
-                           __attribute__ ((nonnull))
+                           __attribute__ ((nonnull(fmt)))
 #elif defined(__GNUC__)
 #define PL_PRINTF(fmt, va) __attribute__ ((format(printf, fmt, va))) \
-                           __attribute__ ((nonnull))
+                           __attribute__ ((nonnull(fmt)))
 #else
 #define PL_PRINTF(fmt, va)
 #endif
@@ -40,14 +51,15 @@
 #include "os.h"
 
 #include "config_internal.h"
-#include "pl_assert.h"
-#include "pl_alloc.h"
-#include "pl_clock.h"
-#include "pl_string.h"
 
 #define PL_DEPRECATED
 
 #include <libplacebo/config.h>
+
+#include "pl_assert.h"
+#include "pl_alloc.h"
+#include "pl_clock.h"
+#include "pl_string.h"
 
 #if PL_API_VER != BUILD_API_VER
 #error Header mismatch? <libplacebo/config.h> pulled from elsewhere!
@@ -117,6 +129,8 @@ static inline float *pl_transpose(int dim, float *out, const float *in)
 
 static inline float pl_smoothstep(float edge0, float edge1, float x)
 {
+    if (edge0 == edge1)
+        return x >= edge0;
     x = (x - edge0) / (edge1 - edge0);
     x = PL_CLAMP(x, 0.0f, 1.0f);
     return x * x * (3.0f - 2.0f * x);
@@ -151,12 +165,16 @@ static inline size_t pl_lcm(size_t x, size_t y)
 # define pl_debug_abort() do {} while (0)
 #endif
 
+#ifdef PL_HAVE_STDATOMIC
+
 // Refcounting helpers
-typedef _Atomic uint32_t pl_rc_t;
+typedef atomic_uint_fast32_t pl_rc_t;
 #define pl_rc_init(rc)  atomic_init(rc, 1)
 #define pl_rc_ref(rc)   ((void) atomic_fetch_add_explicit(rc, 1, memory_order_acquire))
 #define pl_rc_deref(rc) (atomic_fetch_sub_explicit(rc, 1, memory_order_release) == 1)
 #define pl_rc_count(rc)  atomic_load(rc)
+
+#endif
 
 #define pl_unreachable() (assert(!"unreachable"), __builtin_unreachable())
 

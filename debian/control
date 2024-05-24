@@ -13,6 +13,7 @@ Build-Depends:
  libavutil-dev <!nocheck>,
  liblcms2-dev,
  libvulkan-dev,
+ libxxhash-dev,
  glslang-dev,
  python3,
  python3-glad (>= 2),
@@ -31,9 +32,10 @@ Architecture: any
 Multi-Arch: same
 Depends:
  ${misc:Depends},
- libplacebo292 (= ${binary:Version}),
+ libplacebo338 (= ${binary:Version}),
  liblcms2-dev,
- libvulkan-dev
+ libvulkan-dev,
+ libxxhash-dev
 Description: GPU-accelerated video/image rendering primitives (development files)
  The library provides useful GPU-accelerated image processing primitives based
  on GLSL. It includes shader routines for decoding and transforming colors,
@@ -42,7 +44,7 @@ Description: GPU-accelerated video/image rendering primitives (development files
  .
  This package contains the development files.
 
-Package: libplacebo292
+Package: libplacebo338
 Architecture: any
 Multi-Arch: same
 Depends:

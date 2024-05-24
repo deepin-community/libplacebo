@@ -1,4 +1,58 @@
 /*
+ * This file is part of libplacebo.
+ *
+ * libplacebo is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * libplacebo is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with libplacebo. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include "common.h"
+
+#define GOLDEN_RATIO_64 UINT64_C(0x9e3779b97f4a7c15)
+
+static inline void pl_hash_merge(uint64_t *accum, uint64_t hash) {
+    *accum ^= hash + GOLDEN_RATIO_64 + (*accum << 6) + (*accum >> 2);
+}
+
+static inline uint64_t pl_mem_hash(const void *mem, size_t size);
+#define pl_var_hash(x) pl_mem_hash(&(x), sizeof(x))
+
+static inline uint64_t pl_str_hash(pl_str str)
+{
+    return pl_mem_hash(str.buf, str.len);
+}
+
+static inline uint64_t pl_str0_hash(const char *str)
+{
+    return pl_mem_hash(str, str ? strlen(str) : 0);
+}
+
+#ifdef PL_HAVE_XXHASH
+
+#define XXH_NAMESPACE pl_
+#define XXH_INLINE_ALL
+#define XXH_NO_STREAM
+#include <xxhash.h>
+
+XXH_FORCE_INLINE uint64_t pl_mem_hash(const void *mem, size_t size)
+{
+    return XXH3_64bits(mem, size);
+}
+
+#else // !PL_HAVE_XXHASH
+
+/*
    SipHash reference C implementation
    Modified for use by libplacebo:
     - Hard-coded a fixed key (k0 and k1)
@@ -15,8 +69,6 @@
 
    <http://creativecommons.org/publicdomain/zero/1.0/>.
  */
-
-#include "common.h"
 
 /* default: SipHash-2-4 */
 #define cROUNDS 2
@@ -48,7 +100,7 @@
         v2 = ROTL(v2, 32);                                                     \
     } while (0)
 
-uint64_t pl_mem_hash(const void *mem, size_t size)
+static inline uint64_t pl_mem_hash(const void *mem, size_t size)
 {
     if (!size)
         return 0x8533321381b8254bULL;
@@ -106,3 +158,5 @@ uint64_t pl_mem_hash(const void *mem, size_t size)
     b = v0 ^ v1 ^ v2 ^ v3;
     return b;
 }
+
+#endif // PL_HAVE_XXHASH

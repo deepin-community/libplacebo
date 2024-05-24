@@ -6,7 +6,11 @@ export DEB_BUILD_MAINT_OPTIONS=hardening=+all
 	dh $@
 
 override_dh_auto_configure:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	dh_auto_configure -- -Dtests=true -Ddemos=false
+else
+	dh_auto_configure -- -Dtests=false -Ddemos=false
+endif
 
 override_dh_auto_test:
 	dh_auto_test -- -t 100

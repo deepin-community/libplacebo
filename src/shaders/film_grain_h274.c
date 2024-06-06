@@ -16,7 +16,7 @@
  */
 
 #include "shaders.h"
-#include "film_grain.h"
+#include "shaders/film_grain.h"
 
 static const int8_t Gaussian_LUT[2048+4];
 static const uint32_t Seed_LUT[256];
@@ -26,7 +26,7 @@ static void prng_shift(uint32_t *state)
 {
     // Primitive polynomial x^31 + x^3 + 1 (modulo 2)
     uint32_t x = *state;
-    uint8_t feedback = (x >> 2) ^ (x >> 30);
+    uint8_t feedback = 1u ^ (x >> 2) ^ (x >> 30);
     *state = (x << 1) | (feedback & 1u);
 }
 
@@ -172,6 +172,8 @@ bool pl_shader_fg_h274(pl_shader sh, pl_shader_obj *grain_state,
         .height     = 13 * 64,
         .comps      = 1,
         .fill       = fill_grain_lut,
+        .signature  = CACHE_KEY_H274, // doesn't depend on anything
+        .cache      = SH_CACHE(sh),
     ));
 
     sh_describe(sh, "H.274 film grain");
@@ -288,8 +290,10 @@ bool pl_shader_fg_h274(pl_shader sh, pl_shader_obj *grain_state,
              "float scale = "$" * float(int(val >> 16));    \n"
              // Add randomness
              "uint rand = pcg[%d];                          \n"
-             "offset.y += (rand >> 16u) %% 52u;             \n"
-             "offset.x += (rand & 0xFFFFu) %% 56u;          \n"
+             "offset.x += (rand >> 16u) %% 52u;             \n"
+             "offset.y += (rand & 0xFFFFu) %% 56u;          \n"
+             "offset.x &= 0xFFFCu;                          \n"
+             "offset.y &= 0xFFF8u;                          \n"
              "if ((rand & 1u) == 1u) scale = -scale;        \n"
              // Add local offset and compute grain
              "offset += 8u * (gl_WorkGroupID.xy %% 2u);     \n"

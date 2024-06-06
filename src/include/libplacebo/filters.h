@@ -25,39 +25,46 @@ PL_API_BEGIN
 
 #define PL_FILTER_MAX_PARAMS 2
 
+// Invocation parameters for a given kernel
+struct pl_filter_ctx {
+    float radius;
+    float params[PL_FILTER_MAX_PARAMS];
+};
+
 // Represents a single filter function, i.e. kernel or windowing function.
-// To invoke a filter with a different configuration than the default, you can
-// make a copy of this struct and modify the non-const fields before passing it
-// to pl_filter_initialize.
 struct pl_filter_function {
-    // These bools indicate whether or not `radius` and `params` may be
-    // modified by the user.
+    // The cosmetic name associated with this filter function.
+    const char *name;
+
+    // The radius of the filter function. For resizable filters, this gives
+    // the radius needed to represent a single filter lobe (tap).
+    float radius;
+
+    // If true, the filter function is resizable (see pl_filter_config.radius)
     bool resizable;
+
+    // If true, the filter function is tunable (see pl_filter_config.params)
     bool tunable[PL_FILTER_MAX_PARAMS];
+
+    // If the relevant parameter is tunable, this contains the default values.
+    float params[PL_FILTER_MAX_PARAMS];
 
     // The underlying filter function itself: Computes the weight as a function
     // of the offset. All filter functions must be normalized such that x=0 is
     // the center point, and in particular weight(0) = 1.0. The functions may
     // be undefined for values of x outside [0, radius].
-    double (*weight)(const struct pl_filter_function *k, double x);
+    double (*weight)(const struct pl_filter_ctx *f, double x);
 
-    // This field may be used to adjust the function's radius. Defaults to the
-    // the radius needed to represent a single filter lobe (tap). If the
-    // function is not resizable, this field must not be modified - otherwise
-    // the result of filter evaluation is undefined.
-    float radius;
-
-    // These fields may be used to adjust the function. Defaults to the
-    // function's preferred defaults. if the relevant setting is not tunable,
-    // they are ignored entirely.
-    float params[PL_FILTER_MAX_PARAMS];
-
-    // The cosmetic name associated with this filter function. Optional.
-    const char *name;
+    // If true, this filter represents an opaque placeholder for a more
+    // sophisticated filter function which does not fit into the pl_filter
+    // framework. `weight()` will always return 0.0.
+    bool opaque;
 };
 
-PL_API bool pl_filter_function_eq(const struct pl_filter_function *a,
-                                  const struct pl_filter_function *b);
+// Deprecated function, merely checks a->weight == b->weight
+PL_DEPRECATED PL_API bool
+pl_filter_function_eq(const struct pl_filter_function *a,
+                      const struct pl_filter_function *b);
 
 // Box filter: Entirely 1.0 within the radius, entirely 0.0 outside of it.
 // This is also sometimes called a Dirichlet window
@@ -121,29 +128,43 @@ PL_API extern const struct pl_filter_function pl_filter_function_sphinx;
 // functions with two tunable parameters. Does not need to be windowed.
 // Parameter [0]: "B"
 // Parameter [1]: "C"
-// Due to its populariy, this function is available in several variants.
-// B = 0.0,  C = 0.0:  "base" bcspline, AKA Hermite spline (blocky)
+// Some popular variants of this function are:
+// B = 1.0,  C = 0.0:  "base" Cubic (blurry)
+// B = 0.0,  C = 0.0:  Hermite filter (blocky)
 // B = 0.0,  C = 0.5:  Catmull-Rom filter (sharp)
 // B = 1/3,  C = 1/3:  Mitchell-Netravali filter (soft, doesn't ring)
 // B ≈ 0.37, C ≈ 0.31: Robidoux filter (used by ImageMagick)
-// B ≈ 0.26, C ≈ 0.37: RobidouxSharp filter. (sharper variant of Robidoux)
-PL_API extern const struct pl_filter_function pl_filter_function_bcspline;
-PL_API extern const struct pl_filter_function pl_filter_function_catmull_rom;
-PL_API extern const struct pl_filter_function pl_filter_function_mitchell;
-PL_API extern const struct pl_filter_function pl_filter_function_robidoux;
-PL_API extern const struct pl_filter_function pl_filter_function_robidouxsharp;
+// B ≈ 0.26, C ≈ 0.37: RobidouxSharp filter (sharper variant of Robidoux)
+PL_API extern const struct pl_filter_function pl_filter_function_cubic;
+PL_API extern const struct pl_filter_function pl_filter_function_hermite;
+#define pl_filter_function_bicubic pl_filter_function_cubic
+#define pl_filter_function_bcspline pl_filter_function_cubic
 
-// Bicubic function: Very smooth and free of ringing, but very blurry. Does not
-// need to be windowed.
-PL_API extern const struct pl_filter_function pl_filter_function_bicubic;
-
-// Piecewise approximations of the Lanczos filter function (sinc-windowed
-// sinc). Referred to as "spline16", "spline36" and "spline64" mainly for
-// historical reasons, based on their fixed radii of 2, 3 and 4 (respectively).
-// These do not need to be windowed.
+// Cubic splines with 2/3/4 taps. Referred to as "spline16", "spline36", and
+// "spline64" mainly for historical reasons, based on the number of pixels in
+// their window when using them as 2D orthogonal filters. Do not need to be
+// windowed.
 PL_API extern const struct pl_filter_function pl_filter_function_spline16;
 PL_API extern const struct pl_filter_function pl_filter_function_spline36;
 PL_API extern const struct pl_filter_function pl_filter_function_spline64;
+
+// Special filter function for the built-in oversampling algorithm. This is an
+// opaque filter with no meaningful representation. though it has one tunable
+// parameter controlling the threshold at which to switch back to ordinary
+// nearest neighbour sampling. (See `pl_shader_sample_oversample`)
+PL_API extern const struct pl_filter_function pl_filter_function_oversample;
+
+// A list of built-in filter functions, terminated by NULL
+//
+// Note: May contain extra aliases for the above functions.
+PL_API extern const struct pl_filter_function * const pl_filter_functions[];
+PL_API extern const int pl_num_filter_functions; // excluding trailing NULL
+
+// Find the filter function with the given name, or NULL on failure.
+PL_API const struct pl_filter_function *pl_find_filter_function(const char *name);
+
+// Backwards compatibility with the older configuration API. Redundant with
+// `pl_filter_function.name`. May be formally deprecated in the future.
 
 struct pl_filter_function_preset {
     const char *name;
@@ -157,16 +178,45 @@ PL_API extern const int pl_num_filter_function_presets; // excluding trailing {0
 // Find the filter function preset with the given name, or NULL on failure.
 PL_API const struct pl_filter_function_preset *pl_find_filter_function_preset(const char *name);
 
-// Backwards compatibility
-#define pl_named_filter_function        pl_filter_function_preset
-#define pl_named_filter_functions       pl_filter_function_presets
-#define pl_find_named_filter_function   pl_find_filter_function_preset
+// Different usage domains for a filter
+enum pl_filter_usage {
+    PL_FILTER_UPSCALING    = (1 << 0),
+    PL_FILTER_DOWNSCALING  = (1 << 1),
+    PL_FILTER_FRAME_MIXING = (1 << 2),
 
-// Represents a particular configuration/combination of filter functions to
-// form a filter.
+    PL_FILTER_SCALING = PL_FILTER_UPSCALING | PL_FILTER_DOWNSCALING,
+    PL_FILTER_ALL     = PL_FILTER_SCALING | PL_FILTER_FRAME_MIXING,
+};
+
+// Represents a tuned combination of filter functions, plus parameters
 struct pl_filter_config {
-    const struct pl_filter_function *kernel; // The kernel function
-    const struct pl_filter_function *window; // The windowing function. Optional
+    // The cosmetic name associated with this filter config. Optional for
+    // user-provided configs, but always set by built-in configurations.
+    const char *name;
+
+    // Longer / friendly name. Always set for built-in configurations,
+    // except for names which are merely aliases of other filters.
+    const char *description;
+
+    // Allowed and recommended usage domains (respectively)
+    //
+    // When it is desired to maintain a simpler user interface, it may be
+    // recommended to include only scalers whose recommended usage domains
+    // includes the relevant context in which it will be used.
+    enum pl_filter_usage allowed;
+    enum pl_filter_usage recommended;
+
+    // The kernel function and (optionally) windowing function.
+    const struct pl_filter_function *kernel;
+    const struct pl_filter_function *window;
+
+    // The radius. Ignored if !kernel->resizable. Optional, defaults to
+    // kernel->radius if unset.
+    float radius;
+
+    // Parameters for the respective filter function. Ignored if not tunable.
+    float params[PL_FILTER_MAX_PARAMS];
+    float wparams[PL_FILTER_MAX_PARAMS];
 
     // Represents a clamping coefficient for negative weights. A value of 0.0
     // (the default) represents no clamping. A value of 1.0 represents full
@@ -192,8 +242,14 @@ struct pl_filter_config {
     // but provides information about how the results are to be interpreted.
     bool polar;
 
-    // The cosmetic name associated with this filter config. Optional.
-    const char *name;
+    // Antiringing strength. A value of 0.0 disables antiringing, and a value
+    // of 1.0 enables full-strength antiringing. Defaults to 0.0 if
+    // unspecified.
+    //
+    // Note: This is only included in `pl_filter_config` for convenience. Does
+    // not affect the actual filter sampling, but provides information to the
+    // downstream consumer of the `pl_filter`.
+    float antiring;
 };
 
 PL_API bool pl_filter_config_eq(const struct pl_filter_config *a,
@@ -209,19 +265,23 @@ PL_API double pl_filter_sample(const struct pl_filter_config *c, double x);
 PL_API extern const struct pl_filter_config pl_filter_spline16;    // 2 taps
 PL_API extern const struct pl_filter_config pl_filter_spline36;    // 3 taps
 PL_API extern const struct pl_filter_config pl_filter_spline64;    // 4 taps
-PL_API extern const struct pl_filter_config pl_filter_nearest;     // AKA box
-PL_API extern const struct pl_filter_config pl_filter_bilinear;    // AKA triangle
+PL_API extern const struct pl_filter_config pl_filter_nearest;
+PL_API extern const struct pl_filter_config pl_filter_box;
+PL_API extern const struct pl_filter_config pl_filter_bilinear;
 PL_API extern const struct pl_filter_config pl_filter_gaussian;
 // Sinc family (all configured to 3 taps):
-PL_API extern const struct pl_filter_config pl_filter_sinc;        // unwindowed,
+PL_API extern const struct pl_filter_config pl_filter_sinc;        // unwindowed
 PL_API extern const struct pl_filter_config pl_filter_lanczos;     // sinc-sinc
 PL_API extern const struct pl_filter_config pl_filter_ginseng;     // sinc-jinc
 PL_API extern const struct pl_filter_config pl_filter_ewa_jinc;    // unwindowed
 PL_API extern const struct pl_filter_config pl_filter_ewa_lanczos; // jinc-jinc
+PL_API extern const struct pl_filter_config pl_filter_ewa_lanczossharp;
+PL_API extern const struct pl_filter_config pl_filter_ewa_lanczos4sharpest;
 PL_API extern const struct pl_filter_config pl_filter_ewa_ginseng; // jinc-sinc
 PL_API extern const struct pl_filter_config pl_filter_ewa_hann;    // jinc-hann
 // Spline family
 PL_API extern const struct pl_filter_config pl_filter_bicubic;
+PL_API extern const struct pl_filter_config pl_filter_hermite;
 PL_API extern const struct pl_filter_config pl_filter_catmull_rom;
 PL_API extern const struct pl_filter_config pl_filter_mitchell;
 PL_API extern const struct pl_filter_config pl_filter_mitchell_clamp; // clamp = 1.0
@@ -229,11 +289,24 @@ PL_API extern const struct pl_filter_config pl_filter_robidoux;
 PL_API extern const struct pl_filter_config pl_filter_robidouxsharp;
 PL_API extern const struct pl_filter_config pl_filter_ewa_robidoux;
 PL_API extern const struct pl_filter_config pl_filter_ewa_robidouxsharp;
+// Special/opaque filters
+PL_API extern const struct pl_filter_config pl_filter_oversample;
 
 // Backwards compatibility
-#define pl_filter_box       pl_filter_nearest
-#define pl_filter_triangle  pl_filter_bilinear
+#define pl_filter_triangle          pl_filter_bilinear
+#define pl_oversample_frame_mixer   pl_filter_oversample
 
+// A list of built-in filter configs, terminated by NULL
+PL_API extern const struct pl_filter_config * const pl_filter_configs[];
+PL_API extern const int pl_num_filter_configs; // excluding trailing NULL
+
+// Find the filter config with the given name, or NULL on failure.
+// `usage` restricts the valid usage (based on `pl_filter_config.allowed`).
+PL_API const struct pl_filter_config *
+pl_find_filter_config(const char *name, enum pl_filter_usage usage);
+
+// Backward compatibility with the previous filter configuration API. Redundant
+// with pl_filter_config.name/description. May be deprecated in the future.
 struct pl_filter_preset {
     const char *name;
     const struct pl_filter_config *filter;
@@ -249,11 +322,6 @@ PL_API extern const int pl_num_filter_presets; // excluding trailing {0}
 // Find the filter preset with the given name, or NULL on failure.
 PL_API const struct pl_filter_preset *pl_find_filter_preset(const char *name);
 
-// Backwards compatibility
-#define pl_named_filter_config  pl_filter_preset
-#define pl_named_filters        pl_filter_presets
-#define pl_find_named_filter    pl_find_filter_preset
-
 // Parameters for filter generation.
 struct pl_filter_params {
     // The particular filter configuration to be sampled. config.kernel must
@@ -265,20 +333,14 @@ struct pl_filter_params {
     // depending on the use case. This value must be set to something > 0.
     int lut_entries;
 
-    // When set to values above 1.0, the filter will be computed at a size
-    // larger than the radius would otherwise require, in order to prevent
-    // aliasing when downscaling. In practice, this should be set to the
-    // inverse of the scaling ratio, i.e. src_size / dst_size.
-    float filter_scale;
-
-    // --- polar filers only (config.polar)
+    // --- Polar filers only (config.polar)
 
     // As a micro-optimization, all samples below this cutoff value will be
     // ignored when updating the cutoff radius. Setting it to a value of 0.0
     // disables this optimization.
     float cutoff;
 
-    // --- separable filters only (!config.polar)
+    // --- Separable filters only (!config.polar)
 
     // Indicates the maximum row size that is supported by the calling code, or
     // 0 for no limit.
@@ -289,6 +351,9 @@ struct pl_filter_params {
     // each row. The chosen row_size will always be a multiple of this value.
     // Specifying 0 indicates no alignment requirements.
     int row_stride_align;
+
+    // --- Deprecated options
+    float filter_scale PL_DEPRECATED; // no effect, use `config.blur` instead
 };
 
 #define pl_filter_params(...) (&(struct pl_filter_params) { __VA_ARGS__ })
@@ -301,10 +366,13 @@ typedef const struct pl_filter_t {
     struct pl_filter_params params;
 
     // Contains the true radius of the computed filter. This may be
-    // larger than `config.kernel->radius` depending on the `scale` passed to
-    // pl_filter_generate. This is only relevant for polar filters, where it
-    // affects the value range of *weights.
+    // smaller than the configured radius depending on the exact filter
+    // parameters used. Mainly relevant for polar filters, since
+    // it affects the value range of *weights.
     float radius;
+
+    // Radius of the first zero crossing (main lobe size).
+    float radius_zero;
 
     // The computed look-up table (LUT). For polar filters, this is interpreted
     // as a 1D array with dimensions [lut_entries] containing the raw filter
@@ -319,15 +387,6 @@ typedef const struct pl_filter_t {
     // of phase), you would use the values from weights[lut_entries/2].
     const float *weights;
 
-    // --- polar filters only (params.config.polar)
-
-    // Contains the effective cut-off radius for this filter. Samples outside
-    // of this cutoff radius may be discarded. Computed based on the `cutoff`
-    // value specified at filter generation. Only relevant for polar filters
-    // since skipping samples outside of the radius can be a significant
-    // performance gain for EWA sampling.
-    float radius_cutoff;
-
     // --- separable filters only (!params.config.polar)
 
     // The number of source texels to convolve over for each row. This value
@@ -339,6 +398,9 @@ typedef const struct pl_filter_t {
     // The separation (in *weights) between each row of the filter. Always
     // a multiple of params.row_stride_align.
     int row_stride;
+
+    // --- deprecated / removed fields
+    float radius_cutoff PL_DEPRECATED; // identical to `radius`
 } *pl_filter;
 
 // Generate (compute) a filter instance based on a given filter configuration.

@@ -41,6 +41,9 @@ struct pl_gpu_fns {
     // Warning: Care must be taken to avoid recursive calls.
     pl_dispatch dp;
 
+    // Internal cache, or NULL. Set by the user (via pl_gpu_set_cache).
+    _Atomic(pl_cache) cache;
+
     // Destructors: These also free the corresponding objects, but they
     // must not be called on NULL. (The NULL checks are done by the pl_*_destroy
     // wrappers)
@@ -93,8 +96,9 @@ static inline bool pl_gpu_supports_interop(pl_gpu gpu)
            gpu->import_caps.sync;
 }
 
-// Returns the GPU-internal `pl_dispatch` object.
+// Returns the GPU-internal `pl_dispatch` and `pl_cache` objects.
 pl_dispatch pl_gpu_dispatch(pl_gpu gpu);
+pl_cache pl_gpu_cache(pl_gpu gpu);
 
 // GPU-internal helpers: these should not be used outside of GPU implementations
 
@@ -115,6 +119,15 @@ uint32_t pl_fmt_fourcc(pl_fmt fmt);
 
 // Compute the total size (in bytes) of a texture transfer operation
 size_t pl_tex_transfer_size(const struct pl_tex_transfer_params *par);
+
+// Split a tex transfer into slices. For emulated formats, `texel_fmt` gives
+// the format of the underlying texel buffer.
+//
+// Returns the number of slices, or 0 on error (e.g. no SSBOs available).
+// `out_slices` must be freed by caller (on success).
+int pl_tex_transfer_slices(pl_gpu gpu, pl_fmt texel_fmt,
+                           const struct pl_tex_transfer_params *params,
+                           struct pl_tex_transfer_params **out_slices);
 
 // Helper that wraps pl_tex_upload/download using texture upload buffers to
 // ensure that params->buf is always set.

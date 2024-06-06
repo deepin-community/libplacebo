@@ -6,44 +6,55 @@
 #include <libplacebo/shaders/deinterlacing.h>
 #include <libplacebo/shaders/sampling.h>
 
-#define TEX_SIZE 2048
-#define CUBE_SIZE 64
-#define NUM_FBOS 16
-#define BENCH_DUR 3
+enum {
+    // Image configuration
+    NUM_TEX     = 16,
+    WIDTH       = 2048,
+    HEIGHT      = 2048,
+    DEPTH       = 16,
+    COMPS       = 4,
+
+    // Queue configuration
+    NUM_QUEUES  = NUM_TEX,
+    ASYNC_TX    = 1,
+    ASYNC_COMP  = 1,
+
+    // Test configuration
+    TEST_MS     = 1000,
+    WARMUP_MS   = 500,
+};
 
 static pl_tex create_test_img(pl_gpu gpu)
 {
-    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 32, PL_FMT_CAP_LINEAR);
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, COMPS, DEPTH, 32, PL_FMT_CAP_LINEAR);
     REQUIRE(fmt);
 
-    int cube_stride = TEX_SIZE / CUBE_SIZE;
-    int cube_count  = cube_stride * cube_stride;
-
-    assert(cube_count * CUBE_SIZE * CUBE_SIZE == TEX_SIZE * TEX_SIZE);
-    float *data = malloc(TEX_SIZE * TEX_SIZE * sizeof(float[4]));
-    REQUIRE(data);
-    for (int n = 0; n < cube_count; n++) {
-        int xbase = (n % cube_stride) * CUBE_SIZE;
-        int ybase = (n / cube_stride) * CUBE_SIZE;
-        for (int g = 0; g < CUBE_SIZE; g++) {
-            for (int r = 0; r < CUBE_SIZE; r++) {
-                int xpos = xbase + r;
-                int ypos = ybase + g;
-                assert(xpos < TEX_SIZE && ypos < TEX_SIZE);
-
-                float *color = &data[(ypos * TEX_SIZE + xpos) * 4];
-                color[0] = (float) r / CUBE_SIZE;
-                color[1] = (float) g / CUBE_SIZE;
-                color[2] = (float) n / cube_count;
-                color[3] = 1.0;
+    const float xc = (WIDTH  - 1) / 2.0f;
+    const float yc = (HEIGHT - 1) / 2.0f;
+    const float kf = 0.5f / sqrtf(xc * xc + yc * yc);
+    const float invphi = 0.61803398874989;
+    const float freqR = kf * M_PI * 0.2f;
+    const float freqG = freqR * invphi;
+    const float freqB = freqG * invphi;
+    float *data = malloc(WIDTH * HEIGHT * COMPS * sizeof(float));
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            float *color = &data[(y * WIDTH + x) * COMPS];
+            float xx = x - xc, yy = y - yc;
+            float r2 = xx * xx + yy * yy;
+            switch (COMPS) {
+            case 4: color[3] = 1.0;
+            case 3: color[2] = 0.5f * sinf(freqB * r2) + 0.5f;;
+            case 2: color[1] = 0.5f * sinf(freqG * r2) + 0.5f;;
+            case 1: color[0] = 0.5f * sinf(freqR * r2) + 0.5f;;
             }
         }
     }
 
     pl_tex tex = pl_tex_create(gpu, pl_tex_params(
         .format         = fmt,
-        .w              = TEX_SIZE,
-        .h              = TEX_SIZE,
+        .w              = WIDTH,
+        .h              = HEIGHT,
         .sampleable     = true,
         .initial_data   = data,
     ));
@@ -90,16 +101,16 @@ static void benchmark(pl_gpu gpu, const char *name,
     pl_tex src = create_test_img(gpu);
 
     // Create the FBOs
-    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 32,
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, COMPS, DEPTH, 32,
                              PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_BLITTABLE);
     REQUIRE(fmt);
 
-    pl_tex fbos[NUM_FBOS] = {0};
-    for (int i = 0; i < NUM_FBOS; i++) {
+    pl_tex fbos[NUM_TEX] = {0};
+    for (int i = 0; i < NUM_TEX; i++) {
         fbos[i] = pl_tex_create(gpu, pl_tex_params(
             .format         = fmt,
-            .w              = TEX_SIZE,
-            .h              = TEX_SIZE,
+            .w              = WIDTH,
+            .h              = HEIGHT,
             .renderable     = true,
             .blit_dst       = true,
             .host_writable  = true,
@@ -116,51 +127,62 @@ static void benchmark(pl_gpu gpu, const char *name,
     pl_gpu_finish(gpu);
 
     // Perform the actual benchmark
-    pl_clock_t start = 0, stop = 0;
-    unsigned long frames = 0;
-    int index = 0;
+    pl_clock_t start_warmup = 0, start_test = 0;
+    unsigned long frames = 0, frames_warmup = 0;
 
     pl_timer timer = pl_timer_create(gpu);
     uint64_t gputime_total = 0;
     unsigned long gputime_count = 0;
     uint64_t gputime;
 
-    start = pl_clock_now();
+    start_warmup = pl_clock_now();
     do {
+        const int idx = frames % NUM_TEX;
+        while (pl_tex_poll(gpu, fbos[idx], UINT64_MAX))
+            ; // do nothing
+        run_bench(gpu, dp, &state, src, fbos[idx], start_test ? timer : NULL, bench);
+        pl_gpu_flush(gpu);
         frames++;
-        run_bench(gpu, dp, &state, src, fbos[index++], timer, bench);
-        index %= NUM_FBOS;
-        if (index == 0) {
-            pl_gpu_flush(gpu);
-            stop = pl_clock_now();
+
+        if (start_test) {
+            while ((gputime = pl_timer_query(gpu, timer))) {
+                gputime_total += gputime;
+                gputime_count++;
+            }
         }
-        while ((gputime = pl_timer_query(gpu, timer))) {
-            gputime_total += gputime;
-            gputime_count++;
+
+        pl_clock_t now = pl_clock_now();
+        if (start_test) {
+            if (pl_clock_diff(now, start_test) > TEST_MS * 1e-3)
+                break;
+        } else if (pl_clock_diff(now, start_warmup) > WARMUP_MS * 1e-3) {
+            start_test = now;
+            frames_warmup = frames;
         }
-    } while (pl_clock_diff(stop, start) < BENCH_DUR);
+    } while (true);
 
     // Force the GPU to finish execution and re-measure the final stop time
     pl_gpu_finish(gpu);
 
-    stop = pl_clock_now();
+    pl_clock_t stop = pl_clock_now();
     while ((gputime = pl_timer_query(gpu, timer))) {
         gputime_total += gputime;
         gputime_count++;
     }
 
-    double secs = pl_clock_diff(stop, start);
+    frames -= frames_warmup;
+    double secs = pl_clock_diff(stop, start_test);
     printf("'%s':\t%4lu frames in %1.6f seconds => %2.6f ms/frame (%5.2f FPS)",
           name, frames, secs, 1000 * secs / frames, frames / secs);
     if (gputime_count)
-        printf(", gpu time: %2.6f ms", 1e-6 * (gputime_total / gputime_count));
+        printf(", gpu time: %2.6f ms", 1e-6 * gputime_total / gputime_count);
     printf("\n");
 
     pl_timer_destroy(gpu, &timer);
     pl_shader_obj_destroy(&state);
     pl_dispatch_destroy(&dp);
     pl_tex_destroy(gpu, &src);
-    for (int i = 0; i < NUM_FBOS; i++)
+    for (int i = 0; i < NUM_TEX; i++)
         pl_tex_destroy(gpu, &fbos[i]);
 }
 
@@ -188,6 +210,16 @@ static void bench_bilinear(pl_shader sh, pl_shader_obj *state, pl_tex src)
 static void bench_bicubic(pl_shader sh, pl_shader_obj *state, pl_tex src)
 {
     REQUIRE(pl_shader_sample_bicubic(sh, pl_sample_src( .tex = src )));
+}
+
+static void bench_hermite(pl_shader sh, pl_shader_obj *state, pl_tex src)
+{
+    REQUIRE(pl_shader_sample_hermite(sh, pl_sample_src( .tex = src )));
+}
+
+static void bench_gaussian(pl_shader sh, pl_shader_obj *state, pl_tex src)
+{
+    REQUIRE(pl_shader_sample_gaussian(sh, pl_sample_src( .tex = src )));
 }
 
 static void bench_dither_blue(pl_shader sh, pl_shader_obj *state, pl_tex src)
@@ -235,11 +267,16 @@ static void bench_polar_nocompute(pl_shader sh, pl_shader_obj *state, pl_tex src
     REQUIRE(pl_shader_sample_polar(sh, pl_sample_src( .tex = src ), &params));
 }
 
-
 static void bench_hdr_peak(pl_shader sh, pl_shader_obj *state, pl_tex src)
 {
     REQUIRE(pl_shader_sample_direct(sh, pl_sample_src( .tex = src )));
-    REQUIRE(pl_shader_detect_peak(sh, pl_color_space_hdr10, state, NULL));
+    REQUIRE(pl_shader_detect_peak(sh, pl_color_space_hdr10, state, &pl_peak_detect_default_params));
+}
+
+static void bench_hdr_peak_hq(pl_shader sh, pl_shader_obj *state, pl_tex src)
+{
+    REQUIRE(pl_shader_sample_direct(sh, pl_sample_src( .tex = src )));
+    REQUIRE(pl_shader_detect_peak(sh, pl_color_space_hdr10, state, &pl_peak_detect_high_quality_params));
 }
 
 static void bench_hdr_lut(pl_shader sh, pl_shader_obj *state, pl_tex src)
@@ -402,7 +439,7 @@ static void bench_reshape_mmr(pl_shader sh, pl_shader_obj *state, pl_tex src)
     pl_shader_dovi_reshape(sh, &dovi_meta); // this includes MMR
 }
 
-static float data[TEX_SIZE * TEX_SIZE * 4 + 8192];
+static float data[WIDTH * HEIGHT * COMPS + 8192];
 
 static void bench_download(pl_gpu gpu, pl_tex tex)
 {
@@ -452,14 +489,15 @@ int main()
 
     pl_vulkan vk = pl_vulkan_create(log, pl_vulkan_params(
         .allow_software = true,
-        .async_transfer = false,
-        .queue_count = NUM_FBOS,
+        .async_transfer = ASYNC_TX,
+        .async_compute  = ASYNC_COMP,
+        .queue_count    = NUM_QUEUES,
     ));
 
     if (!vk)
         return SKIP;
 
-#define BENCH_SH(fn) &(struct bench) { .run_sh = fn }
+#define BENCH_SH(fn)  &(struct bench) { .run_sh = fn }
 #define BENCH_TEX(fn) &(struct bench) { .run_tex = fn }
 
     printf("= Running benchmarks =\n");
@@ -469,6 +507,8 @@ int main()
     benchmark(vk->gpu, "tex_upload ptr async", BENCH_TEX(bench_upload_async));
     benchmark(vk->gpu, "bilinear", BENCH_SH(bench_bilinear));
     benchmark(vk->gpu, "bicubic", BENCH_SH(bench_bicubic));
+    benchmark(vk->gpu, "hermite", BENCH_SH(bench_hermite));
+    benchmark(vk->gpu, "gaussian", BENCH_SH(bench_gaussian));
     benchmark(vk->gpu, "deband", BENCH_SH(bench_deband));
     benchmark(vk->gpu, "deband_heavy", BENCH_SH(bench_deband_heavy));
 
@@ -488,8 +528,10 @@ int main()
     benchmark(vk->gpu, "dither_ordered_fixed", BENCH_SH(bench_dither_ordered_fix));
 
     // HDR peak detection
-    if (vk->gpu->glsl.compute)
-        benchmark(vk->gpu, "hdr_peakdetect", BENCH_SH(bench_hdr_peak));
+    if (vk->gpu->glsl.compute) {
+        benchmark(vk->gpu, "hdr_peakdetect",    BENCH_SH(bench_hdr_peak));
+        benchmark(vk->gpu, "hdr_peakdetect_hq", BENCH_SH(bench_hdr_peak_hq));
+    }
 
     // Tone mapping
     benchmark(vk->gpu, "hdr_lut", BENCH_SH(bench_hdr_lut));

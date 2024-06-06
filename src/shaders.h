@@ -21,19 +21,14 @@
 #include <limits.h>
 
 #include "common.h"
+#include "cache.h"
 #include "log.h"
 #include "gpu.h"
 
 #include <libplacebo/shaders.h>
 
 // This represents an identifier (e.g. name of function, uniform etc.) for
-// a shader resource. The generated identifiers are immutable, but only live
-// until pl_shader_reset - so make copies when passing to external stuff.
-//
-// Note: When PL_STRIP_SHADERS is set during compile time, identifiers will be
-// treated directly as integers, with no human-readable names.
-
-#ifdef PL_STRIP_SHADERS
+// a shader resource. Not human-readable.
 
 typedef unsigned short ident_t;
 #define $           "_%hx"
@@ -61,19 +56,6 @@ static inline ident_t sh_ident_unpack(const char *name)
     assert((uname & ~IDENT_MASK) == IDENT_SENTINEL);
     return uname & IDENT_MASK;
 }
-
-#else // !PL_STRIP_SHADERS
-
-typedef const char *ident_t;
-#define $           "%s"
-#define NULL_IDENT  NULL
-
-#define sh_mkident(id, name)  pl_asprintf(sh->tmp, "_%hx_%s", id, name)
-#define sh_ident_tostr(id)    ((const char *) id)
-#define sh_ident_pack(id)     ((const char *) id)
-#define sh_ident_unpack(name) ((ident_t) name)
-
-#endif // PL_STRIP_SHADERS
 
 enum pl_shader_buf {
     SH_BUF_PRELUDE, // extra #defines etc.
@@ -148,6 +130,7 @@ pl_str_builder sh_finalize_internal(pl_shader sh);
 // Helper functions for convenience
 #define SH_PARAMS(sh) ((sh)->info->info.params)
 #define SH_GPU(sh) (SH_PARAMS(sh).gpu)
+#define SH_CACHE(sh) pl_gpu_cache(SH_GPU(sh))
 
 // Returns the GLSL version, defaulting to desktop 130.
 struct pl_glsl_version sh_glsl(const pl_shader sh);
@@ -345,6 +328,10 @@ struct sh_lut_params {
     // rather than being treated as read-only.
     bool dynamic;
 
+    // If set , generated shader objects are automatically cached in this
+    // cache. Requires `signature` to be set (and uniquely identify the LUT).
+    pl_cache cache;
+
     // Will be called with a zero-initialized buffer whenever the data needs to
     // be computed, which happens whenever the size is changed, the shader
     // object is invalidated, or `update` is set to true.
@@ -352,9 +339,15 @@ struct sh_lut_params {
     // Note: Interpretation of `data` is according to `type` and `fmt`.
     void (*fill)(void *data, const struct sh_lut_params *params);
     void *priv;
+
+    // Debug tag to track LUT source
+    pl_debug_tag debug_tag;
 };
 
-#define sh_lut_params(...) (&(struct sh_lut_params) { __VA_ARGS__ })
+#define sh_lut_params(...) (&(struct sh_lut_params) {   \
+        .debug_tag = PL_DEBUG_TAG,                      \
+        __VA_ARGS__                                     \
+    })
 
 // Makes a table of values available as a shader variable, using an a given
 // method (falling back if needed). The resulting identifier can be sampled
@@ -364,9 +357,15 @@ struct sh_lut_params {
 // gets interpolated and clamped as needed. Returns NULL on error.
 ident_t sh_lut(pl_shader sh, const struct sh_lut_params *params);
 
-static inline const char *sh_float_type(uint8_t num_comps)
+static inline uint8_t sh_num_comps(uint8_t mask)
 {
-    switch (num_comps) {
+    pl_assert((mask & 0xF) == mask);
+    return __builtin_popcount(mask);
+}
+
+static inline const char *sh_float_type(uint8_t mask)
+{
+    switch (sh_num_comps(mask)) {
     case 1: return "float";
     case 2: return "vec2";
     case 3: return "vec3";
@@ -376,16 +375,13 @@ static inline const char *sh_float_type(uint8_t num_comps)
     pl_unreachable();
 }
 
-static inline uint8_t sh_tex_swiz(char swiz[5], uint8_t comp_mask)
+static inline const char *sh_swizzle(uint8_t mask)
 {
-    uint8_t num_comps = 0;
-    for (uint8_t comps = comp_mask; comps;) {
-        uint8_t c = __builtin_ctz(comps);
-        assert(c < 4 && num_comps < 4);
-        swiz[num_comps++] = "xyzw"[c];
-        comps &= ~(1u << c);
-    }
+    static const char * const swizzles[0x10] = {
+        NULL, "r",  "g",  "rg",  "b",  "rb",  "gb",  "rgb",
+        "a",  "ra", "ga", "rga", "ba", "rba", "gba", "rgba",
+    };
 
-    swiz[num_comps] = '\0';
-    return num_comps;
+    pl_assert(mask <= PL_ARRAY_SIZE(swizzles));
+    return swizzles[mask];
 }

@@ -72,7 +72,7 @@ struct pl_deband_params {
 
     // The debanding filter's cut-off threshold. Higher numbers increase the
     // debanding strength dramatically, but progressively diminish image
-    // details. Defaults to 4.0.
+    // details. Defaults to 3.0.
     float threshold;
 
     // The debanding filter's initial radius. The radius increases linearly
@@ -86,7 +86,7 @@ struct pl_deband_params {
     // result in a very big change to the brightness level. It's recommended to
     // either scale this value down or disable it entirely for HDR.
     //
-    // Defaults to 6.0, which is very mild.
+    // Defaults to 4.0, which is very mild.
     float grain;
 
     // 'Neutral' grain value for each channel being debanded (sorted in order
@@ -98,9 +98,9 @@ struct pl_deband_params {
 
 #define PL_DEBAND_DEFAULTS  \
     .iterations = 1,        \
-    .threshold  = 4.0,      \
+    .threshold  = 3.0,      \
     .radius     = 16.0,     \
-    .grain      = 6.0,
+    .grain      = 4.0,
 
 #define pl_deband_params(...) (&(struct pl_deband_params) {PL_DEBAND_DEFAULTS __VA_ARGS__ })
 PL_API extern const struct pl_deband_params pl_deband_default_params;
@@ -131,11 +131,14 @@ PL_API bool pl_shader_sample_nearest(pl_shader sh, const struct pl_sample_src *s
 // `pl_shader_sample_direct`, but forces bilinear interpolation.
 PL_API bool pl_shader_sample_bilinear(pl_shader sh, const struct pl_sample_src *src);
 
-// Performs hardware-accelerated / efficient bicubic sampling. This is more
-// efficient than using the generalized sampling routines and
-// pl_filter_function_bicubic. Only works well when upscaling - avoid for
-// downscaling.
+// Optimized versions of specific, strictly positive scaler kernels that take
+// adantage of linear texture sampling to reduce the number of fetches needed
+// by a factor of four. This family of functions performs radius-2 scaling
+// with only four texture fetches, which is far more efficient than using
+// the generalized 1D scaling method. Only works well for upscaling.
 PL_API bool pl_shader_sample_bicubic(pl_shader sh, const struct pl_sample_src *src);
+PL_API bool pl_shader_sample_hermite(pl_shader sh, const struct pl_sample_src *src);
+PL_API bool pl_shader_sample_gaussian(pl_shader sh, const struct pl_sample_src *src);
 
 // A sampler that is similar to nearest neighbour sampling, but tries to
 // preserve pixel aspect ratios. This is mathematically equivalent to taking an
@@ -153,15 +156,14 @@ PL_API bool pl_shader_sample_oversample(pl_shader sh, const struct pl_sample_src
 struct pl_sample_filter_params {
     // The filter to use for sampling.
     struct pl_filter_config filter;
-    // The precision of the LUT. Defaults to 64 if unspecified.
-    int lut_entries;
-    // See `pl_filter_params.cutoff`. Defaults to 0.001 if unspecified. Only
-    // relevant for polar filters.
-    float cutoff;
+
     // Antiringing strength. A value of 0.0 disables antiringing, and a value
     // of 1.0 enables full-strength antiringing. Defaults to 0.0 if
-    // unspecified. Only relevant for separated/orthogonal filters.
+    // unspecified.
+    //
+    // Note: Ignored if `filter.antiring` is already set to something nonzero.
     float antiring;
+
     // Disable the use of compute shaders (e.g. if rendering to non-storable tex)
     bool no_compute;
     // Disable the use of filter widening / anti-aliasing (for downscaling)
@@ -172,6 +174,10 @@ struct pl_sample_filter_params {
     // to re-use the same LUT for different filter configurations or scaling
     // ratios. Must be set to a valid pointer, and the target NULL-initialized.
     pl_shader_obj *lut;
+
+    // Deprecated / removed fields
+    int lut_entries PL_DEPRECATED; // hard-coded as 256
+    float cutoff PL_DEPRECATED; // hard-coded as 1e-3
 };
 
 #define pl_sample_filter_params(...) (&(struct pl_sample_filter_params) { __VA_ARGS__ })

@@ -1,1 +1,9 @@
-.pc/
+/build*
+/tags
+/TAGS
+/demos/3rdparty
+/3rdparty
+*.exe
+*.o
+.cache
+__pycache__

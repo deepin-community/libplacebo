@@ -271,9 +271,8 @@ struct pl_vulkan_params {
 PL_API extern const struct pl_vulkan_params pl_vulkan_default_params;
 
 // Creates a new vulkan device based on the given parameters and initializes
-// a new GPU. This function will internally initialize a VkDevice. There is
-// currently no way to share a vulkan device with the caller. If `params` is
-// left as NULL, it defaults to &pl_vulkan_default_params.
+// a new GPU. If `params` is left as NULL, it defaults to
+// &pl_vulkan_default_params.
 //
 // Thread-safety: Safe
 PL_API pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params);
@@ -347,6 +346,11 @@ struct pl_vulkan_swapchain_params {
     // calling `pl_swapchain_resize` as appropriate. libplacebo will tolerate
     // the "suboptimal" status indefinitely.
     bool allow_suboptimal;
+
+    // Disable high-bit (10 or more) SDR formats. May help work around buggy
+    // drivers which don't dither properly when outputting high bit depth
+    // SDR backbuffers to 8-bit screens.
+    bool disable_10bit_sdr;
 };
 
 #define pl_vulkan_swapchain_params(...) (&(struct pl_vulkan_swapchain_params) { __VA_ARGS__ })

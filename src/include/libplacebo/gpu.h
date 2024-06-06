@@ -23,6 +23,7 @@
 #include <stdint.h>
 
 #include <libplacebo/common.h>
+#include <libplacebo/cache.h>
 #include <libplacebo/log.h>
 
 PL_API_BEGIN
@@ -246,6 +247,15 @@ typedef const struct pl_gpu_t {
     // This will only be filled in if interop is supported.
     struct pl_gpu_pci_address pci;
 } *pl_gpu;
+
+// Attach a pl_cache object to this GPU instance. This cache will be
+// used to cache all compiled shaders, as well as several other shader objects
+// (e.g. cached 3DLUTs). Calling this with `cache = NULL` disables the cache.
+//
+// Note: Calling this after shaders have already been compiled will not
+// retroactively add those shaders to the cache, so it's recommended to set
+// this early, before creating any passes.
+PL_API void pl_gpu_set_cache(pl_gpu gpu, pl_cache cache);
 
 enum pl_fmt_type {
     PL_FMT_UNKNOWN = 0, // also used for inconsistent multi-component formats
@@ -890,6 +900,7 @@ struct pl_tex_transfer_params {
                         // multiple of `tex->params.format->texel_size`
     // 2. Transferring to/from host memory directly:
     void *ptr;          // address of data
+    bool no_import;     // always use memcpy, bypassing host ptr import
 
     // Note: The contents of the memory region / buffer must exactly match the
     // texture format; i.e. there is no explicit conversion between formats.
@@ -1196,21 +1207,6 @@ struct pl_pass_params {
     // a compute shader.
     const char *glsl_shader;
 
-    // Highly implementation-specific byte array storing a compiled version of
-    // the same shader. Can be used to speed up pass creation on already
-    // known/cached shaders.
-    //
-    // Note: There are a few restrictions on this. Passing an out-of-date
-    // cache, passing a cache corresponding to a different program, or passing
-    // a cache belonging to a different GPU, are all guaranteed to be valid.
-    //
-    // It is, however, undefined behavior to pass arbitrary or maliciously
-    // crafted bytes - and users are advised that attaching a shader cache
-    // obtained from the internet could lead to arbitrary program behavior
-    // (possibly including code execution).
-    const uint8_t *cached_program;
-    size_t cached_program_len;
-
     // --- type==PL_PASS_RASTER only
 
     // Describes the interpretation and layout of the vertex data.
@@ -1237,6 +1233,10 @@ struct pl_pass_params {
     //
     // Specifying `blend_params` requires `load_target` to be true.
     bool load_target;
+
+    // --- Deprecated / removed fields.
+    PL_DEPRECATED const uint8_t *cached_program; // Non-functional
+    PL_DEPRECATED size_t cached_program_len;
 };
 
 #define pl_pass_params(...) (&(struct pl_pass_params) { __VA_ARGS__ })
@@ -1256,9 +1256,6 @@ typedef const struct pl_pass_t {
 // Compile a shader and create a render pass. This is a rare/expensive
 // operation and may take a significant amount of time, even if a cached
 // program is used. Returns NULL on failure.
-//
-// The resulting pl_pass->params.cached_program will be initialized by
-// this function to point to a new, valid cached program (if any).
 PL_API pl_pass pl_pass_create(pl_gpu gpu, const struct pl_pass_params *params);
 PL_API void pl_pass_destroy(pl_gpu gpu, pl_pass *pass);
 

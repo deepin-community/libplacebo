@@ -45,7 +45,8 @@ if glfw.found()
     apis += static_library('glfw-vk',
       dependencies: [libplacebo, libm, glfw, vulkan_headers],
       sources: 'window_glfw.c',
-      c_args: '-DUSE_VK',
+      c_args: ['-DUSE_VK'],
+      include_directories: vulkan_headers_inc,
     )
   endif
 
@@ -74,7 +75,8 @@ if sdl.found()
     apis += static_library('sdl-vk',
       dependencies: [libplacebo, sdl, vulkan_headers],
       sources: 'window_sdl.c',
-      c_args: '-DUSE_VK',
+      c_args: ['-DUSE_VK'],
+      include_directories: vulkan_headers_inc,
     )
   endif
 
@@ -106,18 +108,23 @@ else
 
   dep = declare_dependency(
     dependencies: [ libplacebo, build_deps ] + additional_dep,
-    sources: ['window.c'],
+    sources: ['window.c', 'utils.c'],
+    include_directories: vulkan_headers_inc,
     link_with: apis,
   )
 
   # Graphical demo programs
   executable('colors', 'colors.c',
     dependencies: [ dep, pl_clock, libm ],
+    link_args: link_args,
+    link_depends: link_depends,
   )
 
   if sdl_image.found()
     executable('sdlimage', 'sdlimage.c',
       dependencies: [ dep, libm, sdl_image ],
+      link_args: link_args,
+      link_depends: link_depends,
     )
   endif
 
@@ -129,18 +136,35 @@ else
     if host_machine.system() == 'windows'
       plplay_deps += cc.find_library('shlwapi', required: true)
     endif
-    executable('plplay', 'plplay.c',
+    plplay_sources = ['plplay.c', 'settings.c']
+    if host_machine.system() == 'windows'
+      windows = import('windows')
+      plplay_sources += windows.compile_resources(demos_rc, depends: version_h,
+                          include_directories: meson.project_source_root()/'win32')
+    endif
+    executable('plplay', plplay_sources,
       dependencies: plplay_deps,
+      link_args: link_args,
+      link_depends: link_depends,
       install: true,
     )
   endif
 
 endif
 
-# Headless video filtering demo
+# Headless vulkan demos
 if components.get('vk-proc-addr')
   executable('video-filtering', 'video-filtering.c',
-    dependencies: [ libplacebo, vulkan_loader ],
+    dependencies: [ libplacebo, pl_clock, pl_thread, vulkan_loader ],
     c_args: '-O2',
+    link_args: link_args,
+    link_depends: link_depends,
+  )
+
+  executable('multigpu-bench', 'multigpu-bench.c',
+    dependencies: [ libplacebo, pl_clock, vulkan_loader ],
+    c_args: '-O2',
+    link_args: link_args,
+    link_depends: link_depends,
   )
 endif

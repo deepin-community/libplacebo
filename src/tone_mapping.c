@@ -21,6 +21,30 @@
 
 #include <libplacebo/tone_mapping.h>
 
+#define fclampf(x, lo, hi) fminf(fmaxf(x, lo), hi)
+static void fix_constants(struct pl_tone_map_constants *c)
+{
+    const float eps = 1e-6f;
+    c->knee_adaptation   = fclampf(c->knee_adaptation, 0.0f, 1.0f);
+    c->knee_minimum      = fclampf(c->knee_minimum, eps, 0.5f - eps);
+    c->knee_maximum      = fclampf(c->knee_maximum, 0.5f + eps, 1.0f - eps);
+    c->knee_default      = fclampf(c->knee_default, c->knee_minimum, c->knee_maximum);
+    c->knee_offset       = fclampf(c->knee_offset, 0.5f, 2.0f);
+    c->slope_tuning      = fclampf(c->slope_tuning, 0.0f, 10.0f);
+    c->slope_offset      = fclampf(c->slope_offset, 0.0f, 1.0f);
+    c->spline_contrast   = fclampf(c->spline_contrast, 0.0f, 1.5f);
+    c->reinhard_contrast = fclampf(c->reinhard_contrast, eps, 1.0f - eps);
+    c->linear_knee       = fclampf(c->linear_knee, eps, 1.0f - eps);
+    c->exposure          = fclampf(c->exposure, eps, 10.0f);
+}
+
+static inline bool constants_equal(const struct pl_tone_map_constants *a,
+                                   const struct pl_tone_map_constants *b)
+{
+    pl_static_assert(sizeof(*a) % sizeof(float) == 0);
+    return !memcmp(a, b, sizeof(*a));
+}
+
 bool pl_tone_map_params_equal(const struct pl_tone_map_params *a,
                               const struct pl_tone_map_params *b)
 {
@@ -34,6 +58,7 @@ bool pl_tone_map_params_equal(const struct pl_tone_map_params *a,
            a->input_avg == b->input_avg &&
            a->output_min == b->output_min &&
            a->output_max == b->output_max &&
+           constants_equal(&a->constants, &b->constants) &&
            pl_hdr_metadata_equal(&a->hdr, &b->hdr);
 }
 
@@ -43,7 +68,7 @@ bool pl_tone_map_params_noop(const struct pl_tone_map_params *p)
     float in_max = pl_hdr_rescale(p->input_scaling, PL_HDR_NITS, p->input_max);
     float out_min = pl_hdr_rescale(p->output_scaling, PL_HDR_NITS, p->output_min);
     float out_max = pl_hdr_rescale(p->output_scaling, PL_HDR_NITS, p->output_max);
-    bool can_inverse = p->function == &pl_tone_map_auto || p->function->map_inverse;
+    bool can_inverse = p->function->map_inverse;
 
     return fabs(in_min - out_min) < 1e-4 && // no BPC
            in_max < out_max + 1e-2 && // no range reduction
@@ -55,40 +80,32 @@ void pl_tone_map_params_infer(struct pl_tone_map_params *par)
     if (!par->function)
         par->function = &pl_tone_map_clip;
 
-    if (!par->param)
-        par->param = par->function->param_def;
-
-    if (par->function == &pl_tone_map_auto) {
-        float src_max = pl_hdr_rescale(par->input_scaling, PL_HDR_NORM, par->input_max);
-        float dst_max = pl_hdr_rescale(par->output_scaling, PL_HDR_NORM, par->output_max);
-        float ratio = src_max / dst_max;
-        if (par->hdr.ootf.num_anchors && ratio >= 1) {
-            // HDR10+ OOTF available: Pick SMPTE ST2094-40
-            par->function = &pl_tone_map_st2094_40;
-        } else if (par->input_avg || ratio > 10) {
-            // Scene-average metadata available, or extreme reduction: Pick
-            // spline for its good tunable properties and quasi-linear behavior
-            par->function = &pl_tone_map_spline;
-        } else if (src_max < 1 + 1e-3 && dst_max < 1 + 1e-3) {
-            // SDR<->SDR range conversion, use linear light stretching
-            par->function = &pl_tone_map_linear;
-        } else if (fmaxf(ratio, 1 / ratio) > 2 && fminf(src_max, dst_max) < 1.5f) {
-            // Reasonably ranged HDR<->SDR conversion, pick BT.2446a since it
-            // was designed for this task
-            par->function = &pl_tone_map_bt2446a;
-        } else if (ratio < 1) {
-            // Small range inverse tone mapping, pick spline since BT.2446a
-            // distorts colors too much
-            par->function = &pl_tone_map_spline;
-        } else {
-            // Small range conversion (nearly no-op), pick BT.2390 because it
-            // has the best asymptotic behavior (approximately linear).
-            par->function = &pl_tone_map_bt2390;
-        }
-        par->param = par->function->param_def;
+    if (par->param) {
+        // Backwards compatibility for older API
+        if (par->function == &pl_tone_map_st2094_40 || par->function == &pl_tone_map_st2094_10)
+            par->constants.knee_adaptation = par->param;
+        if (par->function == &pl_tone_map_bt2390)
+            par->constants.knee_offset = par->param;
+        if (par->function == &pl_tone_map_spline)
+            par->constants.spline_contrast = par->param;
+        if (par->function == &pl_tone_map_reinhard)
+            par->constants.reinhard_contrast = par->param;
+        if (par->function == &pl_tone_map_mobius || par->function == &pl_tone_map_gamma)
+            par->constants.linear_knee = par->param;
+        if (par->function == &pl_tone_map_linear || par->function == &pl_tone_map_linear_light)
+            par->constants.exposure = par->param;
     }
 
-    par->param = PL_CLAMP(par->param, par->function->param_min, par->function->param_max);
+    fix_constants(&par->constants);
+
+    // Constrain the input peak to be no less than target SDR white
+    float sdr = pl_hdr_rescale(par->output_scaling, par->input_scaling, par->output_max);
+    sdr = fminf(sdr, pl_hdr_rescale(PL_HDR_NITS, par->input_scaling, PL_COLOR_SDR_WHITE));
+    par->input_max = fmaxf(par->input_max, sdr);
+
+    // Constrain the output peak if function does not support inverse mapping
+    if (!par->function->map_inverse)
+        par->output_max = fminf(par->output_max, par->input_max);
 }
 
 // Infer params and rescale to function scaling
@@ -100,15 +117,11 @@ static struct pl_tone_map_params fix_params(const struct pl_tone_map_params *par
     const struct pl_tone_map_function *fun = params->function;
     fixed.input_scaling = fun->scaling;
     fixed.output_scaling = fun->scaling;
-    fixed.input_min = pl_hdr_rescale(params->input_scaling, fun->scaling, params->input_min);
-    fixed.input_max = pl_hdr_rescale(params->input_scaling, fun->scaling, params->input_max);
-    fixed.input_avg = pl_hdr_rescale(params->input_scaling, fun->scaling, params->input_avg);
-    fixed.output_min = pl_hdr_rescale(params->output_scaling, fun->scaling, params->output_min);
-    fixed.output_max = pl_hdr_rescale(params->output_scaling, fun->scaling, params->output_max);
-
-    // Constrain the output peak if function does not support inverse mapping
-    if (!fun->map_inverse && fixed.output_max > fixed.input_max)
-        fixed.output_max = fixed.input_max;
+    fixed.input_min  = pl_hdr_rescale(params->input_scaling,  fun->scaling, fixed.input_min);
+    fixed.input_max  = pl_hdr_rescale(params->input_scaling,  fun->scaling, fixed.input_max);
+    fixed.input_avg  = pl_hdr_rescale(params->input_scaling,  fun->scaling, fixed.input_avg);
+    fixed.output_min = pl_hdr_rescale(params->output_scaling, fun->scaling, fixed.output_min);
+    fixed.output_max = pl_hdr_rescale(params->output_scaling, fun->scaling, fixed.output_max);
 
     return fixed;
 }
@@ -194,11 +207,6 @@ static inline float bt1886_oetf(float x, float min, float max)
     return (powf(x, 1/2.4f) - lb) / (lw - lb);
 }
 
-const struct pl_tone_map_function pl_tone_map_auto = {
-    .name = "auto",
-    .description = "Automatic selection",
-};
-
 static void noop(float *lut, const struct pl_tone_map_params *params)
 {
     return;
@@ -212,49 +220,48 @@ const struct pl_tone_map_function pl_tone_map_clip = {
 };
 
 // Helper function to pick a knee point (for suitable methods) based on the
-// HDR10+ brightness metadata and scene brightness average matching. The knee
-// point adaptation strength is optionally tunable (taken from `params->param`).
+// HDR10+ brightness metadata and scene brightness average matching.
 //
 // Inspired by SMPTE ST2094-10, with some modifications
 static void st2094_pick_knee(float *out_src_knee, float *out_dst_knee,
-                             const struct pl_tone_map_params *params,
-                             float adaptation)
+                             const struct pl_tone_map_params *params)
 {
-    // Knee point default, minimum and maximum
-    const float min_knee = 0.1f;
-    const float def_knee = 0.4f;
-    const float max_knee = 0.8f;
+    const float src_min = pl_hdr_rescale(params->input_scaling,  PL_HDR_PQ, params->input_min);
+    const float src_max = pl_hdr_rescale(params->input_scaling,  PL_HDR_PQ, params->input_max);
+    const float src_avg = pl_hdr_rescale(params->input_scaling,  PL_HDR_PQ, params->input_avg);
+    const float dst_min = pl_hdr_rescale(params->output_scaling, PL_HDR_PQ, params->output_min);
+    const float dst_max = pl_hdr_rescale(params->output_scaling, PL_HDR_PQ, params->output_max);
 
-    float src_min = pl_hdr_rescale(params->input_scaling,  PL_HDR_PQ, params->input_min);
-    float src_max = pl_hdr_rescale(params->input_scaling,  PL_HDR_PQ, params->input_max);
-    float src_avg = pl_hdr_rescale(params->input_scaling,  PL_HDR_PQ, params->input_avg);
-    float dst_min = pl_hdr_rescale(params->output_scaling, PL_HDR_PQ, params->output_min);
-    float dst_max = pl_hdr_rescale(params->output_scaling, PL_HDR_PQ, params->output_max);
-    float dst_avg;
-
-    // Choose default scene average brightness to be a fixed percentage of the
-    // value range, override with (clamped) dynamic metadata if available
-    float target_avg = def_knee;
-    if (src_avg) {
-        target_avg = (src_avg - src_min) / (src_max - src_min);
-        target_avg = PL_CLAMP(target_avg, min_knee, max_knee);
-    }
-
-    src_avg = PL_MIX(src_min, src_max, target_avg);
-    dst_avg = PL_MIX(dst_min, dst_max, target_avg);
-
-    // Adjust the destination adaptation point by picking the perceptual
-    // adaptation point between the source average and the desired average.
-    // This moves the knee point, on the vertical axis, closer to the 1:1
-    // (neutral) line.
-    dst_avg = PL_MIX(src_avg, dst_avg, adaptation);
-
+    const float min_knee = params->constants.knee_minimum;
+    const float max_knee = params->constants.knee_maximum;
+    const float def_knee = params->constants.knee_default;
+    const float src_knee_min = PL_MIX(src_min, src_max, min_knee);
+    const float src_knee_max = PL_MIX(src_min, src_max, max_knee);
     const float dst_knee_min = PL_MIX(dst_min, dst_max, min_knee);
     const float dst_knee_max = PL_MIX(dst_min, dst_max, max_knee);
-    dst_avg = PL_CLAMP(dst_avg, dst_knee_min, dst_knee_max);
 
-    *out_src_knee = pl_hdr_rescale(PL_HDR_PQ, params->input_scaling, src_avg);
-    *out_dst_knee = pl_hdr_rescale(PL_HDR_PQ, params->output_scaling, dst_avg);
+    // Choose source knee based on source scene brightness
+    float src_knee = PL_DEF(src_avg, PL_MIX(src_min, src_max, def_knee));
+    src_knee = fclampf(src_knee, src_knee_min, src_knee_max);
+
+    // Choose target adaptation point based on linearly re-scaling source knee
+    float target = (src_knee - src_min) / (src_max - src_min);
+    float adapted = PL_MIX(dst_min, dst_max, target);
+
+    // Choose the destnation knee by picking the perceptual adaptation point
+    // between the source knee and the desired target. This moves the knee
+    // point, on the vertical axis, closer to the 1:1 (neutral) line.
+    //
+    // Adjust the adaptation strength towards 1 based on how close the knee
+    // point is to its extreme values (min/max knee)
+    float tuning = 1.0f - pl_smoothstep(max_knee, def_knee, target) *
+                          pl_smoothstep(min_knee, def_knee, target);
+    float adaptation = PL_MIX(params->constants.knee_adaptation, 1.0f, tuning);
+    float dst_knee = PL_MIX(src_knee, adapted, adaptation);
+    dst_knee = fclampf(dst_knee, dst_knee_min, dst_knee_max);
+
+    *out_src_knee = pl_hdr_rescale(PL_HDR_PQ, params->input_scaling, src_knee);
+    *out_dst_knee = pl_hdr_rescale(PL_HDR_PQ, params->output_scaling, dst_knee);
 }
 
 // Pascal's triangle
@@ -311,7 +318,7 @@ static void st2094_40(float *lut, const struct pl_tone_map_params *params)
 
         // Missing metadata, default to simple brightness matching
         float src_knee, dst_knee;
-        st2094_pick_knee(&src_knee, &dst_knee, params, params->param);
+        st2094_pick_knee(&src_knee, &dst_knee, params);
         Kx = src_knee / params->input_max;
         Ky = dst_knee / params->output_max;
 
@@ -411,7 +418,7 @@ const struct pl_tone_map_function pl_tone_map_st2094_40 = {
 static void st2094_10(float *lut, const struct pl_tone_map_params *params)
 {
     float src_knee, dst_knee;
-    st2094_pick_knee(&src_knee, &dst_knee, params, params->param);
+    st2094_pick_knee(&src_knee, &dst_knee, params);
 
     const float x1 = params->input_min;
     const float x3 = params->input_max;
@@ -444,7 +451,7 @@ const struct pl_tone_map_function pl_tone_map_st2094_10 = {
     .description = "SMPTE ST 2094-10 Annex B.2",
     .param_desc = "Knee point target",
     .param_min = 0.00f,
-    .param_def = 0.50f,
+    .param_def = 0.70f,
     .param_max = 1.00f,
     .scaling = PL_HDR_NITS,
     .map = st2094_10,
@@ -454,7 +461,7 @@ static void bt2390(float *lut, const struct pl_tone_map_params *params)
 {
     const float minLum = rescale_in(params->output_min, params);
     const float maxLum = rescale_in(params->output_max, params);
-    const float offset = params->param;
+    const float offset = params->constants.knee_offset;
     const float ks = (1 + offset) * maxLum - offset;
     const float bp = minLum > 0 ? fminf(1 / minLum, 4) : 4;
     const float gain_inv = 1 + minLum / maxLum * powf(1 - maxLum, bp);
@@ -543,8 +550,7 @@ const struct pl_tone_map_function pl_tone_map_bt2446a = {
 static void spline(float *lut, const struct pl_tone_map_params *params)
 {
     float src_pivot, dst_pivot;
-    const float adaptation = 0.70f;
-    st2094_pick_knee(&src_pivot, &dst_pivot, params, adaptation);
+    st2094_pick_knee(&src_pivot, &dst_pivot, params);
 
     // Solve for linear knee (Pa = 0)
     float slope = (dst_pivot - params->output_min) /
@@ -554,14 +560,11 @@ static void spline(float *lut, const struct pl_tone_map_params *params)
     // gamma exponent, multiplied by an extra tuning coefficient designed to
     // make the slope closer to 1.0 when the difference in peaks is low, and
     // closer to linear when the difference between peaks is high.
-    const float slope_tuning_strength = 1.5f;
-    const float slope_tuning_offset   = 0.2f;
-    const float slope_gamma = 1.0f - params->param;
     float ratio = params->input_max / params->output_max - 1.0f;
-    ratio = PL_CLAMP(slope_tuning_strength * ratio,
-                     slope_tuning_offset,
-                     1.0f + slope_tuning_offset);
-    slope = powf(slope, slope_gamma * ratio);
+    ratio = fclampf(params->constants.slope_tuning * ratio,
+                    params->constants.slope_offset,
+                    1.0f + params->constants.slope_offset);
+    slope = powf(slope, (1.0f - params->constants.spline_contrast) * ratio);
 
     // Normalize everything the pivot to make the math easier
     const float in_min = params->input_min - src_pivot;
@@ -608,7 +611,7 @@ const struct pl_tone_map_function pl_tone_map_spline = {
 static void reinhard(float *lut, const struct pl_tone_map_params *params)
 {
     const float peak = rescale(params->input_max, params),
-                contrast = params->param,
+                contrast = params->constants.reinhard_contrast,
                 offset = (1.0 - contrast) / contrast,
                 scale = (peak + offset) / peak;
 
@@ -633,7 +636,7 @@ const struct pl_tone_map_function pl_tone_map_reinhard = {
 static void mobius(float *lut, const struct pl_tone_map_params *params)
 {
     const float peak = rescale(params->input_max, params),
-                j = params->param;
+                j = params->constants.linear_knee;
 
     // Solve for M(j) = j; M(peak) = 1.0; M'(j) = 1.0
     // where M(x) = scale * (x+a)/(x+b)
@@ -688,7 +691,7 @@ const struct pl_tone_map_function pl_tone_map_hable = {
 static void gamma_map(float *lut, const struct pl_tone_map_params *params)
 {
     const float peak = rescale(params->input_max, params),
-                cutoff = params->param,
+                cutoff = params->constants.linear_knee,
                 gamma = logf(cutoff) / logf(cutoff / peak);
 
     FOREACH_LUT(lut, x) {
@@ -703,14 +706,14 @@ const struct pl_tone_map_function pl_tone_map_gamma = {
     .description = "Gamma function with knee",
     .param_desc = "Knee point",
     .param_min = 0.001,
-    .param_def = 0.50,
+    .param_def = 0.30,
     .param_max = 1.00,
     .map = gamma_map,
 };
 
 static void linear(float *lut, const struct pl_tone_map_params *params)
 {
-    const float gain = params->param;
+    const float gain = params->constants.exposure;
 
     FOREACH_LUT(lut, x) {
         x = rescale_in(x, params);
@@ -731,8 +734,19 @@ const struct pl_tone_map_function pl_tone_map_linear = {
     .map_inverse = linear,
 };
 
+const struct pl_tone_map_function pl_tone_map_linear_light = {
+    .name = "linearlight",
+    .description = "Linear light stretch",
+    .param_desc = "Exposure",
+    .param_min = 0.001,
+    .param_def = 1.00,
+    .param_max = 10.0,
+    .scaling = PL_HDR_NORM,
+    .map = linear,
+    .map_inverse = linear,
+};
+
 const struct pl_tone_map_function * const pl_tone_map_functions[] = {
-    &pl_tone_map_auto,
     &pl_tone_map_clip,
     &pl_tone_map_st2094_40,
     &pl_tone_map_st2094_10,
@@ -744,6 +758,7 @@ const struct pl_tone_map_function * const pl_tone_map_functions[] = {
     &pl_tone_map_hable,
     &pl_tone_map_gamma,
     &pl_tone_map_linear,
+    &pl_tone_map_linear_light,
     NULL
 };
 

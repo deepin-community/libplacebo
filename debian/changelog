@@ -1,3 +1,31 @@
+libplacebo (6.338.2-2) unstable; urgency=medium
+
+  * debian/patches: Don't hard-require glslang internal dependencies (Closes:
+    #1064711)
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Wed, 28 Feb 2024 23:12:07 +0100
+
+libplacebo (6.338.2-1) unstable; urgency=medium
+
+  * New upstream version 6.338.2
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Sun, 28 Jan 2024 22:44:51 +0100
+
+libplacebo (6.338.1-2) unstable; urgency=medium
+
+  * Upload to unstable
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Sun, 05 Nov 2023 21:58:36 +0100
+
+libplacebo (6.338.1-1) experimental; urgency=medium
+
+  * New upstream version 6.338.1
+  * SONAME bump: libplacebo292 -> libplacebo338
+  * debian/copyright: Update info for siphash
+  * debian/control: Enable libxxhash
+
+ -- Sebastian Ramacher <sramacher@debian.org>  Sat, 21 Oct 2023 22:35:59 +0200
+
 libplacebo (6.292.1-1) unstable; urgency=medium
 
   * New upstream version 6.292.1

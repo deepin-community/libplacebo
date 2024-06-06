@@ -7,6 +7,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <timeapi.h>
 #endif
 
 extern const struct window_impl win_impl_glfw_vk;
@@ -109,4 +110,14 @@ bool window_toggle_fullscreen(const struct window *win, bool fullscreen)
 bool window_is_fullscreen(const struct window *win)
 {
     return win->impl->is_fullscreen(win);
+}
+
+const char *window_get_clipboard(const struct window *win)
+{
+    return win->impl->get_clipboard(win);
+}
+
+void window_set_clipboard(const struct window *win, const char *text)
+{
+    win->impl->set_clipboard(win, text);
 }

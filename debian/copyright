@@ -27,10 +27,12 @@ Copyright: 2017-2018, the mpv developers
            2007-2016, Alexis Naveros
 License: LGPL-2.1+ and Zlib
 
-Files: src/siphash.c
+Files: src/hash.h
 Copyright: 2012-2016, Jean-Philippe Aumasson
            2012-2014, Daniel J. Bernstein <djb@cr.yp.to>
-License: CC0
+License: LGPL-2.1+ and CC0
+Comment:
+ The siphash implementation is licensed under CC0.
 
 License: CC0
  Statement of Purpose

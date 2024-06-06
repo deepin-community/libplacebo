@@ -260,7 +260,7 @@ static void vk_gpu_destroy(pl_gpu gpu)
             vk->DestroySampler(vk->dev, p->samplers[s][a], PL_VK_ALLOC);
     }
 
-    spirv_compiler_destroy(&p->spirv);
+    pl_spirv_destroy(&p->spirv);
     pl_mutex_destroy(&p->recording);
     pl_free((void *) gpu);
 }
@@ -415,11 +415,9 @@ pl_gpu pl_gpu_create_vk(struct vk_ctx *vk)
 
     struct pl_vk *p = PL_PRIV(gpu);
     pl_mutex_init(&p->recording);
-    p->impl = pl_fns_vk;
     p->vk = vk;
-
-    const struct pl_spirv_version spirv_ver = get_spirv_version(vk);
-    p->spirv = spirv_compiler_create(vk->log, &spirv_ver);
+    p->impl = pl_fns_vk;
+    p->spirv = pl_spirv_create(vk->log, get_spirv_version(vk));
     if (!p->spirv)
         goto error;
 
@@ -465,6 +463,7 @@ pl_gpu pl_gpu_create_vk(struct vk_ctx *vk)
         if (!strcmp(vk->exts.elem[i], VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
             vk_link_struct(&props, &port_props);
             is_portability = true;
+            break;
         }
     }
 #endif
@@ -505,17 +504,18 @@ pl_gpu pl_gpu_create_vk(struct vk_ctx *vk)
         gpu->glsl.max_gather_offset = limits.maxTexelGatherOffset;
     }
 
+    const size_t max_size = vk_malloc_avail(vk->ma, 0);
     gpu->limits = (struct pl_gpu_limits) {
         // pl_gpu
         .thread_safe        = true,
         .callbacks          = true,
         // pl_buf
-        .max_buf_size       = vk_malloc_avail(vk->ma, 0),
-        .max_ubo_size       = limits.maxUniformBufferRange,
-        .max_ssbo_size      = limits.maxStorageBufferRange,
+        .max_buf_size       = max_size,
+        .max_ubo_size       = PL_MIN(limits.maxUniformBufferRange, max_size),
+        .max_ssbo_size      = PL_MIN(limits.maxStorageBufferRange, max_size),
         .max_vbo_size       = vk_malloc_avail(vk->ma, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
         .max_mapped_size    = vk_malloc_avail(vk->ma, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
-        .max_buffer_texels  = limits.maxTexelBufferElements,
+        .max_buffer_texels  = PL_MIN(limits.maxTexelBufferElements, max_size),
         .align_host_ptr     = host_props.minImportedHostPointerAlignment,
         .host_cached        = vk_malloc_avail(vk->ma, VK_MEMORY_PROPERTY_HOST_CACHED_BIT),
         // pl_tex

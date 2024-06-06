@@ -143,6 +143,10 @@ pl_gpu pl_gpu_finalize(struct pl_gpu_t *gpu)
     // Verification
     pl_assert(gpu->limits.max_tex_2d_dim);
     pl_assert(gpu->limits.max_variable_comps || gpu->limits.max_ubo_size);
+    pl_assert(gpu->limits.max_ubo_size    <= gpu->limits.max_buf_size);
+    pl_assert(gpu->limits.max_ssbo_size   <= gpu->limits.max_buf_size);
+    pl_assert(gpu->limits.max_vbo_size    <= gpu->limits.max_buf_size);
+    pl_assert(gpu->limits.max_mapped_size <= gpu->limits.max_buf_size);
 
     for (int n = 0; n < gpu->num_formats; n++) {
         pl_fmt fmt = gpu->formats[n];
@@ -263,6 +267,7 @@ pl_gpu pl_gpu_finalize(struct pl_gpu_t *gpu)
 
     // Finally, create a `pl_dispatch` object for internal operations
     struct pl_gpu_fns *impl = PL_PRIV(gpu);
+    atomic_init(&impl->cache, NULL);
     impl->dp = pl_dispatch_create(gpu->log, gpu);
     return gpu;
 }
@@ -460,23 +465,86 @@ size_t pl_tex_transfer_size(const struct pl_tex_transfer_params *par)
     return (d - 1) * par->depth_pitch + (h - 1) * par->row_pitch + w * pixel_pitch;
 }
 
+int pl_tex_transfer_slices(pl_gpu gpu, pl_fmt texel_fmt,
+                           const struct pl_tex_transfer_params *params,
+                           struct pl_tex_transfer_params **out_slices)
+{
+    PL_ARRAY(struct pl_tex_transfer_params) slices = {0};
+    size_t max_size = params->buf ? gpu->limits.max_buf_size : SIZE_MAX;
+
+    pl_fmt fmt = params->tex->params.format;
+    if (fmt->emulated && texel_fmt) {
+        size_t max_texel = gpu->limits.max_buffer_texels * texel_fmt->texel_size;
+        max_size = PL_MIN(gpu->limits.max_ssbo_size, max_texel);
+    }
+
+    int slice_w = pl_rect_w(params->rc);
+    int slice_h = pl_rect_h(params->rc);
+    int slice_d = pl_rect_d(params->rc);
+
+    slice_d = PL_MIN(slice_d, max_size / params->depth_pitch);
+    if (!slice_d) {
+        slice_d = 1;
+        slice_h = PL_MIN(slice_h, max_size / params->row_pitch);
+        if (!slice_h) {
+            slice_h = 1;
+            slice_w = PL_MIN(slice_w, max_size / fmt->texel_size);
+            pl_assert(slice_w);
+        }
+    }
+
+    for (int z = 0; z < pl_rect_d(params->rc); z += slice_d) {
+        for (int y = 0; y < pl_rect_h(params->rc); y += slice_h) {
+            for (int x = 0; x < pl_rect_w(params->rc); x += slice_w) {
+                struct pl_tex_transfer_params slice = *params;
+                slice.callback = NULL;
+                slice.rc.x0 = params->rc.x0 + x;
+                slice.rc.y0 = params->rc.y0 + y;
+                slice.rc.z0 = params->rc.z0 + z;
+                slice.rc.x1 = PL_MIN(slice.rc.x0 + slice_w, params->rc.x1);
+                slice.rc.y1 = PL_MIN(slice.rc.y0 + slice_h, params->rc.y1);
+                slice.rc.z1 = PL_MIN(slice.rc.z0 + slice_d, params->rc.z1);
+
+                const size_t offset = z * params->depth_pitch +
+                                      y * params->row_pitch +
+                                      x * fmt->texel_size;
+                if (slice.ptr) {
+                    slice.ptr = (uint8_t *) slice.ptr + offset;
+                } else {
+                    slice.buf_offset += offset;
+                }
+
+                PL_ARRAY_APPEND(NULL, slices, slice);
+            }
+        }
+    }
+
+    *out_slices = slices.elem;
+    return slices.num;
+}
+
 bool pl_tex_upload_pbo(pl_gpu gpu, const struct pl_tex_transfer_params *params)
 {
     if (params->buf)
         return pl_tex_upload(gpu, params);
 
-    pl_buf buf = NULL;
     struct pl_buf_params bufparams = {
         .size = pl_tex_transfer_size(params),
         .debug_tag = PL_DEBUG_TAG,
     };
+
+    struct pl_tex_transfer_params fixed = *params;
+    fixed.ptr = NULL;
 
     // If we can import host pointers directly, and the function is being used
     // asynchronously, then we can use host pointer import to skip a memcpy. In
     // the synchronous case, we still force a host memcpy to avoid stalling the
     // host until the GPU memcpy completes.
     bool can_import = gpu->import_caps.buf & PL_HANDLE_HOST_PTR;
-    if (can_import && params->callback && bufparams.size > 32*1024) { // 32 KiB
+    can_import &= !params->no_import;
+    can_import &= params->callback != NULL;
+    can_import &= bufparams.size > (32 << 10); // 32 KiB
+    if (can_import) {
         bufparams.import_handle = PL_HANDLE_HOST_PTR;
         bufparams.shared_mem = (struct pl_shared_mem) {
             .handle.ptr = params->ptr,
@@ -487,28 +555,24 @@ bool pl_tex_upload_pbo(pl_gpu gpu, const struct pl_tex_transfer_params *params)
         // Suppress errors for this test because it may fail, in which case we
         // want to silently fall back.
         pl_log_level_cap(gpu->log, PL_LOG_DEBUG);
-        buf = pl_buf_create(gpu, &bufparams);
+        fixed.buf = pl_buf_create(gpu, &bufparams);
         pl_log_level_cap(gpu->log, PL_LOG_NONE);
     }
 
-    if (!buf) {
+    if (!fixed.buf) {
         bufparams.import_handle = 0;
         bufparams.host_writable = true;
-        buf = pl_buf_create(gpu, &bufparams);
+        fixed.buf = pl_buf_create(gpu, &bufparams);
+        if (!fixed.buf)
+            return false;
+        pl_buf_write(gpu, fixed.buf, 0, params->ptr, bufparams.size);
+        if (params->callback)
+            params->callback(params->priv);
+        fixed.callback = NULL;
     }
 
-    if (!buf)
-        return false;
-
-    if (!bufparams.import_handle)
-        pl_buf_write(gpu, buf, 0, params->ptr, buf->params.size);
-
-    struct pl_tex_transfer_params newparams = *params;
-    newparams.buf = buf;
-    newparams.ptr = NULL;
-
-    bool ok = pl_tex_upload(gpu, &newparams);
-    pl_buf_destroy(gpu, &buf);
+    bool ok = pl_tex_upload(gpu, &fixed);
+    pl_buf_destroy(gpu, &fixed.buf);
     return ok;
 }
 
@@ -546,7 +610,9 @@ bool pl_tex_download_pbo(pl_gpu gpu, const struct pl_tex_transfer_params *params
     // (sometimes). In the cases where it isn't avoidable, the extra memcpy
     // will happen inside VRAM, which is typically faster anyway.
     bool can_import = gpu->import_caps.buf & PL_HANDLE_HOST_PTR;
-    if (can_import && bufparams.size > 32*1024) { // 32 KiB
+    can_import &= !params->no_import;
+    can_import &= bufparams.size > (32 << 10); // 32 KiB
+    if (can_import) {
         bufparams.import_handle = PL_HANDLE_HOST_PTR;
         bufparams.shared_mem = (struct pl_shared_mem) {
             .handle.ptr = params->ptr,
@@ -631,12 +697,11 @@ bool pl_tex_upload_texel(pl_gpu gpu, const struct pl_tex_transfer_params *params
         return false;
     }
 
-    bool ubo = params->buf->params.uniform;
     ident_t buf = sh_desc(sh, (struct pl_shader_desc) {
         .binding.object = params->buf,
         .desc = {
             .name = "data",
-            .type = ubo ? PL_DESC_BUF_TEXEL_UNIFORM : PL_DESC_BUF_TEXEL_STORAGE,
+            .type = PL_DESC_BUF_TEXEL_STORAGE,
         },
     });
 
@@ -662,17 +727,17 @@ bool pl_tex_upload_texel(pl_gpu gpu, const struct pl_tex_transfer_params *params
     // fmt->texel_align contains the size of an individual color value
     assert(fmt->texel_size == fmt->num_components * fmt->texel_align);
     GLSL("vec4 color = vec4(0.0, 0.0, 0.0, 1.0);                        \n"
-         "ivec3 pos = ivec3(gl_GlobalInvocationID) + ivec3(%d, %d, %d); \n"
-         "int base = pos.z * "$" + pos.y * "$" + pos.x * "$";           \n",
-         params->rc.x0, params->rc.y0, params->rc.z0,
+         "ivec3 pos = ivec3(gl_GlobalInvocationID);                     \n"
+         "ivec3 tex_pos = pos + ivec3("$", "$", "$");                   \n"
+         "int base = "$" + pos.z * "$" + pos.y * "$" + pos.x * "$";     \n",
+         SH_INT_DYN(params->rc.x0), SH_INT_DYN(params->rc.y0), SH_INT_DYN(params->rc.z0),
+         SH_INT_DYN(params->buf_offset),
          SH_INT(params->depth_pitch / fmt->texel_align),
          SH_INT(params->row_pitch / fmt->texel_align),
          SH_INT(fmt->texel_size / fmt->texel_align));
 
-    for (int i = 0; i < fmt->num_components; i++) {
-        GLSL("color[%d] = %s("$", base + %d).r; \n",
-             i, ubo ? "texelFetch" : "imageLoad", buf, i);
-    }
+    for (int i = 0; i < fmt->num_components; i++)
+        GLSL("color[%d] = imageLoad("$", base + %d).r; \n", i, buf, i);
 
     int dims = pl_tex_params_dimension(tex->params);
     static const char *coord_types[] = {
@@ -681,7 +746,7 @@ bool pl_tex_upload_texel(pl_gpu gpu, const struct pl_tex_transfer_params *params
         [3] = "ivec3",
     };
 
-    GLSL("imageStore("$", %s(pos), color);\n", img, coord_types[dims]);
+    GLSL("imageStore("$", %s(tex_pos), color);\n", img, coord_types[dims]);
     return pl_dispatch_compute(dp, pl_dispatch_compute_params(
         .shader = &sh,
         .dispatch_size = {
@@ -742,10 +807,12 @@ bool pl_tex_download_texel(pl_gpu gpu, const struct pl_tex_transfer_params *para
     };
 
     assert(fmt->texel_size == fmt->num_components * fmt->texel_align);
-    GLSL("ivec3 pos = ivec3(gl_GlobalInvocationID) + ivec3(%d, %d, %d); \n"
-         "int base = pos.z * "$" + pos.y * "$" + pos.x * "$";           \n"
-         "vec4 color = imageLoad("$", %s(pos));                         \n",
-         params->rc.x0, params->rc.y0, params->rc.z0,
+    GLSL("ivec3 pos = ivec3(gl_GlobalInvocationID);                     \n"
+         "ivec3 tex_pos = pos + ivec3("$", "$", "$");                   \n"
+         "int base = "$" + pos.z * "$" + pos.y * "$" + pos.x * "$";     \n"
+         "vec4 color = imageLoad("$", %s(tex_pos));                     \n",
+         SH_INT_DYN(params->rc.x0), SH_INT_DYN(params->rc.y0), SH_INT_DYN(params->rc.z0),
+         SH_INT_DYN(params->buf_offset),
          SH_INT(params->depth_pitch / fmt->texel_align),
          SH_INT(params->row_pitch / fmt->texel_align),
          SH_INT(fmt->texel_size / fmt->texel_align),
@@ -1129,8 +1196,6 @@ void pl_pass_run_vbo(pl_gpu gpu, const struct pl_pass_run_params *params)
 struct pl_pass_params pl_pass_params_copy(void *alloc, const struct pl_pass_params *params)
 {
     struct pl_pass_params new = *params;
-    new.cached_program = NULL;
-    new.cached_program_len = 0;
 
     new.glsl_shader = pl_str0dup0(alloc, new.glsl_shader);
     new.vertex_shader = pl_str0dup0(alloc, new.vertex_shader);

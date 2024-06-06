@@ -39,7 +39,11 @@ struct pl_icc_params {
     // The size of the 3DLUT to generate. If left as NULL, these individually
     // default to values appropriate for the profile. (Based on internal
     // precision heuristics)
-    size_t size_r, size_g, size_b;
+    //
+    // Note: Setting this manually is strongly discouraged, as it can result
+    // in excessively high 3DLUT sizes where a much smaller LUT would have
+    // sufficed.
+    int size_r, size_g, size_b;
 
     // This field can be used to override the detected brightness level of the
     // ICC profile. If you set this to the special value 0 (or a negative
@@ -54,27 +58,16 @@ struct pl_icc_params {
     // or when using PL_INTENT_PERCEPTUAL, but YMMV.
     bool force_bpc;
 
-    // 3DLUT caching API. Providing these functions can help speed up ICC LUT
-    // generation by saving/loading profiles to/from disk. Both of these
-    // callbacks are optional.
-    void *cache_priv;
-    //
-    // This is called to inform users of new cache entries. The user may store
-    // this cache to disk or some other internal caching mechanism.
-    void (*cache_save)(void *priv, uint64_t sig, const uint8_t *cache, size_t size);
-    //
-    // This is called to query for existing cache entries. The user should look
-    // up this cache entry and write its contents to `cache`, ensuring that no
-    // more than `size` bytes are written, and return `true` on success.
-    bool (*cache_load)(void *priv, uint64_t sig, uint8_t *cache, size_t size);
-    //
-    // Note: The `signature` of a cache entry is NOT equal to the `signature`
-    // of the underlying `pl_icc_object` - it is split up into separate entries
-    // for `pl_icc_decode` and `pl_icc_encode`, and also includes a hashed
-    // representation of the encoded parameters.
-    //
-    // Note: These callbacks will only be called from within `pl_icc_decode` /
-    // `pl_icc_encode`, so `cache_priv` should exceed this lifetime.
+    // If provided, this pl_cache instance will be used, instead of the
+    // GPU-internal cache, to cache the generated 3DLUTs. Note that these can
+    // get large, especially for large values of size_{r,g,b}, so the user may
+    // wish to split this cache off from the main shader cache. (Optional)
+    pl_cache cache;
+
+    // Deprecated legacy caching API. Replaced by `cache`.
+    PL_DEPRECATED void *cache_priv;
+    PL_DEPRECATED void (*cache_save)(void *priv, uint64_t sig, const uint8_t *cache, size_t size);
+    PL_DEPRECATED bool (*cache_load)(void *priv, uint64_t sig, uint8_t *cache, size_t size);
 };
 
 #define PL_ICC_DEFAULTS                         \
@@ -110,6 +103,19 @@ typedef const struct pl_icc_object_t {
 PL_API pl_icc_object pl_icc_open(pl_log log, const struct pl_icc_profile *profile,
                                  const struct pl_icc_params *params);
 PL_API void pl_icc_close(pl_icc_object *icc);
+
+// Update an existing pl_icc_object, which may be NULL, replacing it by the
+// new profile and parameters (if incompatible).
+//
+// Returns success. `obj` is set to the created profile, or NULL on error.
+//
+// Note: If `profile->signature` matches `(*obj)->signature`, or if `profile` is
+// NULL, then the existing profile is directly reused, with only the effective
+// parameters changing. In this case, `profile->data` is also *not* read from,
+// and may safely be NULL.
+PL_API bool pl_icc_update(pl_log log, pl_icc_object *obj,
+                          const struct pl_icc_profile *profile,
+                          const struct pl_icc_params *params);
 
 // Decode the input from the colorspace determined by the attached ICC profile
 // to linear light RGB (in the profile's containing primary set). `lut` must be

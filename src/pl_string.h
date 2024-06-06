@@ -19,6 +19,8 @@
 
 #include "common.h"
 
+PL_API_BEGIN
+
 typedef struct pl_str {
     uint8_t *buf;
     size_t len;
@@ -41,7 +43,7 @@ static inline pl_str pl_str0(const char *str)
 static inline pl_str pl_strdup(void *alloc, pl_str str)
 {
     return (pl_str) {
-        .buf = str.len ? pl_memdup(alloc, str.buf, str.len) : NULL,
+        .buf = (uint8_t *) (str.len ? pl_memdup(alloc, str.buf, str.len) : NULL),
         .len = str.len,
     };
 }
@@ -93,34 +95,23 @@ size_t pl_str_append_memprintf_c(void *alloc, pl_str *str, const char *fmt,
                                  const void *args)
     PL_PRINTF(3, 0);
 
+// Locale-invariant number printing
+int pl_str_print_hex(char *buf, size_t len, unsigned short n);
+int pl_str_print_int(char *buf, size_t len, int n);
+int pl_str_print_uint(char *buf, size_t len, unsigned int n);
+int pl_str_print_int64(char *buf, size_t len, int64_t n);
+int pl_str_print_uint64(char *buf, size_t len, uint64_t n);
+int pl_str_print_float(char *buf, size_t len, float n);
+int pl_str_print_double(char *buf, size_t len, double n);
+
 // Locale-invariant number parsing
-bool pl_str_parse_double(pl_str str, double *out);
+bool pl_str_parse_hex(pl_str str, unsigned short *out);
+bool pl_str_parse_int(pl_str str, int *out);
+bool pl_str_parse_uint(pl_str str, unsigned int *out);
 bool pl_str_parse_int64(pl_str str, int64_t *out);
 bool pl_str_parse_uint64(pl_str str, uint64_t *out);
-
-static inline bool pl_str_parse_float(pl_str str, float *out)
-{
-    double dbl;
-    bool ret = pl_str_parse_double(str, &dbl);
-    *out = (float) dbl;
-    return ret;
-}
-
-static inline bool pl_str_parse_int(pl_str str, int *out)
-{
-    int64_t i64;
-    bool ret = pl_str_parse_int64(str, &i64);
-    *out = (int) i64;
-    return ret;
-}
-
-static inline bool pl_str_parse_uint(pl_str str, unsigned int *out)
-{
-    uint64_t u64;
-    bool ret = pl_str_parse_uint64(str, &u64);
-    *out = (unsigned int) u64;
-    return ret;
-}
+bool pl_str_parse_float(pl_str str, float *out);
+bool pl_str_parse_double(pl_str str, double *out);
 
 // Variants of string.h functions
 int pl_strchr(pl_str str, int c);
@@ -141,7 +132,7 @@ static inline pl_str pl_str_take(pl_str str, size_t len)
 static inline pl_str pl_str_drop(pl_str str, size_t len)
 {
     if (len >= str.len)
-        return (pl_str) {0};
+        return (pl_str) { .buf = NULL, .len = 0 };
 
     str.buf += len;
     str.len -= len;
@@ -158,6 +149,9 @@ int pl_str_find(pl_str haystack, pl_str needle);
 pl_str pl_str_split_char(pl_str str, char sep, pl_str *out_rest);
 pl_str pl_str_split_str(pl_str str, pl_str sep, pl_str *out_rest);
 
+// Like `pl_str_split_char`, but splits on any char in `seps`
+pl_str pl_str_split_chars(pl_str str, const char *seps, pl_str *out_rest);
+
 static inline pl_str pl_str_getline(pl_str str, pl_str *out_rest)
 {
     return pl_str_split_char(str, '\n', out_rest);
@@ -166,22 +160,6 @@ static inline pl_str pl_str_getline(pl_str str, pl_str *out_rest)
 // Decode a string containing hexadecimal data. All whitespace will be silently
 // ignored. When successful, this allocates a new array to store the output.
 bool pl_str_decode_hex(void *alloc, pl_str hex, pl_str *out);
-
-// Compute a fast 64-bit hash
-uint64_t pl_mem_hash(const void *mem, size_t size);
-static inline void pl_hash_merge(uint64_t *accum, uint64_t hash) {
-    *accum ^= hash + 0x9e3779b9 + (*accum << 6) + (*accum >> 2);
-}
-
-static inline uint64_t pl_str_hash(pl_str str)
-{
-    return pl_mem_hash(str.buf, str.len);
-}
-
-static inline uint64_t pl_str0_hash(const char *str)
-{
-    return pl_mem_hash(str, str ? strlen(str) : 0);
-}
 
 static inline bool pl_str_equals(pl_str str1, pl_str str2)
 {
@@ -336,3 +314,5 @@ void pl_str_builder_vprintf_c(pl_str_builder builder, const char *fmt, va_list a
 // Helper macros to deal with the non-portability of __VA_OPT__(,)
 #define _contains_fmt_chars(fmt, ...)   (strchr(fmt, '%'))
 #define _get_fmt(fmt, ...)              fmt
+
+PL_API_END

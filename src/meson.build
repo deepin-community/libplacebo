@@ -6,7 +6,6 @@ dbghelp = cc.check_header('dbghelp.h', prefix: '#include <windows.h>')
 conf_internal.set('PL_HAVE_DBGHELP', dbghelp)
 conf_internal.set('PL_HAVE_UNWIND', unwind.found())
 conf_internal.set('PL_HAVE_EXECINFO', has_execinfo)
-conf_internal.set('PL_STRIP_SHADERS', not get_option('debug'))
 if dbghelp
   build_deps += cc.find_library('shlwapi', required: true)
 elif unwind.found()
@@ -14,6 +13,9 @@ elif unwind.found()
 elif has_execinfo
   build_deps += libexecinfo
 endif
+
+link_args = []
+link_depends = []
 
 # Looks like meson in certain configuration returns ' ' instead of empty string
 mingw32 = cc.get_define('__MINGW32__').strip()
@@ -28,7 +30,8 @@ if host_machine.system() == 'windows' and mingw32 != '' and host_machine.cpu() i
                             output : ['ucrt_math.lib'],
                             input : 'ucrt_math.def',
                             command : [dlltool, '-d', '@INPUT@', '-l', '@OUTPUT@'])
-  build_deps += declare_dependency(link_with: ucrt_math)
+  link_args += ucrt_math.full_path()
+  link_depends += ucrt_math
   # MinGW-w64 inlines functions like powf, rewriting them to pow. We want to use
   # the powf specialization from UCRT, so disable inlining.
   add_project_arguments(['-D__CRT__NO_INLINE'], language: ['c', 'cpp'])
@@ -50,6 +53,7 @@ endif
 
 ### Common source files
 headers = [
+  'cache.h',
   'colorspace.h',
   'common.h',
   'd3d11.h',
@@ -61,6 +65,7 @@ headers = [
   'gpu.h',
   'log.h',
   'opengl.h',
+  'options.h',
   'renderer.h',
   'shaders/colorspace.h',
   'shaders/custom.h',
@@ -84,8 +89,10 @@ headers = [
 ]
 
 sources = [
+  'cache.c',
   'colorspace.c',
   'common.c',
+  'convert.cc',
   'dither.c',
   'dispatch.c',
   'dummy.c',
@@ -96,22 +103,9 @@ sources = [
   'gpu.c',
   'gpu/utils.c',
   'log.c',
+  'options.c',
   'pl_alloc.c',
   'pl_string.c',
-  'renderer.c',
-  'siphash.c',
-  'shaders.c',
-  'shaders/colorspace.c',
-  'shaders/custom.c',
-  'shaders/custom/mpv.c',
-  'shaders/deinterlacing.c',
-  'shaders/dithering.c',
-  'shaders/film_grain.c',
-  'shaders/film_grain_av1.c',
-  'shaders/film_grain_h274.c',
-  'shaders/icc.c',
-  'shaders/lut.c',
-  'shaders/sampling.c',
   'swapchain.c',
   'tone_mapping.c',
   'utils/dolbyvision.c',
@@ -119,13 +113,31 @@ sources = [
   'utils/upload.c',
 ]
 
+# Source files that may use GLSL pragmas, we need to use custom_target
+# to the proper environment and dependency information for these
+foreach f : ['renderer.c', 'shaders.c']
+  sources += custom_target(f,
+    command: glsl_preproc,
+    depend_files: glsl_deps,
+    env: python_env,
+    input: f,
+    output: f,
+  )
+endforeach
+
+# More .c files defined here, we can't put them in this file because of meson
+# preventing the use of / in custom_target output filenames
+subdir('shaders')
+
 tests = [
+  'cache.c',
   'colorspace.c',
   'common.c',
   'dither.c',
   'dummy.c',
   'lut.c',
   'filters.c',
+  'options.c',
   'string.c',
   'tone_mapping.c',
   'utils.c',
@@ -133,6 +145,7 @@ tests = [
 
 fuzzers = [
   'lut.c',
+  'options.c',
   'shaders.c',
   'user_shaders.c',
 ]
@@ -177,6 +190,13 @@ if libdovi.found()
   build_deps += libdovi
 endif
 
+xxhash_inc = include_directories()
+xxhash = dependency('libxxhash', required: get_option('xxhash'))
+components.set('xxhash', xxhash.found())
+if xxhash.found()
+  xxhash_inc = xxhash.get_variable('includedir')
+endif
+
 # Generate configuration files
 defs = ''
 pc_vars = []
@@ -196,7 +216,7 @@ sources += configure_file(
   configuration: conf_internal
 )
 
-sources += vcs_tag(
+version_h = vcs_tag(
   command: ['git', 'describe', '--dirty'],
   fallback: version_pretty,
   replace_string: '@buildver@',
@@ -204,16 +224,29 @@ sources += vcs_tag(
   output: 'version.h',
 )
 
+sources += version_h
+
+if host_machine.system() == 'windows'
+  windows = import('windows')
+  sources += windows.compile_resources(libplacebo_rc, depends: version_h,
+                                       include_directories: meson.project_source_root()/'win32')
+endif
+
+fast_float_inc = include_directories()
+if fs.is_dir('../3rdparty/fast_float/include')
+  fast_float_inc = include_directories('../3rdparty/fast_float/include')
+endif
 
 ### Main library build process
 inc = include_directories('./include')
 lib = library('placebo', sources,
-  c_args: '-DPL_EXPORT',
+  c_args: ['-DPL_EXPORT'],
   install: true,
   dependencies: build_deps + glad_dep,
   soversion: apiver,
-  include_directories: inc,
+  include_directories: [ inc, vulkan_headers_inc, fast_float_inc, xxhash_inc ],
   link_args: link_args,
+  link_depends: link_depends,
   gnu_symbol_visibility: 'hidden',
   name_prefix: 'lib'
 )
@@ -283,7 +316,13 @@ if get_option('bench')
     error('Compiling the benchmark suite requires vulkan support!')
   endif
 
-  bench = executable('bench', 'tests/bench.c', dependencies: [tdep_shared, vulkan_headers])
+  bench = executable('bench',
+    'tests/bench.c',
+    dependencies: [tdep_shared, vulkan_headers],
+    link_args: link_args,
+    link_depends: link_depends,
+    include_directories: vulkan_headers_inc,
+  )
   test('benchmark', bench, is_parallel: false, timeout: 600)
 endif
 
@@ -292,6 +331,8 @@ if get_option('fuzz')
     executable('fuzz.' + f, 'tests/fuzz/' + f,
         objects: lib.extract_all_objects(recursive: false),
         dependencies: tdep_static,
+        link_args: link_args,
+        link_depends: link_depends,
     )
   endforeach
 endif

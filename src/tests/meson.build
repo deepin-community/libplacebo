@@ -29,9 +29,11 @@ foreach t : ts
       objects: t.get('objects', []),
       c_args: [ '-Wno-unused-function' ],
       dependencies: t.get('deps', []),
+      link_args: link_args,
+      link_depends: link_depends,
   )
 
-  test(t['source'], e)
+  test(t['source'], e, timeout: 120)
 endforeach
 
 subdir('include')

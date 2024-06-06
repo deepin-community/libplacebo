@@ -291,6 +291,11 @@ struct pl_hook_par {
     pl_var_data initial;
     pl_var_data minimum;
     pl_var_data maximum;
+
+    // Human-readable names for the variants of an integer option. This array
+    // can be indexed directly by integer values, ranging from `minimum.i` to
+    // `maximum.i`. May be NULL, in which case options are unnamed.
+    const char * const *names;
 };
 
 // Struct describing a hook.
@@ -326,9 +331,8 @@ struct pl_hook {
 //
 // The resulting `pl_hook` objects should be destroyed with the corresponding
 // destructor when no longer needed.
-PL_API const struct pl_hook *pl_mpv_user_shader_parse(pl_gpu gpu,
-                                                      const char *shader_text,
-                                                      size_t shader_len);
+PL_API const struct pl_hook *
+pl_mpv_user_shader_parse(pl_gpu gpu, const char *shader_text, size_t shader_len);
 
 PL_API void pl_mpv_user_shader_destroy(const struct pl_hook **hook);
 

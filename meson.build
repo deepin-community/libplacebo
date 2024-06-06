@@ -4,7 +4,7 @@ project('libplacebo', ['c', 'cpp'],
     'buildtype=debugoptimized',
     'warning_level=2',
     'c_std=c11',
-    'cpp_std=c++11',
+    'cpp_std=c++20',
   ],
   meson_version: '>=0.63',
   version: '@0@.@1@.@2@'.format(
@@ -12,6 +12,52 @@ project('libplacebo', ['c', 'cpp'],
     6,
     # API version
     {
+      '338': 'split pl_filter_nearest into pl_filter_nearest and pl_filter_box',
+      '337': 'fix PL_FILTER_DOWNSCALING constant',
+      '336': 'deprecate pl_filter.radius_cutoff in favor of pl_filter.radius',
+      '335': 'remove {pl_render_params,pl_sample_filter_params}.{lut_entries,polar_cutoff}',
+      '334': 'add pl_tex_transfer_params.no_import',
+      '333': 'add pl_shader_sample_{hermite,gaussian}',
+      '332': 'add pl_filter_function_hermite and pl_filter_hermite',
+      '331': 'add pl_filter_function_cubic and remove bcspline family of filter functions',
+      '330': 'add pl_frames_infer(_mix)',
+      '329': 'add pl_frame_mix_current and pl_frame_mix_nearest',
+      '328': 'remove pl_render_params.ignore_icc_profiles',
+      '327': 'remove pl_render_params.icc_params',
+      '326': 'add pl_frame.icc',
+      '325': 'add pl_icc_update',
+      '324': 'add pl_render_params.correct_subpixel_offsets',
+      '323': 'deprecate pl_{dispatch,renderer}_{save,load}',
+      '322': 'remove pl_pass_params.cached_program(_len)',
+      '321': 'deprecate pl_icc_params.cache_{save,load,priv}',
+      '320': 'add pl_gpu_set_cache',
+      '319': 'add <libplacebo/cache.h>',
+      '318': 'add pl_filter_ewa_lanczossharp and pl_filter_ewa_lanczos4sharpest',
+      '317': 'add pl_filter_config.antiring',
+      '316': 'remove pl_filter_config.filter_scale',
+      '315': 'remove pl_tone_map_auto',
+      '314': 'add pl_renderer_get_hdr_metadata',
+      '313': 'remove pl_peak_detect_params.minimum_peak',
+      '312': 'add pl_gamut_map_constants.perceptual_strength',
+      '311': 'add pl_tone_map_constants, pl_tone_map_params.constants and pl_color_map_params.tone_constants',
+      '310': 'add pl_gamut_map_constants, pl_gamut_map_params.constants and pl_color_map_params.gamut_constants',
+      '309': 'add <libplacebo/options.h>',
+      '308': 'add pl_hook_par.names',
+      '307': 'add pl_filter.radius_zero',
+      '306': 'add pl_filter_functions and pl_filter_configs',
+      '305': 'add pl_filter_function.opaque and move pl_filter_oversample to filters.h',
+      '304': 'add pl_filter_config.allowed/recommended',
+      '303': 'refactor pl_filter_config and pl_filter_function',
+      '302': 'change type of pl_icc_params.size_r/g/b to int',
+      '301': 'add PL_COLOR_ADJUSTMENT_NEUTRAL and pl_color_adjustment()',
+      '300': 'add pl_color_map_params.gamut_expansion',
+      '299': 'add pl_primaries_compatible and pl_primaries_clip',
+      '298': 'add pl_gamut_map_softclip',
+      '297': 'add pl_tone_map_linear_light',
+      '296': 'add pl_queue_estimate_fps/vps, pl_queue_num_frames and pl_queue_peek',
+      '295': 'change pl_source_frame.pts and pl_queue_params.pts to double',
+      '294': 'add pl_vulkan_swapchain_params.disable_10bit_sdr',
+      '293': 'add pl_test_pixfmt_caps',
       '292': 'add pl_peak_detect_high_quality_params and pl_color_map_high_quality_params',
       '291': 'add PL_COLOR_HDR_BLACK, PL_COLOR_SDR_CONTRAST and PL_COLOR_HLG_PEAK',
       '290': 'remove pl_color_map_params.hybrid_mix',
@@ -307,7 +353,7 @@ project('libplacebo', ['c', 'cpp'],
       '1': '',
     }.keys().length(),
     # Fix version
-    1)
+    2)
 )
 
 ### Version number and configuration
@@ -333,6 +379,7 @@ conf_internal.set('PL_DEBUG_ABORT', get_option('debug-abort'))
 build_opts = [
   # Warnings
   '-Wundef', '-Wshadow', '-Wparentheses', '-Wpointer-arith',
+  '-fno-math-errno',
 ]
 
 link_args = []
@@ -341,8 +388,8 @@ cc = meson.get_compiler('c')
 cxx = meson.get_compiler('cpp')
 
 c_opts = [
-  '-D_ISOC99_SOURCE', '-D_ISOC11_SOURCE', '-D_GNU_SOURCE', '-D_XOPEN_SOURCE=700',
-  '-U__STRICT_ANSI__', '-Wmissing-prototypes',
+  '-D_ISOC99_SOURCE', '-D_ISOC11_SOURCE', '-D_GNU_SOURCE', '-U__STRICT_ANSI__',
+  '-Wmissing-prototypes',
 
   # Warnings to ignore
   '-Wno-sign-compare', '-Wno-unused-parameter',
@@ -362,10 +409,7 @@ if cc.get_id() == 'clang'
 endif
 
 # For sanitizers to work/link properly some public symbols have to be available.
-# We do exception for MSAN to intentionally cripple it's interceptors, which
-# allows us to run it on CI with not all the external libraries instrumented.
-if get_option('b_sanitize') == 'none' or (get_option('b_sanitize') == 'memory' and
-                                          get_option('default_library') == 'static')
+if get_option('b_sanitize') == 'none'
   # don't leak library symbols if possible
   vflag = '-Wl,--exclude-libs=ALL'
   # link and lld-link don't support this arg, but it only shows warning about
@@ -379,11 +423,15 @@ endif
 if host_machine.system() == 'windows'
     build_opts += ['-D_WIN32_WINNT=0x0601',
                    '-D_USE_MATH_DEFINES',
+                   '-DWIN32_LEAN_AND_MEAN',
+                   '-DNOMINMAX',
                    '-D_CRT_SECURE_NO_WARNINGS']
+    subdir('win32')
 endif
 
-add_project_arguments(build_opts + c_opts, language: 'c')
-add_project_link_arguments(link_args, language: 'c')
+add_project_arguments(build_opts + c_opts, language: ['c'])
+add_project_arguments(build_opts, language: ['c', 'cpp'])
+add_project_link_arguments(link_args, language: ['c', 'cpp'])
 
 
 # Global dependencies
@@ -416,6 +464,7 @@ endif
 
 build_deps = [ libm, threads ]
 
+subdir('tools')
 subdir('src')
 
 if get_option('demos')

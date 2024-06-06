@@ -326,13 +326,14 @@ static void sh_lut_uninit(pl_gpu gpu, void *ptr)
 ident_t sh_lut(pl_shader sh, const struct sh_lut_params *params)
 {
     pl_gpu gpu = SH_GPU(sh);
-    void *tmp = NULL;
+    pl_cache_obj obj = { .key = CACHE_KEY_SH_LUT ^ params->signature };
 
     const enum pl_var_type vartype = params->var_type;
     pl_assert(vartype != PL_VAR_INVALID);
     pl_assert(params->method == SH_LUT_NONE || vartype == PL_VAR_FLOAT);
     pl_assert(params->width > 0 && params->height >= 0 && params->depth >= 0);
     pl_assert(params->comps > 0);
+    pl_assert(!params->cache || params->signature);
 
     int sizes[] = { params->width, params->height, params->depth };
     int size = params->width * PL_DEF(params->height, 1) * PL_DEF(params->depth, 1);
@@ -469,14 +470,23 @@ next_dim: ; // `continue` out of the inner loop
         if (params->dynamic)
             pl_log_level_cap(sh->log, PL_LOG_TRACE);
 
-        PL_DEBUG(sh, "LUT cache invalidated, regenerating..");
-        size_t buf_size = size * params->comps * pl_var_type_size(vartype);
-        tmp = pl_zalloc(NULL, buf_size);
+        size_t el_size = params->comps * pl_var_type_size(vartype);
+        if (type == SH_LUT_TEXTURE)
+            el_size = texfmt->texel_size;
 
-        pl_clock_t start = pl_clock_now();
-        params->fill(tmp, params);
-        pl_log_cpu_time(sh->log, start, pl_clock_now(), "generating shader LUT");
+        size_t buf_size = size * el_size;
+        if (pl_cache_get(params->cache, &obj) && obj.size == buf_size) {
+            PL_DEBUG(sh, "Re-using cached LUT (0x%"PRIx64") with size %zu",
+                     obj.key, obj.size);
+        } else {
+            PL_DEBUG(sh, "LUT invalidated, regenerating..");
+            pl_cache_obj_resize(NULL, &obj, buf_size);
+            pl_clock_t start = pl_clock_now();
+            params->fill(obj.data, params);
+            pl_log_cpu_time(sh->log, start, pl_clock_now(), "generating shader LUT");
+        }
 
+        pl_assert(obj.data && obj.size);
         if (params->dynamic)
             pl_log_level_cap(sh->log, PL_LOG_NONE);
 
@@ -499,8 +509,8 @@ next_dim: ; // `continue` out of the inner loop
                 .format         = texfmt,
                 .sampleable     = true,
                 .host_writable  = params->dynamic,
-                .initial_data   = params->dynamic ? NULL : tmp,
-                .debug_tag      = PL_DEBUG_TAG,
+                .initial_data   = params->dynamic ? NULL : obj.data,
+                .debug_tag      = params->debug_tag,
             };
 
             bool ok;
@@ -509,7 +519,7 @@ next_dim: ; // `continue` out of the inner loop
                 if (ok) {
                     ok = pl_tex_upload(gpu, pl_tex_transfer_params(
                         .tex = lut->tex,
-                        .ptr = tmp,
+                        .ptr = obj.data,
                     ));
                 }
             } else {
@@ -528,8 +538,7 @@ next_dim: ; // `continue` out of the inner loop
 
         case SH_LUT_UNIFORM:
             pl_free(lut->data);
-            lut->data = tmp; // re-use `tmp`
-            tmp = NULL;
+            lut->data = pl_memdup(NULL, obj.data, obj.size);
             break;
 
         case SH_LUT_LITERAL: {
@@ -552,17 +561,17 @@ next_dim: ; // `continue` out of the inner loop
                     case PL_VAR_FLOAT:
                         pl_str_append_asprintf_c(lut, &lut->str, "%s%f",
                                                  c > 0 ? "," : "",
-                                                 ((float *) tmp)[i+c]);
+                                                 ((float *) obj.data)[i+c]);
                         break;
                     case PL_VAR_UINT:
                         pl_str_append_asprintf_c(lut, &lut->str, "%s%u",
                                                  c > 0 ? "," : "",
-                                                 ((unsigned int *) tmp)[i+c]);
+                                                 ((unsigned int *) obj.data)[i+c]);
                         break;
                     case PL_VAR_SINT:
                         pl_str_append_asprintf_c(lut, &lut->str, "%s%d",
                                                  c > 0 ? "," : "",
-                                                 ((int *) tmp)[i+c]);
+                                                 ((int *) obj.data)[i+c]);
                         break;
                     case PL_VAR_INVALID:
                     case PL_VAR_TYPE_COUNT:
@@ -588,6 +597,7 @@ next_dim: ; // `continue` out of the inner loop
         lut->depth = params->depth;
         lut->comps = params->comps;
         lut->signature = params->signature;
+        pl_cache_set(params->cache, &obj);
     }
 
     // Done updating, generate the GLSL
@@ -799,12 +809,12 @@ next_dim: ; // `continue` out of the inner loop
     }
 
     lut->error = false;
-    pl_free(tmp);
+    pl_cache_obj_free(&obj);
     pl_assert(name);
     return name;
 
 error:
     lut->error = true;
-    pl_free(tmp);
+    pl_cache_obj_free(&obj);
     return NULL_IDENT;
 }

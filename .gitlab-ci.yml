@@ -1,11 +1,15 @@
 stages:
     - compile
     - test
-    - test
     - sanitize
 
+variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+    IMAGE_UBUNTU_JAMMY: registry.videolan.org/libplacebo-ubuntu-jammy:20230730213642
+    IMAGE_UBUNTU_JAMMY_AARCH: registry.videolan.org/libplacebo-ubuntu-jammy-aarch64:20230203024122
+
 linux:
-    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    image: $IMAGE_UBUNTU_JAMMY
     stage: compile
     tags:
         - docker
@@ -19,7 +23,7 @@ linux:
         - ninja -C build
 
 static:
-    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    image: $IMAGE_UBUNTU_JAMMY
     stage: compile
     tags:
         - docker
@@ -33,7 +37,7 @@ static:
         - ninja -C build
 
 win32:
-    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    image: $IMAGE_UBUNTU_JAMMY
     stage: compile
     tags:
         - docker
@@ -42,13 +46,14 @@ win32:
         - meson build --buildtype release
                       --werror
                       -Dtests=true
-                      --libdir lib
+                      -Ddebug-abort=true
+                      -Dd3d11=enabled
                       --cross-file /opt/crossfiles/i686-w64-mingw32.meson
         - ninja -C build
         - cd build && meson test -t 5 -v --num-processes=1
 
 win64:
-    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    image: $IMAGE_UBUNTU_JAMMY
     stage: compile
     tags:
         - docker
@@ -57,13 +62,14 @@ win64:
         - meson build --buildtype release
                       --werror
                       -Dtests=true
-                      --libdir lib
+                      -Ddebug-abort=true
+                      -Dd3d11=enabled
                       --cross-file /opt/crossfiles/x86_64-w64-mingw32.meson
         - ninja -C build
         - cd build && meson test -t 5 -v --num-processes=1
 
 aarch64:
-    image: registry.videolan.org/libplacebo-ubuntu-eoan-aarch64:20200525090115
+    image: $IMAGE_UBUNTU_JAMMY_AARCH
     stage: compile
     tags:
         - docker
@@ -77,33 +83,35 @@ macos:
     stage: compile
     tags:
         - amd64
-        - catalina
+        - monterey
     script:
         - meson build --buildtype release
                       -Ddefault_library=both
                       -Dtests=true
+                      -Ddebug-abort=true
+                      -Dc_args='-mmacosx-version-min=10.11 -Wunguarded-availability'
                       --werror
         - ninja -C build
         - cd build && meson test -t 5 -v --num-processes=1
 
 scan:
-    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    image: $IMAGE_UBUNTU_JAMMY
     stage: compile
     tags:
         - docker
         - amd64
     script:
-        - env CC=clang meson build --buildtype debugoptimized
-                                   --werror
-                                   -Dtests=true
-                                   -Ddemos=true
-                                   -Dbench=true
-                                   -Dshaderc=enabled
-                                   -Dglslang=enabled
+        - env CC=clang CXX=clang++ CC_LD=lld CXX_LD=lld
+            meson build --buildtype debugoptimized
+                        --werror
+                        -Dtests=true
+                        -Dbench=true
+                        -Dshaderc=enabled
+                        -Dglslang=enabled
         - ninja -C build scan-build
 
 llvmpipe:
-    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    image: $IMAGE_UBUNTU_JAMMY
     stage: test
     tags:
         - docker
@@ -112,15 +120,15 @@ llvmpipe:
         - meson build --buildtype release
                       --werror
                       -Dtests=true
-                      -Ddemos=false
-                      -Dc_args='-DCI_ALLOW_SW'
+                      -Ddebug-abort=true
+                      -Dc_args='-DCI_ALLOW_SW -DCI_MAXGL'
                       -Dshaderc=enabled
                       -Dglslang=enabled
         - ninja -C build
-        - cd build && meson test -t 5 -v --num-processes=1
+        - cd build && meson test -t 20 -v --num-processes=1
 
 gpu:
-    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+    image: $IMAGE_UBUNTU_JAMMY
     stage: test
     tags:
         - gpu
@@ -129,7 +137,9 @@ gpu:
                       --werror
                       -Dtests=true
                       -Ddemos=false
-                      -Dshaderc=disabled
+                      -Ddebug-abort=true
+                      -Dshaderc=enabled
+                      -Dglslang=enabled
                       -Db_coverage=true
         - ninja -C build
         - vulkaninfo
@@ -145,56 +155,26 @@ gpu:
         paths:
             - coverage/
         reports:
-            cobertura: build/meson-logs/coverage.xml
+            coverage_report:
+              coverage_format: cobertura
+              path: build/meson-logs/coverage.xml
 
-asan:
-    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
-    stage: sanitize
-    tags:
-        - gpu
-    variables:
-        ASAN_OPTIONS: 'detect_leaks=0'
-    script:
-        - meson build --buildtype debugoptimized
-                      -Dtests=true
-                      -Ddemos=false
-                      -Dshaderc=disabled
-                      -Db_sanitize=address
-        - ninja -C build
-        - cd build && time meson test -t 5 -v --num-processes=1
-
-msan:
-    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
-    stage: sanitize
-    tags:
-        - gpu
-    variables:
-        MSAN_OPTIONS: 'exitcode=1'
-    script:
-        - env CC=clang meson build --buildtype debugoptimized
-                                   -Dtests=true
-                                   -Ddemos=false
-                                   -Dc_args='-DMSAN'
-                                   -Dglslang=disabled
-                                   -Db_sanitize=memory
-                                   -Db_lundef=false
-        - ninja -C build
-        - cd build && time meson test -t 5 -v --num-processes=1
-
-ubsan:
-    image: registry.videolan.org/libplacebo-ubuntu-focal:20210108182514
+sanitize:
+    image: $IMAGE_UBUNTU_JAMMY
     stage: sanitize
     tags:
         - gpu
     variables:
         UBSAN_OPTIONS: 'print_stacktrace=1:halt_on_error=1'
     script:
-        - env CC=clang meson build --buildtype debugoptimized
-                                   -Dtests=true
-                                   -Ddemos=false
-                                   -Dc_args='-fPIE'
-                                   -Dglslang=disabled
-                                   -Db_sanitize=undefined
-                                   -Db_lundef=false
+        - env CC=clang CXX=clang++ CC_LD=lld CXX_LD=lld
+            meson build --buildtype debugoptimized
+                        --werror
+                        -Dtests=true
+                        -Ddebug-abort=true
+                        -Dc_args='-DCI_MAXGL -Wno-deprecated-declarations'
+                        -Db_sanitize=address,undefined
+                        -Db_lundef=false
+                        -Dshaderc=enabled
         - ninja -C build
         - cd build && time meson test -t 5 -v --num-processes=1

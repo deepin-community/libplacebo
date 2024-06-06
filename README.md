@@ -2,8 +2,7 @@
 
 [![gitlab-ci badge](https://code.videolan.org/videolan/libplacebo/badges/master/pipeline.svg)](https://code.videolan.org/videolan/libplacebo/pipelines)
 [![gitlab-ci coverage](https://code.videolan.org/videolan/libplacebo/badges/master/coverage.svg)](https://code.videolan.org/videolan/libplacebo/-/jobs/artifacts/master/file/coverage/index.html?job=test-gpu)
-[![Backers on Open Collective](https://opencollective.com/libplacebo/backers/badge.svg)](#backers)
-[![Sponsors on Open Collective](https://opencollective.com/libplacebo/sponsors/badge.svg)](#sponsors)
+[![GitHub](https://img.shields.io/github/sponsors/haasn?logo=github)](https://github.com/sponsors/haasn)
 [![PayPal](https://img.shields.io/badge/donate-PayPal-blue.svg?logo=paypal)](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=SFJUTMPSZEAHC)
 [![Patreon](https://img.shields.io/badge/pledge-Patreon-red.svg?logo=patreon)](https://www.patreon.com/haasn)
 
@@ -15,27 +14,24 @@ on both quality and performance. These include features such as the following:
 - High-quality, optimized **upscaling and downscaling** including support for
   polar filters ("Jinc"), anti-aliasing, anti-ringing and gamma correct
   scaling.
-- **Color management** and format conversions for a wide variety of HDR or
-  wide gamut color spaces. This includes support for ICC profiles, ITU-R
-  BT.1886 emulation, colorimetrically accurate clipping, custom 1D/3D LUTs,
-  scene-referred OOTFs (such as HLG), constant luminance formats including
-  ICtCp and a variety of film industry formats ranging from XYZ to Sony's
-  S-Log or Panasonic's V-Gamut.
-- Tunable **debanding** shader. This is based on flash3kyuu, expanded to
-  provide high quality by combining multiple debanding passes.
-- Dynamic **HDR tone mapping**, including shaders for real-time peak and
-  scene-change detection, chroma-preserving (luma-only) tone mapping,
-  highlight desaturation, dynamic exposure control and a variety of
-  industry-standard EETFs including BT.2390.
-- High performance **film grain synthesis** for AV1 and H.274, allowing media
-  players to offload this part of decoding from the CPU to the GPU.
-- A **pluggable, extensible custom shader syntax**, equivalent to an improved
-  version of [mpv's `.hook`
-  syntax](https://mpv.io/manual/master/#options-glsl-shaders). This can be
-  used to arbitrarily extend the range of custom shaders to include popular
-  user shaders like RAVU, FSRCNNX, or Anime4K. See the [mpv wiki on user
+- Dynamic **HDR tone mapping**, including real-time measurement of scene
+  histogram, scene change detection, dynamic exposure control, perceptual gamut
+  stretching, contrast recovery and more.
+- Native support for **Dolby Vision HDR**, including Profile 5 conversion to
+  HDR/PQ or SDR, reading DV side data, and reshaping. (BL only, currently)
+- A colorimetrically accurate **color management** engine with support for
+  soft gamut mapping, ICC profiles, accurate ITU-R BT.1886 emulation, black
+  point compensation, and custom 3DLUTs (.cube).
+- A pluggable, extensible [**custom shader
+  system**](http://libplacebo.org/custom-shaders/). This can be used to
+  arbitrarily extend the range of custom shaders to include popular user
+  shaders like RAVU, FSRCNNX, or Anime4K. See the [mpv wiki on user
   scripts](https://github.com/mpv-player/mpv/wiki/User-Scripts#user-shaders)
   for more information.
+- High performance **film grain synthesis** for AV1 and H.274, allowing media
+  players to offload this part of decoding from the CPU to the GPU.
+- Tunable, fast **debanding** and **deinterlacing** shaders.
+- High quality gamma-correct **dithering**, including error diffusion modes.
 
 Every attempt was made to provide these features at a **high level of
 abstraction**, taking away all the messy details of GPU programming, color
@@ -48,7 +44,7 @@ Expert-level functionality is packed into easy-to-use functions like
 libplacebo currently supports Vulkan (including MoltenVK), OpenGL, and
 Direct3D 11. It currently has the following minimum hardware requirements:
 
-- **Vulkan**: Core version 1.1 + timeline semaphores
+- **Vulkan**: Core version 1.2
 - **OpenGL**: GLSL version >= 130 (GL >= 3.0, GL ES >= 3.0)
 - **Direct3D**: Feature level >= 9_1
 
@@ -102,6 +98,8 @@ libplacebo to take care of everything.
 
 ### Tier 0 (logging, raw math primitives)
 
+- `cache.h`: Caching subsystem. Used to cache large or computationally heavy
+  binary blobs, such as compiled shaders, 3DLUTs, and so on.
 - `colorspace.h`: A collection of enums and structs for describing color
   spaces, as well as a collection of helper functions for computing various
   color space transformation matrices.
@@ -191,6 +189,10 @@ identifiers (so they can be freely merged together).
 
 ### Tier 4 (high level renderer)
 
+- `options.h`: A high-level options framework which wraps all of the options
+  comprising `pl_render_params` into a memory-managed, serializable struct that
+  can also be treated as a key/value dictionary. Also includes an options
+  parser to load options provided by the API user in string format.
 - `renderer.h`: A high-level renderer which combines the shader primitives
   and dispatch mechanism into a fully-fledged rendering pipeline that takes
   raw texture data and transforms it into the desired output image.
@@ -220,34 +222,9 @@ best overall image quality, and so forth.
 
 libplacebo was founded and primarily developed by Niklas Haas
 ([@haasn](https://github.com/haasn)), but it would not be possible without the
-contributions of others. Special note also goes out to wm4, the developer of
-mpv, whose ideas helped shape the foundation of the shader dispatch system.
-This library also includes various excerpts from mpv, in particular the filter
-kernel code. For a full list of past contributors to mpv, see the [mpv
-authorship page](https://github.com/mpv-player/mpv/graphs/contributors)
+contributions of others, especially support for windows.
 
 [![contributor list](https://opencollective.com/libplacebo/contributors.svg?width=890&button=false)](https://github.com/haasn/libplacebo/graphs/contributors)
-
-### Backers
-
-Thank you to all our backers! 🙏 [[Become a backer](https://opencollective.com/libplacebo#backer)]
-
-[![backer list](https://opencollective.com/libplacebo/backers.svg?width=890)](https://opencollective.com/libplacebo#backers)
-
-### Sponsors
-
-Support this project by becoming a sponsor. Your logo will show up here with a link to your website. [[Become a sponsor](https://opencollective.com/libplacebo#sponsor)]
-
-[![sponsor 0](https://opencollective.com/libplacebo/sponsor/0/avatar.svg)](https://opencollective.com/libplacebo/sponsor/0/website)
-[![sponsor 0](https://opencollective.com/libplacebo/sponsor/1/avatar.svg)](https://opencollective.com/libplacebo/sponsor/1/website)
-[![sponsor 0](https://opencollective.com/libplacebo/sponsor/2/avatar.svg)](https://opencollective.com/libplacebo/sponsor/2/website)
-[![sponsor 0](https://opencollective.com/libplacebo/sponsor/3/avatar.svg)](https://opencollective.com/libplacebo/sponsor/3/website)
-[![sponsor 0](https://opencollective.com/libplacebo/sponsor/4/avatar.svg)](https://opencollective.com/libplacebo/sponsor/4/website)
-[![sponsor 0](https://opencollective.com/libplacebo/sponsor/5/avatar.svg)](https://opencollective.com/libplacebo/sponsor/5/website)
-[![sponsor 0](https://opencollective.com/libplacebo/sponsor/6/avatar.svg)](https://opencollective.com/libplacebo/sponsor/6/website)
-[![sponsor 0](https://opencollective.com/libplacebo/sponsor/7/avatar.svg)](https://opencollective.com/libplacebo/sponsor/7/website)
-[![sponsor 0](https://opencollective.com/libplacebo/sponsor/8/avatar.svg)](https://opencollective.com/libplacebo/sponsor/8/website)
-[![sponsor 0](https://opencollective.com/libplacebo/sponsor/9/avatar.svg)](https://opencollective.com/libplacebo/sponsor/9/website)
 
 ### License
 
@@ -310,13 +287,14 @@ A full list of optional dependencies each feature requires:
 - **opengl**: `glad2` (*)
 - **shaderc**: `libshaderc`
 - **vulkan**: `libvulkan`, `python3-jinja2` (*)
+- **xxhash**: `libxxhash`
 
 (*) This dependency is bundled automatically when doing a recursive clone.
 
 #### Vulkan support
 
 Because the vulkan backend requires on code generation at compile time,
-`python3-mako` is a hard dependency of the build system. In addition to this,
+`python3-Jinja2` is a hard dependency of the build system. In addition to this,
 the path to the Vulkan registry (`vk.xml`) must be locatable, ideally by
 explicitly providing it via the `-Dvulkan-registry=/path/to/vk.xml` option,
 unless it can be found in one of the built-in hard-coded locations.

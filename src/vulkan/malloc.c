@@ -47,13 +47,9 @@
 // small slabs. (Default: 256 KB)
 #define MINIMUM_SLAB_SIZE (1LLU << 18)
 
-// Controls the maximum slab size, to avoid ballooning memory requirements
-// due to overzealous allocation of extra pages. (Default: 256 MB)
-#define MAXIMUM_SLAB_SIZE (1LLU << 28)
-
 // How long to wait before garbage collecting empty slabs. Slabs older than
 // this many invocations of `vk_malloc_garbage_collect` will be released.
-#define MAXIMUM_SLAB_AGE 8
+#define MAXIMUM_SLAB_AGE 32
 
 // A single slab represents a contiguous region of allocated memory. Actual
 // allocations are served as pages of this. Slabs are organized into pools,
@@ -464,6 +460,8 @@ static struct vk_slab *slab_alloc(struct vk_malloc *ma,
              (int) minfo.memoryTypeIndex, (int) mtype->heapIndex,
              PL_DEF(params->debug_tag, "unknown"));
 
+    pl_clock_t start = pl_clock_now();
+
     VkResult res = vk->AllocateMemory(vk->dev, &minfo, PL_VK_ALLOC, &slab->mem);
     switch (res) {
     case VK_ERROR_OUT_OF_DEVICE_MEMORY:
@@ -472,6 +470,7 @@ static struct vk_slab *slab_alloc(struct vk_malloc *ma,
                PRINT_SIZE(slab->size), vk_res_str(res));
         vk_malloc_print_stats(ma, PL_LOG_ERR);
         pl_log_stack_trace(vk->log, PL_LOG_ERR);
+        pl_debug_abort();
         goto error;
 
     default:
@@ -515,6 +514,8 @@ static struct vk_slab *slab_alloc(struct vk_malloc *ma,
                                        &slab->handle.handle));
     }
 #endif
+
+    pl_log_cpu_time(vk->log, start, pl_clock_now(), "allocating slab");
 
     // free space accounting is done by the caller
     return slab;
@@ -718,8 +719,11 @@ static struct vk_slab *pool_get_page(struct vk_malloc *ma, struct vk_pool *pool,
     // Otherwise, allocate a new vk_slab and append it to the list.
     VkDeviceSize slab_size = slab_pages * pagesize;
     pl_static_assert(MINIMUM_SLAB_SIZE <= PAGE_SIZE_ALIGN * MAXIMUM_PAGE_COUNT);
-    slab_size = PL_CLAMP(slab_size, MINIMUM_SLAB_SIZE, MAXIMUM_SLAB_SIZE);
+    const VkDeviceSize max_slab_size = ma->maximum_page_size * MINIMUM_PAGE_COUNT;
+    pl_assert(pagesize <= ma->maximum_page_size);
+    slab_size = PL_CLAMP(slab_size, MINIMUM_SLAB_SIZE, max_slab_size);
     slab_pages = slab_size / pagesize;
+    slab_size = slab_pages * pagesize; // max_slab_size may be npot2, trim excess
 
     struct vk_malloc_params params = pool->params;
     params.reqs.size = slab_size;

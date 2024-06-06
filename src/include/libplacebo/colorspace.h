@@ -530,7 +530,7 @@ struct pl_color_adjustment {
     // Saturation gain. 1.0 = neutral, 0.0 = grayscale
     float saturation;
     // Hue shift, corresponding to a rotation around the [U, V] subvector, in
-    // radians. Only meaningful for YCbCr-like colorspaces. 0.0 = neutral
+    // radians. 0.0 = neutral
     float hue;
     // Gamma adjustment. 1.0 = neutral, 0.0 = solid black
     float gamma;
@@ -538,7 +538,12 @@ struct pl_color_adjustment {
     float temperature;
 };
 
-// A struct pre-filled with all-neutral values.
+#define PL_COLOR_ADJUSTMENT_NEUTRAL \
+    .contrast       = 1.0,           \
+    .saturation     = 1.0,           \
+    .gamma          = 1.0,
+
+#define pl_color_adjustment(...) (&(struct pl_color_adjustment) { PL_COLOR_ADJUSTMENT_NEUTRAL __VA_ARGS__ })
 PL_API extern const struct pl_color_adjustment pl_color_adjustment_neutral;
 
 // Represents the chroma placement with respect to the luma samples. This is
@@ -589,6 +594,19 @@ PL_API bool pl_primaries_superset(const struct pl_raw_primaries *a,
 // not check whether or not these primaries are actually physically realisable,
 // merely that they satisfy the requirements for colorspace math (to avoid NaN).
 PL_API bool pl_primaries_valid(const struct pl_raw_primaries *prim);
+
+// Returns true if two primaries are 'compatible', which is the case if
+// they preserve the relationship between primaries (red=red, green=green,
+// blue=blue). In other words, this is false for synthetic primaries that have
+// channels misordered from the convention (e.g. for some test ICC profiles).
+PL_API bool pl_primaries_compatible(const struct pl_raw_primaries *a,
+                                    const struct pl_raw_primaries *b);
+
+// Clip points in the first gamut (src) to be fully contained inside the second
+// gamut (dst). Only works on compatible primaries (pl_primaries_compatible).
+PL_API struct pl_raw_primaries
+pl_primaries_clip(const struct pl_raw_primaries *src,
+                  const struct pl_raw_primaries *dst);
 
 // Primary-dependent RGB->LMS matrix for the IPTPQc4 color system. This is
 // derived from the HPE XYZ->LMS matrix with 4% crosstalk added.
@@ -674,12 +692,15 @@ struct pl_icc_profile {
     const void *data;
     size_t len;
 
-    // If a profile is set, this signature must uniquely identify it, ideally
-    // using a checksum of the profile contents. The user is free to choose the
-    // method of determining this signature, but note the existence of the
+    // If a profile is set, this signature must uniquely identify it (including
+    // across restarts, for caching), ideally using a checksum of the profile
+    // contents. The user is free to choose the method of determining this
+    // signature, but note the existence of the
     // `pl_icc_profile_compute_signature` helper.
     uint64_t signature;
 };
+
+#define pl_icc_profile(...) &(struct pl_icc_profile) { __VA_ARGS__ }
 
 // This doesn't do a comparison of the actual contents, only of the signature.
 PL_API bool pl_icc_profile_equal(const struct pl_icc_profile *p1,

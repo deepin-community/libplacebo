@@ -41,6 +41,30 @@ struct pl_gamut_map_function {
     void *priv;
 };
 
+struct pl_gamut_map_constants {
+    // (Relative) chromaticity protection zone for perceptual mapping [0,1]
+    float perceptual_deadzone;
+
+    // Strength of the perceptual saturation mapping component [0,1]
+    float perceptual_strength;
+
+    // I vs C curve gamma to use for colorimetric clipping [0,10]
+    float colorimetric_gamma;
+
+    // Knee point to use for softclipping methods (perceptual, softclip) [0,1]
+    float softclip_knee;
+
+    // Desaturation strength (for softclip only) [0,1]
+    float softclip_desat;
+};
+
+#define PL_GAMUT_MAP_CONSTANTS    \
+    .colorimetric_gamma  = 1.80f, \
+    .softclip_knee       = 0.70f, \
+    .softclip_desat      = 0.35f, \
+    .perceptual_deadzone = 0.30f, \
+    .perceptual_strength = 0.80f,
+
 struct pl_gamut_map_params {
     // If `function` is NULL, defaults to `pl_gamut_map_clip`.
     const struct pl_gamut_map_function *function;
@@ -59,6 +83,10 @@ struct pl_gamut_map_params {
     float min_luma;
     float max_luma;
 
+    // Common constants, should be initialized to PL_GAMUT_MAP_CONSTANTS if
+    // not intending to override them further.
+    struct pl_gamut_map_constants constants;
+
     // -- LUT generation options (for `pl_gamut_map_generate` only)
 
     // The size of the resulting LUT, per channel.
@@ -75,7 +103,10 @@ struct pl_gamut_map_params {
     float chroma_margin PL_DEPRECATED; // non-functional
 };
 
-#define pl_gamut_map_params(...) (&(struct pl_gamut_map_params) { __VA_ARGS__ })
+#define pl_gamut_map_params(...) (&(struct pl_gamut_map_params) {   \
+    .constants = { PL_GAMUT_MAP_CONSTANTS },                        \
+    __VA_ARGS__                                                     \
+})
 
 // Note: Only does pointer equality testing on `function`
 PL_API bool pl_gamut_map_params_equal(const struct pl_gamut_map_params *a,
@@ -103,8 +134,12 @@ PL_API extern const struct pl_gamut_map_function pl_gamut_map_clip;
 // Performs a perceptually balanced (saturation) gamut mapping, using a soft
 // knee function to preserve in-gamut colors, followed by a final softclip
 // operation. This works bidirectionally, meaning it can both compress and
-// expand the gamut. Behaves similar to a blend of `saturation` and `clip`.
+// expand the gamut. Behaves similar to a blend of `saturation` and `softclip`.
 PL_API extern const struct pl_gamut_map_function pl_gamut_map_perceptual;
+
+// Performs a perceptually balanced gamut mapping using a soft knee function to
+// roll-off clipped regions, and a hue shifting function to preserve saturation.
+PL_API extern const struct pl_gamut_map_function pl_gamut_map_softclip;
 
 // Performs relative colorimetric clipping, while maintaining an exponential
 // relationship between brightness and chromaticity.
@@ -138,7 +173,7 @@ PL_API extern const struct pl_gamut_map_function pl_gamut_map_linear;
 // A list of built-in gamut mapping functions, terminated by NULL
 PL_API extern const struct pl_gamut_map_function * const pl_gamut_map_functions[];
 PL_API extern const int pl_num_gamut_map_functions; // excluding trailing NULL
-                                             //
+
 // Find the gamut mapping function with the given name, or NULL on failure.
 PL_API const struct pl_gamut_map_function *pl_find_gamut_map_function(const char *name);
 

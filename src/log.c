@@ -281,7 +281,7 @@ void pl_log_stack_trace(pl_log log, enum pl_log_level lev)
     HANDLE process = GetCurrentProcess();
     HMODULE dbghelp = LoadLibrary("dbghelp.dll");
     DWORD options;
-    SYMBOL_INFO *symbol;
+    SYMBOL_INFO *symbol = NULL;
     BOOL use_dbghelp = !!dbghelp;
 
 #define DBGHELP_SYM(sym)                                                        \
@@ -441,7 +441,7 @@ void pl_log_stack_trace(pl_log log, enum pl_log_level lev)
     }
 }
 
-#elif defined(PL_HAVE_EXECINFO) && !defined(MSAN)
+#elif defined(PL_HAVE_EXECINFO)
 #include <execinfo.h>
 
 void pl_log_stack_trace(pl_log log, enum pl_log_level lev)

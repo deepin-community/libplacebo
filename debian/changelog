@@ -1,3 +1,9 @@
+libplacebo (6.338.2-2deepin0) unstable; urgency=medium
+
+  * No source change upload against GCC 12.
+
+ -- Tianyu Chen <sweetyfish@deepin.org>  Fri, 20 Sep 2024 12:11:14 +0800
+
 libplacebo (6.338.2-2) unstable; urgency=medium
 
   * debian/patches: Don't hard-require glslang internal dependencies (Closes:

@@ -1,3 +1,10 @@
+libplacebo (6.338.2-2deepin1) unstable; urgency=medium
+
+  * Add upstream patch to link glslang, fixing the build with glslang
+    15.x
+
+ -- Tianyu Chen <sweetyfish@deepin.org>  Fri, 09 Oct 2026 14:14:37 +0800
+
 libplacebo (6.338.2-2deepin0) unstable; urgency=medium
 
   * No source change upload against GCC 12.
